@@ -864,6 +864,12 @@ pub fn call_on_event(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// `dispatch_one` is awaited through a read guard of the plugin registry in
+// single-tenant tests: each test owns its `App`, the guard can contend with
+// nothing, and restructuring to hand the registry out of the lock would test a
+// different shape than production uses. The production path (`api::test_plugin`)
+// keeps the guard off the await via `spawn_blocking`.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::db::Db;

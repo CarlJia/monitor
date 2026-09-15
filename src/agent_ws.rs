@@ -236,7 +236,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 /// that one would mark a node offline while it is reporting normally.
 fn release(app: &App, node_id: i64, session: u64) -> bool {
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    if !agents.get(&node_id).is_some_and(|a| a.session == session) {
+    if agents.get(&node_id).is_none_or(|a| a.session != session) {
         return false;
     }
     agents.remove(&node_id);
