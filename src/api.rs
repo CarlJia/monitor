@@ -857,6 +857,8 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "notification.offline_threshold_reports",
+    "notification.expiry_thresholds",
 ];
 
 // ---- the database itself ----
@@ -1844,9 +1846,37 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
+        // 通知阈值(U7/D4):读侧在 main.rs 的 offline_threshold_reports,1..=100
+        // 之外与解析失败都会被 clamp/回退,这里挡在写入之前——存进去的值读出来
+        // 必须还是它自己。
+        "notification.offline_threshold_reports"
+            if !value.parse::<i64>().is_ok_and(|n| (1..=100).contains(&n)) =>
+        {
+            Some("离线判定阈值必须是 1 到 100 之间的整数（连续 N 个上报周期无消息即判离线）".into())
+        }
+        // 与 main.rs 的 expiry_thresholds 同一套宽松写法:`"[7,3,1]"` 与
+        // `"7,3,1"` 都收。读侧会剔除坏项并在全部失效时回退默认,这里同样挡在
+        // 写入之前,且要求至少一项有效。
+        "notification.expiry_thresholds" if !valid_expiry_thresholds(value) => {
+            Some("到期提醒阈值必须是逗号分隔的 1 到 365 之间的天数，如 7,3,1".into())
+        }
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
+}
+
+/// `notification.expiry_thresholds` 的静态校验:去掉可选的 JSON 数组括号后,
+/// 每一项都必须是 1..=365 的整数,且至少一项。
+fn valid_expiry_thresholds(value: &str) -> bool {
+    let inner = value.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut any = false;
+    for token in inner.split(',') {
+        match token.trim().parse::<i64>() {
+            Ok(days) if (1..=365).contains(&days) => any = true,
+            _ => return false,
+        }
+    }
+    any
 }
 
 pub async fn save_settings(
@@ -2988,6 +3018,59 @@ mod tests {
         assert_eq!(body["github_secret_set"], true);
         assert!(body.get("github_client_secret").is_none());
         assert!(!body.to_string().contains("super-secret"));
+    }
+
+    /// 通知阈值两个 key(U7):读侧带出,合法值（两种 expiry 写法）落库,非法值
+    /// 400 且什么都不写。
+    #[tokio::test]
+    async fn notification_threshold_settings_round_trip() {
+        let app = std::sync::Arc::new(app());
+        let Json(read) = settings(Admin, State(app.clone())).await;
+        assert!(read.get("notification.offline_threshold_reports").is_some());
+        assert!(read.get("notification.expiry_thresholds").is_some());
+
+        let put = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
+
+        // 合法值:expiry 两种写法都收。
+        assert_eq!(
+            put(json!({"notification.offline_threshold_reports": "5"})).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(app.db.get("notification.offline_threshold_reports").as_deref(), Some("5"));
+        for good in ["[7,3,1]", "7, 3, 1"] {
+            assert_eq!(
+                put(json!({"notification.expiry_thresholds": good})).await.status(),
+                StatusCode::OK,
+                "{good:?}"
+            );
+        }
+        assert_eq!(app.db.get("notification.expiry_thresholds").as_deref(), Some("7, 3, 1"));
+
+        // 非法值:范围外、非数字、空串、坏项混杂。全部 400 且不落库。
+        for junk in ["", "0", "101", "-3", "abc", "3.5"] {
+            assert_eq!(
+                put(json!({"notification.offline_threshold_reports": junk})).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{junk:?}"
+            );
+        }
+        for junk in ["", "abc", "7,x", "0", "366", "[", "7;3", "-1,3"] {
+            assert_eq!(
+                put(json!({"notification.expiry_thresholds": junk})).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{junk:?}"
+            );
+        }
+        assert_eq!(
+            app.db.get("notification.offline_threshold_reports").as_deref(),
+            Some("5"),
+            "被拒绝的值不能覆盖已存的合法值"
+        );
+        assert_eq!(
+            app.db.get("notification.expiry_thresholds").as_deref(),
+            Some("7, 3, 1"),
+            "被拒绝的值不能覆盖已存的合法值"
+        );
     }
 
     // ---- plugins(U5) ----
