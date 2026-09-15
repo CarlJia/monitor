@@ -29,14 +29,22 @@ pub enum Event {
 }
 
 impl Event {
+    /// 事件词表的单一来源:db 的状态行比较、manifest 校验与扫描循环都引用
+    /// 这组名字,散写字面量会让两处悄悄漂移。
+    pub const AGENT_OFFLINE: &'static str = "agent_offline";
+    pub const AGENT_ONLINE: &'static str = "agent_online";
+    pub const EXPIRY_SOON: &'static str = "expiry_soon";
+    /// v1 支持的全部事件名,manifest 的 `subscribes` 逐项对照。
+    pub const KNOWN: [&'static str; 3] = [Self::AGENT_OFFLINE, Self::AGENT_ONLINE, Self::EXPIRY_SOON];
+
     /// The discriminator stored in `notification_log.event_type` and carried in
     /// the JSON `type` tag. A lifetime `&'static str` rather than a String:
     /// it is compared against database rows on every emission.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Event::AgentOffline { .. } => "agent_offline",
-            Event::AgentOnline { .. } => "agent_online",
-            Event::ExpirySoon { .. } => "expiry_soon",
+            Event::AgentOffline { .. } => Self::AGENT_OFFLINE,
+            Event::AgentOnline { .. } => Self::AGENT_ONLINE,
+            Event::ExpirySoon { .. } => Self::EXPIRY_SOON,
         }
     }
 
@@ -98,17 +106,13 @@ pub fn emit(app: &App, event: &Event) -> Result<()> {
     if event.is_state_event() {
         // One row per node holds whichever side the node is on; a repeat of
         // the same side is the same outage window and must not re-alert. The
-        // transition also clears the opposite side's row in the same
-        // transaction, so `current_state_event` is authoritative.
-        if app
-            .db
-            .current_state_event(event.node_id())?
-            .is_some_and(|(current, _)| current == event.type_name())
-        {
-            return Ok(());
-        }
+        // transition is itself the check: it reads the standing row first and
+        // returns false -- writing nothing -- when the node is already on this
+        // side, and it clears the opposite side's row in the same transaction
+        // when it does write.
         if !app.db.transition_state_event(event.node_id(), event.type_name(), Utc::now().timestamp())? {
-            return Ok(()); // Lost a race with a concurrent emission of the same side.
+            return Ok(()); // Same side already stands, or lost a race with a
+                           // concurrent emission of it.
         }
     } else {
         // ExpirySoon: one alert per node, per tier, per billing cycle, keyed

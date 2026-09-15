@@ -633,18 +633,13 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// 解析 `notification.expiry_thresholds`:接受 JSON 数组字符串 `"[7,3,1]"`
-/// 与裸逗号分隔 `"7,3,1"` 两种写法。逐项校验 1..=365,坏项剔除;解析失败
-/// 或没有留下任何有效项时回退默认 `[7, 3, 1]`——与 `retention_days` 同一
-/// 读取模式:坏值静默回退,不挡住扫描本身。
+/// 读 `notification.expiry_thresholds` 设置,空值(未设置、解析失败或没有
+/// 任何有效项)回退默认 `[7, 3, 1]`——与 `retention_days` 同一读取模式:坏值
+/// 静默回退,不挡住扫描本身。解析本体见 [`db::parse_expiry_thresholds`],
+/// 与写侧(api)共用。
 fn expiry_thresholds(app: &App) -> Vec<i64> {
     let raw = app.db.get("notification.expiry_thresholds").unwrap_or_default();
-    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    let parsed: Vec<i64> = inner
-        .split(',')
-        .filter_map(|t| t.trim().parse::<i64>().ok())
-        .filter(|&days| (1..=365).contains(&days))
-        .collect();
+    let parsed = db::parse_expiry_thresholds(&raw);
     if parsed.is_empty() {
         vec![7, 3, 1]
     } else {
@@ -730,7 +725,11 @@ fn notify_offline_nodes(app: &App) -> Result<()> {
     for node in active {
         // 窗口内活跃且上一状态是离线:恢复。没有状态行(从未离线)的
         // 节点查不到 agent_offline,自然跳过。
-        if app.db.current_state_event(node.id)?.is_some_and(|(state, _)| state == "agent_offline") {
+        if app
+            .db
+            .current_state_event(node.id)?
+            .is_some_and(|(state, _)| state == notification_bus::Event::AGENT_OFFLINE)
+        {
             notification_bus::emit(
                 app,
                 &notification_bus::Event::AgentOnline {

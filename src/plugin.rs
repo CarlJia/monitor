@@ -1,9 +1,5 @@
 //! WASM plugin runtime.
 //!
-//! U2 shipped the Registry stub the notification bus calls into; U3 added
-//! everything needed to actually run a plugin; U4 replaced the stub with the
-//! real [`Registry`]:
-//!
 //! - [`Manifest::parse`] 校验 manifest(R7),
 //! - [`load`] 把 db 行变成 [`LoadedPlugin`](R6 的前半段:编译 + 导出契约检查),
 //! - [`call_on_event`] 每次事件新建 Store、注入宿主函数、以 fuel 限额调用插件,
@@ -33,7 +29,6 @@
 //! 复用会让首次耗尽 fuel 的插件永久死亡,也无法并发调用。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -42,6 +37,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use wasmtime::{Caller, Extern, Linker, Memory, Store};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::notification_bus::Event;
 use crate::{db::PluginRow, App};
@@ -54,6 +52,10 @@ use crate::{db::PluginRow, App};
 /// dispatch_log 的容量(KTD12)。环形:push_back 满了 pop_front,最近 1000 次
 /// 派发结果始终可见,面板与测试都据此判断一次派发是否真的发生、结果如何。
 pub const DISPATCH_LOG_CAP: usize = 1000;
+
+/// `DispatchEntry::result` 取值 `success` 时表示插件返回 0:Rust 侧的比较与
+/// 构造都引用这里,不散写魔法串。
+pub const RESULT_SUCCESS: &str = "success";
 
 /// fuel 限额的 setting key(KTD6)。每次派发都重读,改完下一次扫描即生效。
 const SETTING_FUEL_LIMIT: &str = "plugin.fuel_limit";
@@ -101,8 +103,9 @@ pub struct Registry {
     /// 环形缓冲套一层 Arc:fire-and-forget 的汇总任务要在 dispatch 返回之后
     /// 继续写入,那时 `&self` 已不可借。
     dispatch_log: Arc<Mutex<VecDeque<DispatchEntry>>>,
-    /// 已转发进 Registry 的事件数(不论有没有订阅者)。notification_bus 的
-    /// 测试据此区分"记录了幂等行"和"真的转发了"。
+    /// 已转发进 Registry 的事件数(不论有没有订阅者)。只有测试读它:
+    /// notification_bus 的测试据此区分"记录了幂等行"和"真的转发了"。
+    #[cfg(test)]
     dispatched: AtomicUsize,
 }
 
@@ -116,6 +119,7 @@ impl Registry {
             app: Weak::new(),
             loaded: HashMap::new(),
             dispatch_log: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(test)]
             dispatched: AtomicUsize::new(0),
         }
     }
@@ -125,7 +129,7 @@ impl Registry {
     /// 插件照常加载。main 在 `Arc::new(App::new(..))` 之后调用一次。
     pub fn init(&mut self, app: &Arc<App>) {
         self.app = Arc::downgrade(app);
-        let rows = match app.db.list_plugins() {
+        let rows = match app.db.enabled_plugins() {
             Ok(rows) => rows,
             Err(e) => {
                 warn!("读取插件列表失败,本次不加载任何插件: {e:#}");
@@ -133,9 +137,6 @@ impl Registry {
             }
         };
         for row in rows {
-            if !row.enabled {
-                continue;
-            }
             match load(&self.engine, &row) {
                 Ok(plugin) => {
                     // 成功也落库:上一次启动若把它标成 failed,不清掉就永远
@@ -156,13 +157,14 @@ impl Registry {
 
     /// 把一个已在 db 里 enabled 的插件装进内存(U5 的 enable API 在写完 db
     /// 后调用)。加载失败时把 `failed` 与原因落库并返回 Err,API 层转成 400;
-    /// 成功时清掉 last_error。
+    /// 成功时不再写库——API 层的 `set_plugin_enabled(id, true)` 在调用前已把
+    /// status 置为 `enabled`、last_error 清空,与这里要写的完全相同,同一请求
+    /// 写两次没有意义。
     pub fn enable_plugin(&mut self, app: &App, plugin_row_id: i64) -> Result<()> {
         let row =
             app.db.get_plugin(plugin_row_id)?.with_context(|| format!("插件 {plugin_row_id} 不存在"))?;
         match load(&self.engine, &row) {
             Ok(plugin) => {
-                app.db.set_plugin_status(plugin_row_id, "enabled", None)?;
                 self.loaded.insert(plugin_row_id, plugin);
                 Ok(())
             }
@@ -188,6 +190,7 @@ impl Registry {
         self.loaded.contains_key(&plugin_row_id)
     }
 
+    #[cfg(test)]
     pub fn dispatch_count(&self) -> usize {
         self.dispatched.load(Ordering::Relaxed)
     }
@@ -208,6 +211,7 @@ impl Registry {
     /// notification_log。回写在一个汇总任务里做:dispatch 自己不 async,没有
     /// "等它们跑完"的自然位置,汇总任务补上这个位置。
     pub fn dispatch(&self, event: &Event) {
+        #[cfg(test)]
         self.dispatched.fetch_add(1, Ordering::Relaxed);
         let subscribers: Vec<LoadedPlugin> = self
             .loaded
@@ -301,7 +305,7 @@ async fn run_one(
     });
     let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
         Err(_) => "timeout".to_owned(),
-        Ok(Ok(Ok(0))) => "success".to_owned(),
+        Ok(Ok(Ok(0))) => RESULT_SUCCESS.to_owned(),
         Ok(Ok(Ok(code))) => format!("other:插件返回错误码 {code}"),
         Ok(Ok(Err(e))) => {
             // trap 的具体信息在错误链深处,格式化整条链再判 fuel。
@@ -337,13 +341,13 @@ fn push_entry(log: &Arc<Mutex<VecDeque<DispatchEntry>>>, entry: DispatchEntry) {
 /// transition_state_event 立好,这里只做 UPDATE;行不存在(比如测试直接调
 /// dispatch)时 UPDATE 落空,无害。
 fn write_back(app: &App, event: &Event, entries: &[DispatchEntry]) {
-    let success = entries.iter().all(|e| e.result == "success");
+    let success = entries.iter().all(|e| e.result == RESULT_SUCCESS);
     let detail = if success {
         String::new()
     } else {
         let failed: Vec<String> = entries
             .iter()
-            .filter(|e| e.result != "success")
+            .filter(|e| e.result != RESULT_SUCCESS)
             .map(|e| format!("{}: {}", e.plugin_id, e.result))
             .collect();
         truncate(&failed.join("; "), DETAIL_MAX)
@@ -365,16 +369,23 @@ fn setting_u64(app: &App, key: &str, default: u64) -> u64 {
     app.db.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
+/// 不超过 `max` 的最大字符边界偏移:截断必须落在边界上,否则切出的字节不是
+/// 合法 UTF-8。detail 的带省略号截断与 host_kv_get 的前缀截断共用(一个加
+/// 省略号一个不加,共用的是边界计算)。
+fn char_boundary_end(s: &str, max: usize) -> usize {
+    let mut end = s.len().min(max);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// 按字符边界截断,加省略号标记被截。
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    format!("{}…", &s[..char_boundary_end(s, max)])
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +395,10 @@ fn truncate(s: &str, max: usize) -> String {
 /// 宿主与插件之间的 ABI 版本。宿主大版本升级时递增;不匹配的插件在加载时被拒。
 pub const ABI_VERSION: i64 = 1;
 
-/// v1 的事件词表。manifest 声明订阅未来才有的事件名会在这里被拒:静默接受会让
-/// 拼写错误无声失效,显式契约尽早暴露错误(KTD2)。
-pub const KNOWN_EVENT_NAMES: [&str; 3] = ["agent_offline", "agent_online", "expiry_soon"];
+/// v1 的事件词表,单一来源是 [`Event::KNOWN`]:manifest 校验、db 的状态行
+/// 与扫描循环读的都是同一组名字。manifest 声明订阅未来才有的事件名会在这里
+/// 被拒:静默接受会让拼写错误无声失效,显式契约尽早暴露错误(KTD2)。
+pub const KNOWN_EVENT_NAMES: [&str; 3] = Event::KNOWN;
 
 /// plugin.toml。字段与校验规则见 [`Manifest::parse`]。
 #[derive(Debug, Clone, Deserialize)]
@@ -405,7 +417,6 @@ pub struct Manifest {
     pub subscribes: Vec<String>,
     /// 包内 wasm 入口文件名。上传 API(U5)按它从包里取模块;运行期不再使用。
     #[serde(default = "default_wasm_entry")]
-    #[allow(dead_code)] // U5 的上传解包读它
     pub wasm_entry: String,
 }
 
@@ -511,8 +522,9 @@ pub fn load(engine: &wasmtime::Engine, row: &PluginRow) -> Result<LoadedPlugin> 
 pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
 
 /// 单个插件的 kv 值上限:8 KiB,足够放渠道配置,又不会让 setting 表被一个插件
-/// 当对象存储用。
-const KV_VALUE_MAX: usize = 8 * 1024;
+/// 当对象存储用。面板的 kv 写入引用同一个上限:「面板能写的不能比插件运行时
+/// 能写的多」,否则面板成了绕过插件存储限额的后门。
+pub const KV_VALUE_MAX: usize = 8 * 1024;
 
 /// 插件 http 请求的墙钟超时(A13):4 秒,落在 5 秒的派发预算内,留 1 秒给宿主
 /// 自己的开销。挂在请求上而不是再建一个 client:全局 `app.http` 的 15 秒超时
@@ -664,10 +676,7 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 return ERR_BOUNDS;
             }
             let cap = out_cap as usize;
-            let mut end = value.len().min(cap);
-            while end > 0 && !value.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = char_boundary_end(&value, cap);
             let bytes = &value.as_bytes()[..end];
             if !write_mem(&mut caller, out_ptr, bytes) {
                 return ERR_BOUNDS;
@@ -863,6 +872,20 @@ pub fn call_on_event(
 // tests
 // ---------------------------------------------------------------------------
 
+/// 最小合法模块:memory + bump 分配器 + 恒返回 0 的 on_event。api.rs 的上传
+/// 测试与本模块的测试共用同一份,fixture 漂移会让两边测的不是同一个东西。
+#[cfg(test)]
+pub(crate) const MINIMAL_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 1024))
+  (func (export "__alloc") (param $cap i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $cap)))
+    (local.get $ptr))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0)))"#;
+
 #[cfg(test)]
 // `dispatch_one` is awaited through a read guard of the plugin registry in
 // single-tenant tests: each test owns its `App`, the guard can contend with
@@ -882,18 +905,6 @@ version = "1.0.0"
 abi_version = 1
 subscribes = ["expiry_soon", "agent_offline"]
 "#;
-
-    /// 最小合法模块:memory + bump 分配器 + 恒返回 0 的 on_event。
-    const MINIMAL_WAT: &str = r#"
-(module
-  (memory (export "memory") 1)
-  (global $heap (mut i32) (i32.const 1024))
-  (func (export "__alloc") (param $cap i32) (result i32)
-    (local $ptr i32)
-    (local.set $ptr (global.get $heap))
-    (global.set $heap (i32.add (global.get $heap) (local.get $cap)))
-    (local.get $ptr))
-  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0)))"#;
 
     fn app() -> Arc<App> {
         Arc::new(App::for_test(Db::open(":memory:").unwrap()))

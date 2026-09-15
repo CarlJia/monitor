@@ -12,6 +12,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::notification_bus::Event;
+
 pub struct Db(Mutex<Connection>);
 
 const SCHEMA: &str = r#"
@@ -483,8 +485,8 @@ pub struct PluginRow {
 /// hub would replay "offline" while the node is already known to be offline.
 fn opposite_state(event_type: &str) -> Option<&'static str> {
     match event_type {
-        "agent_offline" => Some("agent_online"),
-        "agent_online" => Some("agent_offline"),
+        Event::AGENT_OFFLINE => Some(Event::AGENT_ONLINE),
+        Event::AGENT_ONLINE => Some(Event::AGENT_OFFLINE),
         _ => None,
     }
 }
@@ -1577,6 +1579,16 @@ impl Db {
 
     // ---- plugins ----
 
+    /// The plugin SELECT's column list, spelled out rather than `SELECT *` so
+    /// the summary view below can substitute its one lighter column. The two
+    /// constants must stay in step with `row_to_plugin`, which reads by name.
+    const PLUGIN_COLUMNS: &str = "id, plugin_id, name, version, manifest_json, wasm_blob,
+                    wasm_sha256, enabled, status, last_error, uploaded_at";
+    /// [`Self::PLUGIN_COLUMNS`] with the megabyte blob replaced by an empty one:
+    /// the panel's list needs none of the module's bytes.
+    const PLUGIN_COLUMNS_SUMMARY: &str = "id, plugin_id, name, version, manifest_json, x'' AS wasm_blob,
+                    wasm_sha256, enabled, status, last_error, uploaded_at";
+
     /// Stores an uploaded plugin and returns the row as it now stands. A
     /// `plugin_id` collision surfaces as an error the caller turns into a 400
     /// rather than a silent clobber of the previous upload.
@@ -1616,10 +1628,32 @@ impl Db {
 
     pub fn list_plugins(&self) -> Result<Vec<PluginRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256,
-                    enabled, status, last_error, uploaded_at FROM plugin ORDER BY uploaded_at DESC, id DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM plugin ORDER BY uploaded_at DESC, id DESC",
+            Self::PLUGIN_COLUMNS
+        ))?;
+        let rows = stmt.query_map([], row_to_plugin)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Just the `plugin_id` behind a row, or `None` when there is no such row.
+    /// For callers that need only the existence or the identifier: reading the
+    /// whole row would drag the wasm blob along for nothing.
+    pub fn plugin_id_of(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT plugin_id FROM plugin WHERE id=?1", [id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Every enabled plugin, for the registry's startup preload: a disabled
+    /// plugin's blob is never compiled, so it is not read either.
+    pub fn enabled_plugins(&self) -> Result<Vec<PluginRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM plugin WHERE enabled=1 ORDER BY uploaded_at DESC, id DESC",
+            Self::PLUGIN_COLUMNS
+        ))?;
         let rows = stmt.query_map([], row_to_plugin)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1628,8 +1662,7 @@ impl Db {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256,
-                        enabled, status, last_error, uploaded_at FROM plugin WHERE id=?1",
+                &format!("SELECT {} FROM plugin WHERE id=?1", Self::PLUGIN_COLUMNS),
                 [id],
                 row_to_plugin,
             )
@@ -1641,10 +1674,10 @@ impl Db {
     /// read and thrown away.
     pub fn plugin_summaries(&self) -> Result<Vec<PluginRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, plugin_id, name, version, manifest_json, x'' AS wasm_blob, wasm_sha256,
-                    enabled, status, last_error, uploaded_at FROM plugin ORDER BY uploaded_at DESC, id DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM plugin ORDER BY uploaded_at DESC, id DESC",
+            Self::PLUGIN_COLUMNS_SUMMARY
+        ))?;
         let rows = stmt.query_map([], row_to_plugin)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1924,6 +1957,20 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         last_seen: n("last_seen"),
         token: s("token"),
     }
+}
+
+/// 解析 `notification.expiry_thresholds` 的值:接受 JSON 数组字符串 `"[7,3,1]"`
+/// 与裸逗号分隔 `"7,3,1"` 两种写法,返回落在 1..=365 的合法项。空返回值表示
+/// 没有任何合法项——写侧(api 的 `valid_expiry_thresholds`)据此拒绝整个值,
+/// 读侧(main 的 `expiry_thresholds`)据此回退默认档,两侧的宽严由各自外层
+/// 决定,解析本身只有这一份。
+pub fn parse_expiry_thresholds(raw: &str) -> Vec<i64> {
+    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    inner
+        .split(',')
+        .filter_map(|t| t.trim().parse::<i64>().ok())
+        .filter(|&days| (1..=365).contains(&days))
+        .collect()
 }
 
 /// Start of the billing period containing `today`, given a reset day of month.

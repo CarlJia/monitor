@@ -1368,11 +1368,25 @@ const PLUGIN_MAX_EXPANDED: u64 = 32 << 20;
 const PLUGIN_MANIFEST_MAX: usize = 64 * 1024;
 const PLUGIN_WASM_MAX: usize = 16 << 20;
 
-/// 面板 kv 的 value 上限,与插件的 host_kv_set 同限:面板能写的不能比插件
-/// 运行时能写的多,否则面板成了绕过插件存储限额的后门。
-const PLUGIN_KV_VALUE_MAX: usize = 8 * 1024;
-/// 面板 kv 的 key 上限,给 `plugin.<id>:<key>` 的命名空间留出余量。
+/// 面板 kv 的 key 上限,给 `plugin.<id>:<key>` 的命名空间留出余量。value 的
+/// 上限不在 api 这边定义:面板能写的不能比插件运行时能写的多,单点是
+/// [`plugin::KV_VALUE_MAX`]。
 const PLUGIN_KV_KEY_MAX: usize = 128;
+
+/// 插件 handler 共用的 404 门:多数 handler 只要 plugin_id(delete 连它删的
+/// kv 行也只按 plugin_id 找),所以这里读轻量的 [`Db::plugin_id_of`] 而不是
+/// 整行——整行会连几 MiB 的 wasm blob 一起读出来再扔掉。返回 `Err(响应)`
+/// 的两种情况:404(行不存在)与 500(读库失败)。Err 装的是现成的 Response
+/// 而不是错误码,调用侧直接 return;它比一个错误码大,但这是本函数唯一的
+/// 消费方式,装箱省下的那点栈不值得多一次解引用。
+#[allow(clippy::result_large_err)]
+fn plugin_or_404(app: &App, id: i64) -> Result<String, Response> {
+    match app.db.plugin_id_of(id) {
+        Ok(Some(plugin_id)) => Ok(plugin_id),
+        Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
+        Err(e) => Err(fail(e)),
+    }
+}
 
 /// Installs an uploaded plugin package (R11): a `multipart/form-data` request
 /// whose `plugin` field carries the plugin's `tar.gz`.
@@ -1454,12 +1468,6 @@ fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
         bail!("{} 超过 {} MiB 的上限", manifest.wasm_entry, PLUGIN_WASM_MAX >> 20);
     }
     let wasm_sha256 = hex::encode(Sha256::digest(wasm));
-
-    // 重复的 plugin_id 是覆盖不是升级:manifest_json 与 wasm_blob 都整行替换
-    // 会丢掉 enabled 与状态,所以先拒绝,让作者显式删掉旧版再上传。
-    if app.db.list_plugins()?.iter().any(|r| r.plugin_id == manifest.plugin_id) {
-        bail!("插件 {} 已存在；先删除旧版本再上传", manifest.plugin_id);
-    }
 
     // 预热校验:用一条临时行(id=0,不落库)走真实的加载路径,把「manifest 写
     // 错了」「模块缺导出」「模块编译不过」在上传时就暴露。失败不拒绝入库:
@@ -1588,21 +1596,17 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
 /// 收:任何一处留下都会以别的方式回来——行留着列表里就还有它,kv 留着删除
 /// 再重传同名插件会捡到旧的渠道配置,内存留着它还会继续收事件。
 pub async fn delete_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match app.db.get_plugin(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
     };
-    let gone = app.db.delete_plugin(id).and_then(|()| app.db.delete_plugin_kv(&row.plugin_id));
-    match gone {
+    match app.db.delete_plugin(id).and_then(|()| app.db.delete_plugin_kv(&plugin_id)) {
         // db 行与 kv 都删净之后才动内存:失败路径上插件保持原状,重试即是。
         // 返回值是删掉的 kv 行数,0 也是成功。
         Ok(_) => {
             app.plugins.write().unwrap_or_else(|e| e.into_inner()).remove_plugin(id);
             StatusCode::NO_CONTENT.into_response()
         }
-        // get_plugin 与 delete_plugin 之间的窗口里行没了:也是 404。
-        Err(e) if e.to_string().contains("no plugin") => StatusCode::NOT_FOUND.into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1610,10 +1614,8 @@ pub async fn delete_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
 /// 启用插件:先写 db 的开关,再装进内存。加载失败时 Registry 已把 failed 与
 /// 原因落库,这里转成 400 带给面板——作者改完包重新上传即可。
 pub async fn enable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    match app.db.get_plugin(id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    if let Err(resp) = plugin_or_404(&app, id) {
+        return resp;
     }
     if let Err(e) = app.db.set_plugin_enabled(id, true) {
         return fail(e);
@@ -1626,10 +1628,8 @@ pub async fn enable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
 
 /// 禁用插件:与启用对称,只是加载不可能失败,没有错误分支可言。
 pub async fn disable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    match app.db.get_plugin(id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    if let Err(resp) = plugin_or_404(&app, id) {
+        return resp;
     }
     if let Err(e) = app.db.set_plugin_enabled(id, false) {
         return fail(e);
@@ -1642,10 +1642,9 @@ pub async fn disable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<
 /// 执行路径(超时、fuel、宿主函数),但绕过 emit 与 notification_log——一次
 /// 手工测试不占幂等键,真实事件的成功与否不该被它覆盖(U4 的 dispatch_one)。
 pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match app.db.get_plugin(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
     };
     let event = Event::ExpirySoon {
         node_id: 0,
@@ -1669,7 +1668,7 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     };
     match outcome {
         Ok(Ok(entry)) => Json(json!({
-            "plugin_id": row.plugin_id,
+            "plugin_id": plugin_id,
             "wasm_result": entry.result,
             "elapsed_ms": entry.elapsed_ms,
         }))
@@ -1684,10 +1683,9 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 /// 100 条。缓冲是进程内的,重启后为空——面板把它当「刚才发生了什么」看,
 /// 长期审计在 notification_log。
 pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match app.db.get_plugin(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
     };
     let entries: Vec<_> = app
         .plugins
@@ -1695,7 +1693,7 @@ pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): 
         .unwrap_or_else(|e| e.into_inner())
         .dispatch_log_snapshot()
         .into_iter()
-        .filter(|entry| entry.plugin_id == row.plugin_id)
+        .filter(|entry| entry.plugin_id == plugin_id)
         .take(100)
         .collect();
     Json(entries).into_response()
@@ -1710,10 +1708,9 @@ pub async fn set_plugin_kv(
     Path((id, key)): Path<(i64, String)>,
     Json(body): Json<Value>,
 ) -> Response {
-    let row = match app.db.get_plugin(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
     };
     if key.trim().is_empty() {
         return bad("key 不能为空");
@@ -1727,13 +1724,13 @@ pub async fn set_plugin_kv(
     let Some(value) = body.get("value").and_then(Value::as_str) else {
         return bad("body 必须是 {\"value\": \"...\"} 形式的对象");
     };
-    if value.len() > PLUGIN_KV_VALUE_MAX {
+    if value.len() > plugin::KV_VALUE_MAX {
         return bad(&format!(
             "value 超过 {} KiB 的上限（与插件的 host_kv_set 同限）",
-            PLUGIN_KV_VALUE_MAX / 1024
+            plugin::KV_VALUE_MAX / 1024
         ));
     }
-    match app.db.set(&format!("plugin.{}:{key}", row.plugin_id), value) {
+    match app.db.set(&format!("plugin.{plugin_id}:{key}"), value) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => fail(e),
     }
@@ -1741,12 +1738,11 @@ pub async fn set_plugin_kv(
 
 /// 列出一个插件的全部 kv 行(R13),key 去掉命名空间前缀,面板照原样回填表单。
 pub async fn list_plugin_kv(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match app.db.get_plugin(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return fail(e),
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
     };
-    match app.db.plugin_kv(&row.plugin_id) {
+    match app.db.plugin_kv(&plugin_id) {
         Ok(pairs) => Json(
             pairs.into_iter().map(|(key, value)| json!({"key": key, "value": value})).collect::<Vec<_>>(),
         )
@@ -1865,18 +1861,15 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     }
 }
 
-/// `notification.expiry_thresholds` 的静态校验:去掉可选的 JSON 数组括号后,
-/// 每一项都必须是 1..=365 的整数,且至少一项。
+/// `notification.expiry_thresholds` 的静态校验。共享解析
+/// ([`crate::db::parse_expiry_thresholds`],与读侧 main.rs 同一份)只保留合法
+/// 项,写侧比读侧严:任何一项非法都拒绝整个值,否则 `"7,x"` 会存进去、读出来
+/// 变成 `[7]`,面板回显的不再是操作员输入的值。解析前后项数一致即每项都
+/// 合法;至少一项有效由非空保证。
 fn valid_expiry_thresholds(value: &str) -> bool {
-    let inner = value.trim().trim_start_matches('[').trim_end_matches(']');
-    let mut any = false;
-    for token in inner.split(',') {
-        match token.trim().parse::<i64>() {
-            Ok(days) if (1..=365).contains(&days) => any = true,
-            _ => return false,
-        }
-    }
-    any
+    let items = crate::db::parse_expiry_thresholds(value);
+    let tokens = value.trim().trim_start_matches('[').trim_end_matches(']').split(',').count();
+    !items.is_empty() && items.len() == tokens
 }
 
 pub async fn save_settings(
@@ -3083,18 +3076,8 @@ mod tests {
 
     use tower::ServiceExt as _;
 
-    /// 与 plugin.rs tests 相同的最小合法模块:memory + bump 分配器 + 恒返回 0
-    /// 的 on_event。加载、启停、测试与日志全都用它。
-    const MINIMAL_WAT: &str = r#"
-(module
-  (memory (export "memory") 1)
-  (global $heap (mut i32) (i32.const 1024))
-  (func (export "__alloc") (param $cap i32) (result i32)
-    (local $ptr i32)
-    (local.set $ptr (global.get $heap))
-    (global.set $heap (i32.add (global.get $heap) (local.get $cap)))
-    (local.get $ptr))
-  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0)))"#;
+    // 与 plugin.rs 共享的最小合法模块:加载、启停、测试与日志全都用它。
+    use crate::plugin::MINIMAL_WAT;
 
     fn plugin_manifest(plugin_id: &str, abi_version: i64) -> String {
         format!(
@@ -3103,7 +3086,8 @@ mod tests {
         )
     }
 
-    /// 内存里打一个 tar.gz,entry 名与字节由调用方给。
+    /// 内存里打一个 tar.gz,entry 名与字节由调用方给。checksum 由
+    /// `append_data` 自己补齐,这里不重复设。
     fn tarball(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
@@ -3112,7 +3096,6 @@ mod tests {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(bytes.len() as u64);
                 header.set_mode(0o644);
-                header.set_cksum();
                 builder.append_data(&mut header, name, bytes.as_slice()).unwrap();
             }
             builder.into_inner().unwrap();
@@ -3132,7 +3115,6 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
-            header.set_cksum();
             builder.append_data(&mut header, "placeholder", bytes).unwrap();
             builder.into_inner().unwrap();
         }
@@ -3307,7 +3289,8 @@ mod tests {
         assert!(app.db.list_plugins().unwrap().is_empty(), "被拒的包一行都不写");
     }
 
-    /// 重复的 plugin_id 是覆盖不是升级,拒绝并保留原行。
+    /// 重复的 plugin_id 是覆盖不是升级:UNIQUE 约束在写库时拒绝(db 的
+    /// create_plugin 就是为此报的错),保留原行。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_duplicate_plugin_id_is_refused() {
         let app = plugin_app();
@@ -3319,7 +3302,7 @@ mod tests {
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
         assert!(
-            String::from_utf8_lossy(&bytes).contains("已存在"),
+            String::from_utf8_lossy(&bytes).contains("already uploaded"),
             "应说明如何处理:{}",
             String::from_utf8_lossy(&bytes)
         );
@@ -3498,7 +3481,7 @@ mod tests {
         assert_eq!(put("a:b", json!({"value": "x"})).await.status(), StatusCode::BAD_REQUEST);
         let long = "k".repeat(PLUGIN_KV_KEY_MAX + 1);
         assert_eq!(put(&long, json!({"value": "x"})).await.status(), StatusCode::BAD_REQUEST);
-        let big = "v".repeat(PLUGIN_KV_VALUE_MAX + 1);
+        let big = "v".repeat(plugin::KV_VALUE_MAX + 1);
         assert_eq!(put("k", json!({"value": big})).await.status(), StatusCode::BAD_REQUEST);
         assert_eq!(put("k", json!({"not_value": "x"})).await.status(), StatusCode::BAD_REQUEST);
         assert_eq!(put("k", json!({"value": 42})).await.status(), StatusCode::BAD_REQUEST);
