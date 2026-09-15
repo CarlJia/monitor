@@ -117,12 +117,41 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- Uploaded notification plugins: the manifest and the wasm module itself, so a
+-- restart needs nothing from the filesystem beyond the database.
+CREATE TABLE IF NOT EXISTS plugin (
+  id INTEGER PRIMARY KEY,
+  plugin_id TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL DEFAULT '',
+  manifest_json TEXT NOT NULL DEFAULT '',
+  wasm_blob BLOB NOT NULL,
+  wasm_sha256 TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'disabled',
+  last_error TEXT,
+  uploaded_at INTEGER NOT NULL
+);
+
+-- One row per dispatch the hub has made. The key is the idempotency key: the
+-- same node, event and billing cycle must never notify twice, while a state
+-- event (agent_offline/agent_online) holds one mutable row per node per side.
+CREATE TABLE IF NOT EXISTS notification_log (
+  node_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  threshold_or_state_key INTEGER NOT NULL,
+  sent_at INTEGER NOT NULL,
+  success INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (node_id, event_type, threshold_or_state_key)
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -219,6 +248,41 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
+/// v4 adds the `plugin` and `notification_log` tables and moves nothing. On a
+/// database opened through `Db::open` the schema batch has already created
+/// them by the time any migration runs; a backup candidate in `check_backup`
+/// is migrated on a bare connection, so the tables are created here rather
+/// than assumed. The DDL must match SCHEMA's -- a drift is caught loudly by
+/// `check_backup`, which compares a migrated backup's columns against a
+/// database SCHEMA built.
+fn migrate_to_4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin (
+           id INTEGER PRIMARY KEY,
+           plugin_id TEXT NOT NULL UNIQUE,
+           name TEXT NOT NULL DEFAULT '',
+           version TEXT NOT NULL DEFAULT '',
+           manifest_json TEXT NOT NULL DEFAULT '',
+           wasm_blob BLOB NOT NULL,
+           wasm_sha256 TEXT NOT NULL DEFAULT '',
+           enabled INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'disabled',
+           last_error TEXT,
+           uploaded_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS notification_log (
+           node_id INTEGER NOT NULL,
+           event_type TEXT NOT NULL,
+           threshold_or_state_key INTEGER NOT NULL,
+           sent_at INTEGER NOT NULL,
+           success INTEGER NOT NULL DEFAULT 0,
+           detail TEXT NOT NULL DEFAULT '',
+           PRIMARY KEY (node_id, event_type, threshold_or_state_key)
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -235,13 +299,18 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         migrate_to_3(conn)?;
     }
+    if from < 4 {
+        migrate_to_4(conn)?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
-    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+const TABLES: [&str; 10] = [
+    "setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session",
+    "plugin", "notification_log",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -381,6 +450,35 @@ pub struct PingTask {
     pub interval: i64,
     #[serde(default)]
     pub nodes: Vec<i64>,
+}
+
+/// One stored plugin: its manifest, wasm bytes and lifecycle flags.
+#[derive(Serialize, Debug, Clone)]
+pub struct PluginRow {
+    pub id: i64,
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub manifest_json: String,
+    /// Empty in the summary view served to the panel's list: the wasm module
+    /// is megabytes and the list needs none of it.
+    pub wasm_blob: Vec<u8>,
+    pub wasm_sha256: String,
+    pub enabled: bool,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub uploaded_at: i64,
+}
+
+/// The state event on the other side of `event_type`, if it names one. A state
+/// event's row and its opposite's are a pair: at most one may stand, or the
+/// hub would replay "offline" while the node is already known to be offline.
+fn opposite_state(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "agent_offline" => Some("agent_online"),
+        "agent_online" => Some("agent_offline"),
+        _ => None,
+    }
 }
 
 /// Restricts the database to its owner.
@@ -1329,7 +1427,7 @@ impl Db {
         if plotted > 0 {
             anyhow::bail!("the file carries views or triggers, which a hub backup never does");
         }
-        for table in TABLES {
+        for table in &TABLES[..8] {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -1358,6 +1456,21 @@ impl Db {
         // arrangement in which the restore has failed and the original data is
         // also gone.
         migrate(&candidate, version)?;
+        // The tables a migration adds are checked after it has run: a v3
+        // backup arrives without them, and it is exactly the file the migration
+        // exists to fix. Everything a pre-v4 hub wrote is checked before the
+        // migration touches the file, so a file missing those is still refused
+        // before anything is written.
+        for table in &TABLES[8..] {
+            let found: i64 = candidate.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )?;
+            if found == 0 {
+                anyhow::bail!("the file is not a hub backup: no {table} table");
+            }
+        }
         // The migration lands in a -wal beside a backup taken from a running hub.
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
@@ -1453,6 +1566,235 @@ impl Db {
         self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
         Ok(())
     }
+
+    // ---- plugins ----
+
+    /// Stores an uploaded plugin and returns the row as it now stands. A
+    /// `plugin_id` collision surfaces as an error the caller turns into a 400
+    /// rather than a silent clobber of the previous upload.
+    pub fn create_plugin(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        version: &str,
+        manifest_json: &str,
+        wasm_blob: &[u8],
+        wasm_sha256: &str,
+    ) -> Result<PluginRow> {
+        let now = Utc::now().timestamp();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO plugin (plugin_id, name, version, manifest_json, wasm_blob,
+                                 wasm_sha256, enabled, status, uploaded_at)
+             VALUES (?1,?2,?3,?4,?5,?6,0,'disabled',?7)",
+            params![plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256, now],
+        )
+        .with_context(|| format!("plugin {plugin_id} is already uploaded"))?;
+        let id = conn.last_insert_rowid();
+        Ok(PluginRow {
+            id,
+            plugin_id: plugin_id.into(),
+            name: name.into(),
+            version: version.into(),
+            manifest_json: manifest_json.into(),
+            wasm_blob: wasm_blob.into(),
+            wasm_sha256: wasm_sha256.into(),
+            enabled: false,
+            status: "disabled".into(),
+            last_error: None,
+            uploaded_at: now,
+        })
+    }
+
+    pub fn list_plugins(&self) -> Result<Vec<PluginRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256,
+                    enabled, status, last_error, uploaded_at FROM plugin ORDER BY uploaded_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_plugin)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn get_plugin(&self, id: i64) -> Result<Option<PluginRow>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256,
+                        enabled, status, last_error, uploaded_at FROM plugin WHERE id=?1",
+                [id],
+                row_to_plugin,
+            )
+            .optional()?)
+    }
+
+    /// The panel's list. The wasm bytes are megabytes per plugin and the list
+    /// needs none of them, so the column is left out of the query rather than
+    /// read and thrown away.
+    pub fn plugin_summaries(&self) -> Result<Vec<PluginRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, plugin_id, name, version, manifest_json, x'' AS wasm_blob, wasm_sha256,
+                    enabled, status, last_error, uploaded_at FROM plugin ORDER BY uploaded_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_plugin)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Enabling and disabling are the same switch: `status` mirrors `enabled`
+    /// so a reader that only looks at one of them cannot be lied to, and a
+    /// fresh enable starts from no error.
+    pub fn set_plugin_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        let status = if enabled { "enabled" } else { "disabled" };
+        self.conn().execute(
+            "UPDATE plugin SET enabled=?2, status=?3, last_error=NULL WHERE id=?1",
+            params![id, enabled, status],
+        )?;
+        Ok(())
+    }
+
+    /// Records the loader's verdict on a plugin: running, disabled, or failed
+    /// with the error that stopped it.
+    pub fn set_plugin_status(&self, id: i64, status: &str, last_error: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE plugin SET status=?2, last_error=?3 WHERE id=?1",
+            params![id, status, last_error],
+        )?;
+        Ok(())
+    }
+
+    /// Bails on an id that matches nothing, so a delete routed to a removed
+    /// plugin surfaces as an error the caller turns into a 404 rather than a
+    /// success that changed nothing.
+    pub fn delete_plugin(&self, id: i64) -> Result<()> {
+        let gone = self.conn().execute("DELETE FROM plugin WHERE id=?1", [id])?;
+        if gone == 0 {
+            anyhow::bail!("no plugin {id}");
+        }
+        Ok(())
+    }
+
+    // ---- notification log ----
+
+    /// True once this dispatch has been recorded. The ExpirySoon idempotency
+    /// check: `key` encodes the threshold tier and the expiry date, so one
+    /// alert per node, per tier, per billing cycle.
+    pub fn dispatch_already_sent(&self, node_id: i64, event_type: &str, key: i64) -> Result<bool> {
+        let conn = self.conn();
+        let sent: i64 = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM notification_log
+                            WHERE node_id=?1 AND event_type=?2 AND threshold_or_state_key=?3)",
+            params![node_id, event_type, key],
+            |r| r.get(0),
+        )?;
+        Ok(sent != 0)
+    }
+
+    /// Records an ExpirySoon dispatch. `INSERT OR IGNORE` rather than a plain
+    /// insert: the check and the write are not one statement, and a dispatch
+    /// racing itself must land as one row. Returns false when the row already
+    /// stood, so the caller knows it was the duplicate.
+    pub fn record_dispatch(
+        &self,
+        node_id: i64,
+        event_type: &str,
+        key: i64,
+        sent_at: i64,
+    ) -> Result<bool> {
+        let inserted = self.conn().execute(
+            "INSERT OR IGNORE INTO notification_log
+               (node_id, event_type, threshold_or_state_key, sent_at, success, detail)
+             VALUES (?1,?2,?3,?4,0,'')",
+            params![node_id, event_type, key, sent_at],
+        )?;
+        Ok(inserted != 0)
+    }
+
+    /// The node's most recent state event, whichever side it was. A node with
+    /// no row has never been reported offline (or the row was cleared by the
+    /// transition to the other side).
+    pub fn current_state_event(&self, node_id: i64) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT event_type, sent_at FROM notification_log
+                  WHERE node_id=?1 AND event_type IN ('agent_offline','agent_online')
+                  ORDER BY sent_at DESC LIMIT 1",
+                [node_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Flips the node to `event_type` and clears the opposite side's row, both
+    /// or neither. Returns false without writing when the node is already in
+    /// that state: an offline node flapping its connection must not re-alert.
+    pub fn transition_state_event(
+        &self,
+        node_id: i64,
+        event_type: &str,
+        sent_at: i64,
+    ) -> Result<bool> {
+        if self.current_state_event(node_id)?.is_some_and(|(current, _)| current == event_type) {
+            return Ok(false);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // State rows sit on key 0; the key distinguishes them from ExpirySoon
+        // dispatches, which carry their tier and expiry date.
+        tx.execute(
+            "INSERT OR REPLACE INTO notification_log
+               (node_id, event_type, threshold_or_state_key, sent_at, success, detail)
+             VALUES (?1,?2,0,?3,0,'')",
+            params![node_id, event_type, sent_at],
+        )?;
+        if let Some(other) = opposite_state(event_type) {
+            tx.execute(
+                "DELETE FROM notification_log
+                  WHERE node_id=?1 AND event_type=?2 AND threshold_or_state_key=0",
+                params![node_id, other],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Writes the dispatch outcome back: `success` and whatever the plugin
+    /// said, so the panel can show what was sent and what failed.
+    pub fn mark_dispatch_result(
+        &self,
+        node_id: i64,
+        event_type: &str,
+        key: i64,
+        success: bool,
+        detail: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE notification_log SET success=?4, detail=?5
+              WHERE node_id=?1 AND event_type=?2 AND threshold_or_state_key=?3",
+            params![node_id, event_type, key, success, detail],
+        )?;
+        Ok(())
+    }
+}
+
+/// Column order matches every plugin SELECT, which spell out their columns
+/// rather than relying on `SELECT *`: the summary view substitutes an empty
+/// blob for the column it leaves out.
+fn row_to_plugin(r: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRow> {
+    Ok(PluginRow {
+        id: r.get("id")?,
+        plugin_id: r.get("plugin_id")?,
+        name: r.get("name")?,
+        version: r.get("version")?,
+        manifest_json: r.get("manifest_json")?,
+        wasm_blob: r.get("wasm_blob")?,
+        wasm_sha256: r.get("wasm_sha256")?,
+        enabled: r.get::<_, i64>("enabled")? != 0,
+        status: r.get("status")?,
+        last_error: r.get("last_error")?,
+        uploaded_at: r.get("uploaded_at")?,
+    })
 }
 
 /// Turns one finished bucket into a row per probe, stamped with the bucket's
@@ -2350,5 +2692,227 @@ mod tests {
         // Editing an existing probe does not count as adding one.
         let first = db.ping_tasks().unwrap()[0].id;
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
+    }
+
+    /// A fresh database carries the two tables this build expects, and the
+    /// backup gates rely on `TABLES` naming every one of them.
+    #[test]
+    fn a_fresh_database_is_on_schema_v4_with_the_new_tables() {
+        let db = db();
+        let conn = db.conn();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            4
+        );
+        let table = |name: &str| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(table("plugin"), 1);
+        assert_eq!(table("notification_log"), 1);
+        drop(conn);
+
+        assert!(TABLES.contains(&"plugin"));
+        assert!(TABLES.contains(&"notification_log"));
+    }
+
+    /// A database left at v3 by the previous build: opening it must stamp v4,
+    /// add both tables, and keep the rows it already held. Opening the result
+    /// again must not redo anything that cannot be redone.
+    #[test]
+    fn a_v3_database_upgrades_to_v4_and_reopens_cleanly() {
+        let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A hub at v3: this build's schema minus the two v4 tables, carrying a
+        // node that must survive the upgrade.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "DROP TABLE plugin;
+             DROP TABLE notification_log;
+             INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(path).unwrap();
+        let conn = db.conn();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            4
+        );
+        for table in ["plugin", "notification_log"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} must exist after the upgrade");
+        }
+        drop(conn);
+        assert_eq!(db.nodes().unwrap().len(), 1, "the node the v3 hub had survives");
+
+        // Reopening a v4 database is a no-op: the migration chain stops before
+        // v4 and the stamp is already in place.
+        drop(db);
+        let again = Db::open(path).unwrap();
+        assert_eq!(
+            again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            4
+        );
+        drop(again);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A backup taken by a v3 hub carries neither new table, and restore is
+    /// the one path that migrates a file `Db::open` never sees: `check_backup`
+    /// opens the upload on a bare connection. The migration must create the
+    /// v4 tables there, or every backup older than this build is refused.
+    #[test]
+    fn a_v3_backup_survives_check_backup() {
+        let scratch = Scratch::new();
+        let live = Db::open(&scratch.0).unwrap();
+        node(&live, 1);
+
+        // The upload: this build's schema minus the two v4 tables, stamped as
+        // a v3 hub would have left it.
+        let old_path = format!("{}.copy", scratch.0);
+        let old = Connection::open(&old_path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "DROP TABLE plugin; DROP TABLE notification_log; PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(old);
+
+        // The candidate carries no foreign tables or rows, only the shape; it
+        // must pass every gate and come out with the v4 tables created.
+        live.check_backup(&old_path).unwrap();
+        let checked = Connection::open(&old_path).unwrap();
+        assert_eq!(
+            checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            4
+        );
+        for table in ["plugin", "notification_log"] {
+            let found: i64 = checked
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} must exist on the migrated upload");
+        }
+    }
+
+    /// The plugin round trip: upload, read back with and without the bytes,
+    /// flip the lifecycle flags, and refuse a second copy of the same
+    /// `plugin_id` rather than overwriting the first.
+    #[test]
+    fn plugins_round_trip_and_a_duplicate_plugin_id_is_refused() {
+        let db = db();
+        let wasm = b"\0asm-fake-module".to_vec();
+        let created = db
+            .create_plugin("mailer", "Mailer", "1.0.0", "{\"entry\":\"send\"}", &wasm, "sha")
+            .unwrap();
+        assert_eq!((created.id, created.plugin_id.as_str(), created.status.as_str()), (1, "mailer", "disabled"));
+        assert!(!created.enabled);
+
+        let back = db.get_plugin(created.id).unwrap().unwrap();
+        assert_eq!(back.wasm_blob, wasm, "the stored module comes back whole");
+        assert_eq!((back.name.as_str(), back.version.as_str()), ("Mailer", "1.0.0"));
+
+        let duplicate = db
+            .create_plugin("mailer", "Mailer", "2.0.0", "{}", &wasm, "sha2")
+            .expect_err("a second upload of the same plugin_id must be refused");
+        assert!(duplicate.to_string().contains("already uploaded"), "{duplicate}");
+        assert!(db.get_plugin(created.id).unwrap().unwrap().version == "1.0.0", "the first upload stands");
+
+        let second = db.create_plugin("webhook", "Webhook", "0.1", "{}", b"m2", "sha3").unwrap();
+        // Newest upload first.
+        let listed = db.list_plugins().unwrap();
+        assert_eq!(
+            listed.iter().map(|p| p.plugin_id.as_str()).collect::<Vec<_>>(),
+            vec!["webhook", "mailer"]
+        );
+
+        let summaries = db.plugin_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|p| p.wasm_blob.is_empty()), "the list never carries the bytes");
+        assert_eq!(summaries[1].id, created.id, "everything but the blob is the same row");
+
+        db.set_plugin_enabled(created.id, true).unwrap();
+        let enabled = db.get_plugin(created.id).unwrap().unwrap();
+        assert!(enabled.enabled && enabled.status == "enabled" && enabled.last_error.is_none());
+
+        db.set_plugin_status(created.id, "error", Some("wasm would not start")).unwrap();
+        assert_eq!(db.get_plugin(created.id).unwrap().unwrap().last_error.as_deref(), Some("wasm would not start"));
+
+        db.delete_plugin(second.id).unwrap();
+        assert!(db.get_plugin(second.id).unwrap().is_none());
+        assert!(db.delete_plugin(second.id).is_err(), "deleting a removed plugin must not report success");
+    }
+
+    /// The ExpirySoon idempotency key in action: the first record wins, the
+    /// second is told it lost, and the result lands on the row that stands.
+    #[test]
+    fn an_expiry_dispatch_is_recorded_once_and_its_result_written_back() {
+        let db = db();
+        assert!(!db.dispatch_already_sent(7, "expiry_soon", 42).unwrap(), "nothing sent, nothing recorded");
+
+        assert!(db.record_dispatch(7, "expiry_soon", 42, 100).unwrap(), "the first dispatch records");
+        assert!(db.dispatch_already_sent(7, "expiry_soon", 42).unwrap(), "and is remembered");
+        assert!(!db.record_dispatch(7, "expiry_soon", 42, 200).unwrap(), "a repeat is the duplicate");
+        // A different tier, or a different cycle's key, is its own dispatch.
+        assert!(!db.dispatch_already_sent(7, "expiry_soon", 43).unwrap());
+        assert!(!db.dispatch_already_sent(8, "expiry_soon", 42).unwrap());
+
+        db.mark_dispatch_result(7, "expiry_soon", 42, true, "sent to 2 channels").unwrap();
+        let conn = db.conn();
+        let (success, detail): (i64, String) = conn
+            .query_row(
+                "SELECT success, detail FROM notification_log
+                  WHERE node_id=7 AND event_type='expiry_soon' AND threshold_or_state_key=42",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((success, detail.as_str()), (1, "sent to 2 channels"));
+    }
+
+    /// State transitions are edges, not events: the same state twice is one
+    /// row and one alert, and flipping back and forth works because the
+    /// opposite side's row is what a flip clears.
+    #[test]
+    fn state_events_transition_once_per_side() {
+        let db = db();
+        assert_eq!(db.current_state_event(5).unwrap(), None, "never reported, never recorded");
+
+        assert!(db.transition_state_event(5, "agent_offline", 100).unwrap(), "the first offline is a transition");
+        assert!(!db.transition_state_event(5, "agent_offline", 200).unwrap(), "a repeat is not");
+        assert_eq!(db.current_state_event(5).unwrap(), Some(("agent_offline".into(), 100)));
+
+        assert!(db.transition_state_event(5, "agent_online", 300).unwrap(), "coming back is");
+        assert_eq!(db.current_state_event(5).unwrap(), Some(("agent_online".into(), 300)));
+        let offline_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_log WHERE node_id=5 AND event_type='agent_offline'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(offline_rows, 0, "the offline row died with the transition");
+
+        assert!(db.transition_state_event(5, "agent_offline", 400).unwrap(), "going offline again re-alerts");
     }
 }
