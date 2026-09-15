@@ -288,7 +288,8 @@ impl Registry {
 /// 上下文(host_http_post 要 `Handle::try_current`);但 block_in_place 是
 /// 同步阻塞,直接在本任务里调用会让外层的 timeout 永远等不到 poll。所以再
 /// spawn 一层,让本任务只在 worker 上等 JoinHandle,计时由别的 worker 完成。
-/// 超时后那个任务继续烧到 fuel 尽头——fuel 是硬兜底,超时只是不再等它。
+/// 超时后那个任务继续烧到 fuel 尽头——纯 wasm 死循环由 fuel 硬兜底;宿主调用
+/// 循环(fuel 不计量宿主侧执行)由 PluginState.deadline 拦截,见 [`call_on_event`]。
 async fn run_one(
     engine: wasmtime::Engine,
     app: Arc<App>,
@@ -301,12 +302,14 @@ async fn run_one(
     let plugin_id = plugin.manifest.plugin_id.clone();
     let event_type = event.type_name();
     let task = tokio::spawn(async move {
-        tokio::task::block_in_place(move || call_on_event(&engine, &app, &plugin, &event, fuel_limit))
+        tokio::task::block_in_place(move || {
+            call_on_event(&engine, &app, &plugin, &event, fuel_limit, timeout_ms)
+        })
     });
     let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
         Err(_) => "timeout".to_owned(),
         Ok(Ok(Ok(0))) => RESULT_SUCCESS.to_owned(),
-        Ok(Ok(Ok(code))) => format!("other:插件返回错误码 {code}"),
+        Ok(Ok(Ok(code))) => format!("other:{code}"),
         Ok(Ok(Err(e))) => {
             // trap 的具体信息在错误链深处,格式化整条链再判 fuel。
             let whole = format!("{e:#}");
@@ -531,12 +534,20 @@ pub const KV_VALUE_MAX: usize = 8 * 1024;
 /// 服务于面板自身的下载,不能为插件收短。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// 单次 http 响应体的硬上限:64 KiB。插件声明的 resp_cap 再大也读这么多——
+/// 有界下载要防的正是"cap 被声明成超大值/响应体本身无限大"的内存放大。
+const HTTP_RESP_MAX: usize = 64 * 1024;
+
 /// Store 的 user data:宿主函数看得见的全部宿主侧状态。
 pub(crate) struct PluginState {
     /// kv 命名空间隔离:`plugin.<plugin_id>:<key>`。
     plugin_id: String,
     /// 宿主回程:kv 与 http 都要它。App 本就活在 Arc 里,克隆只是引用计数。
     app: Arc<App>,
+    /// 本次 `on_event` 的墙钟预算截止点(由 `instantiate` 从 timeout_ms 折算)。
+    /// 外层 tokio 超时只能 detach 后台任务,fuel 又只计量 wasm 指令——宿主调用
+    /// 循环(每轮 wasm 指令极少、宿主侧执行再久也不耗 fuel)只有这道检查能拦。
+    deadline: std::time::Instant,
     /// 最近一次 `host_resp_alloc` 拿到的缓冲。`host_http_post` 的 resp_ptr 传 0
     /// 时回落到这里,插件可以少传两个参数。
     resp_ptr: i32,
@@ -550,7 +561,7 @@ pub(crate) struct PluginState {
 /// | -1 | 内存越界 / 非法 UTF-8 / 值超限 / `__alloc` 缺失或失败 |
 /// | -2 | http:URL 不是 `https://`(或 kv:数据库写入失败) |
 /// | -3 | http:method 不是 `POST` |
-/// | -4 | http:网络请求失败(或宿主不在异步运行时上下文里) |
+/// | -4 | http:网络请求失败 / 宿主不在异步运行时上下文 / 墙钟预算耗尽 |
 /// | -5 | http:响应状态非 2xx |
 const ERR_BOUNDS: i32 = -1;
 
@@ -600,18 +611,43 @@ pub(crate) struct InstanceHandle {
     pub instance: wasmtime::Instance,
 }
 
-/// 新建 Store(带 fuel)、注册宿主函数、实例化。`call_on_event` 的骨架,也是
-/// 测试直接驱动单个宿主函数的入口。
+/// http 响应的写回计划(纯函数,便于单测):决定写到哪个缓冲、最多写多少字节。
+///
+/// - 选缓冲:显式 `resp_ptr > 0` 优先,否则回落最近一次 `host_resp_alloc`
+///   (传入 `last`);都不可用返回 `None`——请求已发出,宿主返回 0 字节而不是
+///   报错。
+/// - 有效容量 = `min(声明 cap, HTTP_RESP_MAX)`:既是有界下载的上限(读到
+///   即停,超出的字节丢弃——与"整读后截断"同效,但不会把大响应体整个拉进
+///   内存),也是最终写回的截断长度。`bytes_len` 传 `usize::MAX` 时返回的
+///   第二项就是纯容量,下载前据此定界。
+fn resp_write_plan(resp_ptr: i32, resp_cap: i32, last: (i32, i32), bytes_len: usize) -> Option<(i32, usize)> {
+    let (ptr, cap) = if resp_ptr > 0 { (resp_ptr, resp_cap) } else { last };
+    if ptr <= 0 || cap < 0 {
+        return None;
+    }
+    let cap = (cap as usize).min(HTTP_RESP_MAX);
+    Some((ptr, bytes_len.min(cap)))
+}
+
+/// 新建 Store(带 fuel 与墙钟 deadline)、注册宿主函数、实例化。`call_on_event`
+/// 的骨架,也是测试直接驱动单个宿主函数的入口。
 pub(crate) fn instantiate(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
     plugin_id: &str,
     module: &wasmtime::Module,
     fuel_limit: u64,
+    timeout_ms: u64,
 ) -> Result<InstanceHandle> {
     let mut store = Store::new(
         engine,
-        PluginState { plugin_id: plugin_id.into(), app: app.clone(), resp_ptr: 0, resp_cap: 0 },
+        PluginState {
+            plugin_id: plugin_id.into(),
+            app: app.clone(),
+            deadline: std::time::Instant::now() + Duration::from_millis(timeout_ms),
+            resp_ptr: 0,
+            resp_cap: 0,
+        },
     );
     // fuel 在任何 wasm 执行(含 start 段)之前就位。
     store.set_fuel(fuel_limit)?;
@@ -665,6 +701,13 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
          out_ptr: i32,
          out_cap: i32|
          -> i32 {
+            // 墙钟预算检查(#3):kv 词表没有专门的预算错误码,复用 -1(负数让
+            // 插件能感知预算耗尽并退出循环;正常路径不会与越界混淆——越界是
+            // 参数问题,预算是时间问题,都会让插件放弃本次调用)。
+            if std::time::Instant::now() >= caller.data().deadline {
+                warn!(plugin = %caller.data().plugin_id, "kv_get 超出派发墙钟预算,拒绝");
+                return ERR_BOUNDS;
+            }
             let Some(key) = read_text(&mut caller, key_ptr, key_len) else {
                 return ERR_BOUNDS;
             };
@@ -739,7 +782,7 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     // host_http_post(method_ptr, method_len, url_ptr, url_len, body_ptr, body_len,
     //                resp_ptr, resp_cap) -> i32:
     //   >0 写入 resp 的字节数;-1 参数越界/非法 UTF-8/resp 写不进;
-    //   -2 URL 非 https;-3 method 非 POST;-4 网络失败;-5 状态非 2xx。
+    //   -2 URL 非 https;-3 method 非 POST;-4 网络失败/预算耗尽;-5 状态非 2xx。
     // v1 固定发 `Content-Type: application/json` 的 POST(webhook 事实标准)。
     // 日志只记 method 与 host:URL 可能内嵌 bot token。
     linker.func_wrap(
@@ -765,6 +808,13 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 return ERR_BOUNDS;
             };
             let plugin_id = caller.data().plugin_id.clone();
+            // 墙钟预算检查(#3):fuel 不计量宿主侧执行,超时也只 detach 任务;
+            // 入口拒绝让 wasm 侧的调用循环每轮拿到 -4,配合 fuel 兜底终止循环。
+            // -4 沿用"网络失败"码,语义是"本次请求不发出:预算耗尽"。
+            if std::time::Instant::now() >= caller.data().deadline {
+                warn!(plugin = %plugin_id, "host_http_post 超出派发墙钟预算,拒绝");
+                return -4;
+            }
             if method != "POST" {
                 warn!(plugin = %plugin_id, method = %method, "host_http_post v1 只接受 POST");
                 return -3;
@@ -776,6 +826,15 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
             // 只记 host,不记完整 URL:路径与查询串可能带 token。
             let host = url.split('/').nth(2).unwrap_or_default().to_string();
             let app = caller.data().app.clone();
+            // 下载前先定缓冲与有效容量:容量同时约束下载(读到即停)与写回截断。
+            // 没有可用缓冲也按硬上限有界下载——读完丢弃,不能不设界。
+            let last = {
+                let state = caller.data();
+                (state.resp_ptr, state.resp_cap)
+            };
+            let download_cap = resp_write_plan(resp_ptr, resp_cap, last, usize::MAX)
+                .map(|(_, cap)| cap)
+                .unwrap_or(HTTP_RESP_MAX);
             let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
                 warn!(plugin = %plugin_id, "host_http_post 不在异步运行时上下文中");
                 return -4;
@@ -787,9 +846,22 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 .header("content-type", "application/json")
                 .body(body);
             let outcome = handle.block_on(async {
-                let resp = request.send().await?;
+                let mut resp = request.send().await?;
                 let status = resp.status();
-                Ok::<_, reqwest::Error>((status, resp.bytes().await?))
+                // 有界读取(#4):按 chunk 累计到 download_cap 即停,超出的字节
+                // 丢弃——截断语义与"整读后截断"一致,但大响应体不再整体进内存。
+                let mut buf: Vec<u8> = Vec::new();
+                while buf.len() < download_cap {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) => {
+                            let remaining = download_cap - buf.len();
+                            buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        }
+                        Ok(None) => break,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok::<_, reqwest::Error>((status, buf))
             });
             let (status, bytes) = match outcome {
                 Ok(ok) => ok,
@@ -802,17 +874,11 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, host = %host, status = %status, "host_http_post 非 2xx 响应");
                 return -5;
             }
-            // resp_ptr 为 0 时回落到最近一次 host_resp_alloc 的缓冲。
-            let (ptr, cap) = if resp_ptr > 0 {
-                (resp_ptr, resp_cap)
-            } else {
-                let state = caller.data();
-                (state.resp_ptr, state.resp_cap)
+            // resp_ptr 为 0 时回落到最近一次 host_resp_alloc 的缓冲;没有可用
+            // 缓冲但请求已发出:不报错,返回 0 字节。选缓冲与截断见 resp_write_plan。
+            let Some((ptr, n)) = resp_write_plan(resp_ptr, resp_cap, last, bytes.len()) else {
+                return 0;
             };
-            if ptr <= 0 || cap < 0 {
-                return 0; // 没有可用缓冲,但请求已发出:不报错,返回 0 字节。
-            }
-            let n = bytes.len().min(cap as usize);
             if !write_mem(&mut caller, ptr, &bytes[..n]) {
                 return ERR_BOUNDS;
             }
@@ -830,16 +896,21 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
 /// 把一个事件交给插件处理,返回 `on_event` 的 i32(0 = 成功,非 0 = 插件自定义
 /// 错误码)。trap(fuel 耗尽、越界访问等)返回 `Err`。
 ///
-/// 超时不在这一层:Registry 的派发循环在外面套 tokio 超时;http 的单请求
-/// 超时见 [`HTTP_TIMEOUT`]。
+/// 超时不在这一层强制中断:Registry 的派发循环在外面套 tokio 超时,超时只是
+/// 不再等后台任务;fuel 只计量 wasm 指令,拦不住宿主调用循环。所以把
+/// `timeout_ms` 折算成 deadline 存进 PluginState,宿主函数(http_post/kv_get)
+/// 入口检查——预算耗尽后宿主调用被拒绝,wasm 循环每轮拿到负数返回值,配合
+/// fuel 兜底,两种死循环都出得来。http 的单请求超时见 [`HTTP_TIMEOUT`]。
 pub fn call_on_event(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
     plugin: &LoadedPlugin,
     event: &Event,
     fuel_limit: u64,
+    timeout_ms: u64,
 ) -> Result<i32> {
-    let mut handle = instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit)?;
+    let mut handle =
+        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
     let payload = serde_json::to_vec(event)?;
     let alloc = handle
         .instance
@@ -951,9 +1022,16 @@ subscribes = ["expiry_soon", "agent_offline"]
         let engine = engine();
         let app = app();
         let plugin = load(&engine, &row(compile(MINIMAL_WAT))).unwrap();
-        assert_eq!(call_on_event(&engine, &app, &plugin, &expiry_event(), DEFAULT_FUEL_LIMIT).unwrap(), 0);
+        assert_eq!(
+            call_on_event(&engine, &app, &plugin, &expiry_event(), DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS)
+                .unwrap(),
+            0
+        );
         let online = Event::AgentOnline { node_id: 5, name: "edge-1".into(), observed_at: 300 };
-        assert_eq!(call_on_event(&engine, &app, &plugin, &online, DEFAULT_FUEL_LIMIT).unwrap(), 0);
+        assert_eq!(
+            call_on_event(&engine, &app, &plugin, &online, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -977,7 +1055,8 @@ subscribes = ["expiry_soon", "agent_offline"]
         let app = app();
         let plugin = load(&engine, &row(compile(wat_text))).unwrap();
         let event = expiry_event();
-        let n = call_on_event(&engine, &app, &plugin, &event, DEFAULT_FUEL_LIMIT).unwrap();
+        let n =
+            call_on_event(&engine, &app, &plugin, &event, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap();
         let json = serde_json::to_vec(&event).unwrap();
         assert_eq!(n as usize, json.len());
     }
@@ -1064,7 +1143,7 @@ subscribes = ["expiry_soon", "agent_offline"]
     /// 实例化一个 WAT 模块并保留 Store:测试要直接读内存与 db。
     fn spawn(engine: &wasmtime::Engine, app: &Arc<App>, wat_text: &str) -> InstanceHandle {
         let module = wasmtime::Module::new(engine, compile(wat_text)).unwrap();
-        instantiate(engine, app, "com.example.test", &module, DEFAULT_FUEL_LIMIT).unwrap()
+        instantiate(engine, app, "com.example.test", &module, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap()
     }
 
     /// 通过 on_event 驱动:kv_set 写入再 kv_get 读出到固定地址,返回读到的字节数。
@@ -1197,10 +1276,59 @@ subscribes = ["expiry_soon", "agent_offline"]
         let engine = engine();
         let app = app();
         let plugin = load(&engine, &row(compile(wat_text))).unwrap();
-        let err = call_on_event(&engine, &app, &plugin, &expiry_event(), 10_000).unwrap_err();
+        let err =
+            call_on_event(&engine, &app, &plugin, &expiry_event(), 10_000, DEFAULT_TIMEOUT_MS).unwrap_err();
         // trap 信息在错误链深处,格式化整条链再找。
         let whole = format!("{err:#}");
         assert!(whole.to_lowercase().contains("fuel"), "应是 fuel 耗尽,实际: {whole}");
+    }
+
+    /// #3:宿主调用循环不能击穿超时沙箱。wasm 循环调 kv_get,每轮 wasm 指令
+    /// 极少(给的 fuel 烧不完)、宿主侧也不耗时——没有 deadline 检查时它会一直
+    /// 转到 fuel 尽头(远超 50ms 预算);有检查时 kv_get 在 deadline 后返回 -1,
+    /// 循环当轮退出。参数都是合法的,-1 只可能来自预算检查。
+    #[test]
+    fn a_host_call_loop_is_cut_off_by_the_deadline() {
+        let wat_text = r#"
+(module
+  (import "host" "kv_get" (func $kv_get (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "k")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (local $r i32)
+    (loop $again
+      ;; 无值返回 0:继续;预算耗尽返回 -1:退出。
+      (local.set $r (call $kv_get (i32.const 1024) (i32.const 1) (i32.const 4096) (i32.const 64)))
+      (br_if $again (i32.eqz (local.get $r))))
+    (local.get $r)))"#;
+        let engine = engine();
+        let app = app();
+        let plugin = load(&engine, &row(compile(wat_text))).unwrap();
+        let started = std::time::Instant::now();
+        // fuel 给到 50ms 内烧不完的量级;墙钟预算只有 50ms。
+        let code = call_on_event(&engine, &app, &plugin, &expiry_event(), 1_000_000_000, 50).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(code, -1, "循环应以 kv_get 的预算耗尽返回码退出");
+        assert!(elapsed < Duration::from_secs(5), "应在墙钟预算附近终止,实际 {elapsed:?}");
+    }
+
+    /// #16:resp_write_plan 的分支——完整写回、截断到 cap、resp_ptr=0 回落、
+    /// 硬上限、无缓冲。纯函数直接驱动,不需要网络。
+    #[test]
+    fn resp_write_plan_covers_full_truncated_fallback_and_limits() {
+        // 完整写回:cap 足够,写全部字节。
+        assert_eq!(resp_write_plan(8192, 256, (0, 0), 100), Some((8192, 100)));
+        // 截断到 cap:响应比缓冲大,只写 cap 字节。
+        assert_eq!(resp_write_plan(8192, 10, (0, 0), 100), Some((8192, 10)));
+        // resp_ptr = 0:回落最近一次 host_resp_alloc 的缓冲,截断同样生效。
+        assert_eq!(resp_write_plan(0, 0, (4096, 32), 100), Some((4096, 32)));
+        // 硬上限:cap 声明成超大值,有效容量仍是 64 KiB(bytes_len 传 MAX
+        // 即"只要容量"的用法,下载定界走的就是这条)。
+        assert_eq!(resp_write_plan(8192, i32::MAX, (0, 0), usize::MAX), Some((8192, HTTP_RESP_MAX)));
+        // 没有可用缓冲:请求已发出的场景由调用方返回 0 字节。
+        assert_eq!(resp_write_plan(0, 0, (0, 0), 100), None);
+        assert_eq!(resp_write_plan(8192, -1, (0, 0), 100), None);
     }
 
     // ---- Registry(U4):路由、隔离、预加载、dispatch_log、回写 ----

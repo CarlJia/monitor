@@ -193,12 +193,16 @@ export const testPlugin = (id: number) =>
 /** 一个插件最近的 100 条派发记录（R16）。 */
 export const pluginLogs = (id: number) => api<PluginLogEntry[]>(`/plugins/${id}/logs`)
 
-/** 写一个插件的 kv 行（R13）。后端没有删除路由：删 = 把值写空。 */
+/** 写一个插件的 kv 行（R13）。key 校验在后端 set_plugin_kv。 */
 export const setPluginKv = (id: number, key: string, value: string) =>
   api<{ ok: boolean }>(`/plugins/${id}/kv/${encodeURIComponent(key)}`, {
     method: "PUT",
     body: JSON.stringify({ value }),
   })
+
+/** 删一个插件的 kv 行（R13）。204 成功；404 插件不存在；key 校验与 PUT 一致。 */
+export const deletePluginKv = (id: number, key: string) =>
+  api<void>(`/plugins/${id}/kv/${encodeURIComponent(key)}`, { method: "DELETE" })
 
 /** 列出一个插件的全部 kv 行（R13）。 */
 export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)

@@ -1100,6 +1100,17 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            // The plugin table was replaced wholesale, so the in-memory registry
+            // must be rebuilt from the restored rows, as at startup: left alone
+            // it would keep dispatching to a plugin the backup no longer carries
+            // and never load one it newly finds enabled. Same shape as the
+            // agents clear above -- in-memory state that a page copy just
+            // orphaned.
+            {
+                let mut reg = app.plugins.write().unwrap_or_else(|e| e.into_inner());
+                *reg = plugin::Registry::empty(app.engine.clone());
+                reg.init(&app);
+            }
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -1600,10 +1611,11 @@ pub async fn delete_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    match app.db.delete_plugin(id).and_then(|()| app.db.delete_plugin_kv(&plugin_id)) {
+    // 行与 kv 在一条事务里删:两次独立调用之间失败的话,重试会撞上
+    // plugin_or_404 的 404,kv 孤儿永久留在 setting 表里。
+    match app.db.delete_plugin_with_kv(id, &plugin_id) {
         // db 行与 kv 都删净之后才动内存:失败路径上插件保持原状,重试即是。
-        // 返回值是删掉的 kv 行数,0 也是成功。
-        Ok(_) => {
+        Ok(()) => {
             app.plugins.write().unwrap_or_else(|e| e.into_inner()).remove_plugin(id);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1611,8 +1623,10 @@ pub async fn delete_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
     }
 }
 
-/// 启用插件:先写 db 的开关,再装进内存。加载失败时 Registry 已把 failed 与
-/// 原因落库,这里转成 400 带给面板——作者改完包重新上传即可。
+/// 启用插件:先写 db 的开关,再装进内存。加载失败时回滚开关再返回 400:
+/// Registry 已把 `failed` 与原因落库,但 `enabled` 还是上面写成的 1,留着
+/// 它,面板列表里就是"已启用"与 failed 的矛盾状态,重启后的预加载还会把
+/// 同一个失败再跑一遍。作者改完包重新上传即可。
 pub async fn enable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     if let Err(resp) = plugin_or_404(&app, id) {
         return resp;
@@ -1622,7 +1636,20 @@ pub async fn enable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
     }
     match app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(&app, id) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => bad(&format!("插件加载失败，已标记为 failed：{e:#}")),
+        Err(e) => {
+            let message = format!("{e:#}");
+            // 回滚开关并保住 failed 状态:`set_plugin_enabled(false)` 会把
+            // status 覆盖回 disabled、清掉 last_error,随后这条把 Registry
+            // 已写的 failed 与原因再放回去。
+            if let Err(e) = app
+                .db
+                .set_plugin_enabled(id, false)
+                .and_then(|()| app.db.set_plugin_status(id, "failed", Some(&message)))
+            {
+                return fail(e);
+            }
+            bad(&format!("插件加载失败，已标记为 failed：{message}"))
+        }
     }
 }
 
@@ -1699,6 +1726,22 @@ pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): 
     Json(entries).into_response()
 }
 
+/// kv 的 key 校验,set 与 delete 共用:set 侧挡住不能落库的形状,delete
+/// 侧对同样的形状按 400 拒绝而不是当成不存在的行吞掉——它们只能是打错的
+/// 路由参数,报错比静默成功更接近调用方的预期。
+fn kv_key_error(key: &str) -> Option<Response> {
+    if key.trim().is_empty() {
+        return Some(bad("key 不能为空"));
+    }
+    if key.len() > PLUGIN_KV_KEY_MAX {
+        return Some(bad(&format!("key 超过 {PLUGIN_KV_KEY_MAX} 字节的上限")));
+    }
+    if key.contains(':') {
+        return Some(bad("key 不能包含 ':'（它是 kv 命名空间的分隔符）"));
+    }
+    None
+}
+
 /// 写一个插件的 kv 行(R13):渠道配置这类「面板替插件填」的值。落在与
 /// host_kv_set 相同的 `plugin.<plugin_id>:<key>` 命名空间与相同的 8 KiB 上限
 /// 里,插件读到的与作者填的是同一行。
@@ -1712,14 +1755,8 @@ pub async fn set_plugin_kv(
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    if key.trim().is_empty() {
-        return bad("key 不能为空");
-    }
-    if key.len() > PLUGIN_KV_KEY_MAX {
-        return bad(&format!("key 超过 {PLUGIN_KV_KEY_MAX} 字节的上限"));
-    }
-    if key.contains(':') {
-        return bad("key 不能包含 ':'（它是 kv 命名空间的分隔符）");
+    if let Some(resp) = kv_key_error(&key) {
+        return resp;
     }
     let Some(value) = body.get("value").and_then(Value::as_str) else {
         return bad("body 必须是 {\"value\": \"...\"} 形式的对象");
@@ -1747,6 +1784,28 @@ pub async fn list_plugin_kv(_: Admin, State(app): State<Shared>, Path(id): Path<
             pairs.into_iter().map(|(key, value)| json!({"key": key, "value": value})).collect::<Vec<_>>(),
         )
         .into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// 删除一个插件的一个 kv 行(R13),与 set 同名路由、同一 key 校验。键名是
+/// 拼好的精确键,不走 LIKE:调用方给的是 key 而不是模式,`%` 与 `_` 只能按
+/// 字符匹配。删除不存在的行不是错误——两处面板同时打开,后点的那个同样
+/// 达成目标(与 `delete_session` 对同一竞态的处理一致)。
+pub async fn delete_plugin_kv_route(
+    _: Admin,
+    State(app): State<Shared>,
+    Path((id, key)): Path<(i64, String)>,
+) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = kv_key_error(&key) {
+        return resp;
+    }
+    match app.db.delete_setting(&format!("plugin.{plugin_id}:{key}")) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1795,6 +1854,25 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     // `retention_days()` already holds the default `prune` and the data page read,
     // so it answers here as well.
     out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
+    // The two notification keys follow the same shape: both have read-side
+    // fallbacks in `main`, so a hub where they were never set answered "" here
+    // and then `setting_error` refused the settings form echoing it back --
+    // failing the entire page over a field that was never edited. Echoing the
+    // effective value keeps the GET-PUT round trip closed, as `retention_days`
+    // above already does. The readers in `main` are the single source of the
+    // fallback, shared here rather than restated.
+    out.insert(
+        "notification.offline_threshold_reports".into(),
+        json!(crate::offline_threshold_reports(&app).to_string()),
+    );
+    out.insert(
+        "notification.expiry_thresholds".into(),
+        json!(crate::expiry_thresholds(&app)
+            .iter()
+            .map(|days| days.to_string())
+            .collect::<Vec<_>>()
+            .join(",")),
+    );
     out.insert(
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
@@ -2978,18 +3056,30 @@ mod tests {
     /// What `settings` returns must be what `save_settings` accepts. The panel
     /// echoes the whole form back and the write is all-or-nothing, so one key
     /// returned in a form the write refuses fails the entire page, naming a field
-    /// that was never edited.
+    /// that was never edited. The two notification keys are the newest of the
+    /// same shape: unset on a fresh hub, both must answer their effective
+    /// defaults rather than "".
     #[tokio::test]
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
         assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(
+            read["notification.offline_threshold_reports"], "3",
+            "未设置的离线阈值回显生效默认值,而不是空串"
+        );
+        assert_eq!(
+            read["notification.expiry_thresholds"], "7,3,1",
+            "未设置的到期阈值回显生效默认值,而不是空串"
+        );
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
             "site_name": read["site_name"],
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
+            "notification.offline_threshold_reports": read["notification.offline_threshold_reports"],
+            "notification.expiry_thresholds": read["notification.expiry_thresholds"],
             "public_page": "on",
         });
         assert_eq!(
@@ -2998,6 +3088,11 @@ mod tests {
             "a fresh hub's own settings must survive a round trip"
         );
         assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(
+            app.db.get("notification.offline_threshold_reports").as_deref(),
+            Some("3"),
+            "and the stored threshold is the one that was shown"
+        );
     }
 
     #[tokio::test]
@@ -3103,11 +3198,27 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    /// 重算 GNU 头的 checksum:checksum 字段在 148..156,计算时按空格。
+    /// 直接篡改原始 tar 字节的 fixture 在改完感兴趣的字段后调用。
+    fn rechecksum(raw: &mut [u8]) {
+        for b in &mut raw[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = raw[..512].iter().map(|&b| b as u32).sum();
+        raw[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+    }
+
+    fn gzipped(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
     /// 打一个 entry 名任意的 tar.gz:tar::Builder 拒绝写 `..` 与绝对路径,而要
     /// 防的正是绕过了 Builder 的包——把名字直接改在原始 tar 字节上(重算
     /// checksum)再压缩。
     fn tarball_with_entry_name(name: &str, bytes: &[u8]) -> Vec<u8> {
-        use std::io::Write as _;
         assert!(name.len() < 100, "tar 的 name 字段只有 100 字节");
         let mut raw = Vec::new();
         {
@@ -3118,19 +3229,50 @@ mod tests {
             builder.append_data(&mut header, "placeholder", bytes).unwrap();
             builder.into_inner().unwrap();
         }
-        // GNU 头:name 在 0..100,checksum 在 148..156(算时按空格)。
+        // GNU 头:name 在 0..100。
         for (i, b) in raw[..100].iter_mut().enumerate() {
             *b = name.as_bytes().get(i).copied().unwrap_or(0);
         }
-        for b in &mut raw[148..156] {
-            *b = b' ';
-        }
-        let sum: u32 = raw[..512].iter().map(|&b| b as u32).sum();
-        raw[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        rechecksum(&mut raw);
+        gzipped(&raw)
+    }
 
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&raw).unwrap();
-        encoder.finish().unwrap()
+    /// 打一个头里声明的大小与实际内容脱钩的 tar.gz:单 entry 上限检查读的是
+    /// 头里的声明值,「声明 16 MiB+1、内容为空」的包才能证明检查发生在读入
+    /// 之前,而不是把 16 MiB 真的吃进内存之后。
+    fn tarball_with_declared_entry_size(size: u64) -> Vec<u8> {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            builder.append_data(&mut header, "plugin.toml", &b""[..]).unwrap();
+            builder.into_inner().unwrap();
+        }
+        // GNU 头:size 在 124..136(11 位八进制 + NUL)。
+        let field = format!("{:011o}\0", size);
+        assert_eq!(field.len(), 12);
+        raw[124..136].copy_from_slice(field.as_bytes());
+        rechecksum(&mut raw);
+        gzipped(&raw)
+    }
+
+    /// 打一个带 symlink entry 的 tar.gz。大小合法、名字合法,唯一的越界是
+    /// 条目类型——解包防线必须在读内容之前就按类型拒绝它。
+    fn tarball_with_symlink() -> Vec<u8> {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("/etc/passwd").unwrap();
+            builder.append_data(&mut header, "evil-link", std::io::empty()).unwrap();
+            builder.into_inner().unwrap();
+        }
+        gzipped(&raw)
     }
 
     fn plugin_archive(manifest: &str) -> Vec<u8> {
@@ -3251,11 +3393,17 @@ mod tests {
     }
 
     /// 每一种坏包都带着原因被拒,并且什么都不写:manifest 缺失、ABI 不符、
-    /// plugin_id 含 ':',以及路径带 `..` 或绝对路径的包(名字直接改在 tar 头上,
-    /// 绕过打包工具的好心)。
+    /// plugin_id 含 ':',路径带 `..` 或绝对路径的包(名字直接改在 tar 头上,
+    /// 绕过打包工具的好心),以及解包防线的四种形态——条目数、单 entry 的
+    /// 声明大小、manifest 体量、symlink 条目。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bad_packages_are_refused_with_a_reason_and_store_nothing() {
         let app = plugin_app();
+        // 条目数超限:PLUGIN_MAX_ENTRIES + 1 个小文件,目录条目一样计入。
+        let crowded: Vec<(String, Vec<u8>)> =
+            (0..=PLUGIN_MAX_ENTRIES).map(|i| (format!("f{i}"), vec![b'x'])).collect();
+        let crowded: Vec<(&str, Vec<u8>)> =
+            crowded.iter().map(|(name, bytes)| (name.as_str(), bytes.clone())).collect();
         let cases: Vec<(Vec<u8>, &str)> = vec![
             // 没有 plugin.toml。
             (tarball(&[("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap())]), "没有 plugin.toml"),
@@ -3278,6 +3426,14 @@ mod tests {
                 ),
                 "绝对路径",
             ),
+            // 条目数超限。
+            (tarball(&crowded), "条目超过"),
+            // 单 entry 声明的大小越过 16 MiB:检查必须发生在读入之前。
+            (tarball_with_declared_entry_size(PLUGIN_MAX_FILE + 1), "单个文件"),
+            // manifest 体量越过 64 KiB:内容不必是合法 TOML,长度检查在解析之前。
+            (tarball(&[("plugin.toml", vec![b'#'; PLUGIN_MANIFEST_MAX + 1])]), "64 KiB"),
+            // symlink 条目:不是普通文件,读内容之前就该被拒。
+            (tarball_with_symlink(), "仅接受普通文件"),
         ];
         for (archive, needle) in cases {
             let refused = upload(&app, archive).await;
@@ -3329,6 +3485,7 @@ mod tests {
         );
         let row = app.db.get_plugin(row.id).unwrap().unwrap();
         assert_eq!(row.status, "failed", "失败的启用要落库成 failed");
+        assert!(!row.enabled, "开关也要拨回去:留着 enabled=1,列表里就是「已启用」与 failed 并存的矛盾状态");
         assert!(!app.plugins.read().unwrap_or_else(|e| e.into_inner()).is_loaded(row.id));
     }
 
@@ -3552,6 +3709,43 @@ mod tests {
         assert_eq!(left, json!([{"key": "bot_token", "value": "of-b"}]));
     }
 
+    /// kv 的单行删除(R13):删掉点名的那一行,别的行不动;key 校验与 set
+    /// 同一套;插件行不存在是 404。删不存在的行同样是 204——两处面板同时
+    /// 打开,后点的那个也达成了目标。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_kv_row_can_be_deleted_on_its_own() {
+        let app = plugin_app();
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.kv-del", 1))).await.status(),
+            StatusCode::OK
+        );
+        let id = app.db.list_plugins().unwrap()[0].id;
+        let put = |key: &str| {
+            set_plugin_kv(Admin, State(app.clone()), Path((id, key.to_owned())), Json(json!({"value": "v"})))
+        };
+        assert_eq!(put("webhook").await.status(), StatusCode::OK);
+        assert_eq!(put("fallback").await.status(), StatusCode::OK);
+        let del = |key: &str| delete_plugin_kv_route(Admin, State(app.clone()), Path((id, key.to_owned())));
+
+        assert_eq!(del("webhook").await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(app.db.get("plugin.com.example.kv-del:webhook"), None, "点名的那一行删掉");
+        let left = body_of(list_plugin_kv(Admin, State(app.clone()), Path(id)).await).await;
+        assert_eq!(left, json!([{"key": "fallback", "value": "v"}]), "别的行原样保留");
+
+        // 已经不存在的行:同样 204,重试幂等。
+        assert_eq!(del("webhook").await.status(), StatusCode::NO_CONTENT);
+
+        // key 校验与 set 同一套:空、含 ':'、超长。
+        for bad_key in ["   ", "a:b", &"k".repeat(PLUGIN_KV_KEY_MAX + 1)] {
+            assert_eq!(del(bad_key).await.status(), StatusCode::BAD_REQUEST, "{bad_key:?}");
+        }
+        // 插件行不存在是 404,不是静默成功。
+        assert_eq!(
+            delete_plugin_kv_route(Admin, State(app.clone()), Path((9999, "k".to_owned()))).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     /// 派发日志按 plugin_id 过滤:两个插件各自测试过,每个的日志只有自己的。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_dispatch_log_is_filtered_per_plugin() {
@@ -3585,5 +3779,84 @@ mod tests {
             plugin_dispatch_log(Admin, State(app.clone()), Path(9999)).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// restore 整库替换 plugin 表,内存里的 Registry 也必须跟着按还原后的
+    /// 行重建:置之不理的话,备份里没有的插件会继续收事件,备份里 enabled
+    /// 的插件永远装不进内存(Registry 只在启动 init 一次)。文件库而不是
+    /// :memory:,因为还原路径本身就是文件操作。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restore_rebuilds_the_plugin_registry_from_the_restored_table() {
+        let dir = std::env::temp_dir().join(format!("monitor-restore-plugin-{}", &random_token()[..16]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+        fn registry(app: &App) -> std::sync::RwLockReadGuard<'_, plugin::Registry> {
+            app.plugins.read().unwrap_or_else(|e| e.into_inner())
+        }
+
+        // 备份里有一个 enabled 的插件。
+        let wasm = wat::parse_str(MINIMAL_WAT).unwrap();
+        let backed_up = app
+            .db
+            .create_plugin(
+                "com.example.backup",
+                "Test Plugin",
+                "1.0.0",
+                &plugin_manifest("com.example.backup", 1),
+                &wasm,
+                "sha",
+            )
+            .unwrap();
+        app.db.set_plugin_enabled(backed_up.id, true).unwrap();
+        // 启动等价物:main 在 Arc::new 之后预加载一次,enabled 的插件装进内存。
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
+        assert!(registry(&app).is_loaded(backed_up.id), "预加载装上了备份里的插件");
+
+        let copy = format!("{live}.copy");
+        app.db.backup_into(&copy).unwrap();
+        let bytes = std::fs::read(&copy).unwrap();
+        std::fs::remove_file(&copy).unwrap();
+        assert!(registry(&app).is_loaded(backed_up.id), "预加载装上了备份里的插件");
+
+        // 备份之后:面板停用了备份里的插件,又传了另一个并启用,db 与内存
+        // 各自一致。备份里的行留着不删——SQLite 会把删掉的最高行号让给
+        // 下一个插入,两个插件就会共用同一个 id,断言分不清谁是谁。
+        app.db.set_plugin_enabled(backed_up.id, false).unwrap();
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).disable_plugin(backed_up.id);
+        let after = app
+            .db
+            .create_plugin(
+                "com.example.after",
+                "Test Plugin",
+                "1.0.0",
+                &plugin_manifest("com.example.after", 1),
+                &wasm,
+                "sha",
+            )
+            .unwrap();
+        assert_eq!(after.id, backed_up.id + 1, "fixture 只在两个 id 不同时才有意义");
+        app.db.set_plugin_enabled(after.id, true).unwrap();
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(&app, after.id).unwrap();
+        assert!(!registry(&app).is_loaded(backed_up.id) && registry(&app).is_loaded(after.id));
+
+        let done = db_restore(
+            Admin,
+            State(app.clone()),
+            Query(Chunk { offset: 0, total: bytes.len() as u64 }),
+            HeaderMap::new(),
+            axum::body::Body::from(bytes),
+        )
+        .await;
+        assert_eq!(done.status(), StatusCode::OK);
+
+        // 还原后的注册表以还原库为准:备份里的插件重新装进内存,备份之后
+        // 传的不再在。
+        assert!(registry(&app).is_loaded(backed_up.id), "备份里 enabled 的插件要重新加载");
+        assert!(!registry(&app).is_loaded(after.id), "备份里没有的插件不能留在内存里");
+        let enabled: Vec<String> =
+            app.db.enabled_plugins().unwrap().into_iter().map(|r| r.plugin_id).collect();
+        assert_eq!(enabled, vec!["com.example.backup".to_owned()]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

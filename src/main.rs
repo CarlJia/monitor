@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
         .route("/api/plugins/{id}/test", post(api::test_plugin))
         .route("/api/plugins/{id}/logs", get(api::plugin_dispatch_log))
         .route("/api/plugins/{id}/kv", get(api::list_plugin_kv))
-        .route("/api/plugins/{id}/kv/{key}", put(api::set_plugin_kv))
+        .route("/api/plugins/{id}/kv/{key}", put(api::set_plugin_kv).delete(api::delete_plugin_kv_route))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
@@ -636,8 +636,9 @@ fn renew_online_nodes(app: &App) -> Result<()> {
 /// 读 `notification.expiry_thresholds` 设置,空值(未设置、解析失败或没有
 /// 任何有效项)回退默认 `[7, 3, 1]`——与 `retention_days` 同一读取模式:坏值
 /// 静默回退,不挡住扫描本身。解析本体见 [`db::parse_expiry_thresholds`],
-/// 与写侧(api)共用。
-fn expiry_thresholds(app: &App) -> Vec<i64> {
+/// 与写侧(api)共用。`pub(crate)` 是因为 api 的 settings 读侧要回显同一
+/// 生效值,保证 GET-PUT 往返闭合。
+pub(crate) fn expiry_thresholds(app: &App) -> Vec<i64> {
     let raw = app.db.get("notification.expiry_thresholds").unwrap_or_default();
     let parsed = db::parse_expiry_thresholds(&raw);
     if parsed.is_empty() {
@@ -648,8 +649,9 @@ fn expiry_thresholds(app: &App) -> Vec<i64> {
 }
 
 /// 解析 `notification.offline_threshold_reports`:连续 N 个上报周期没有
-/// 消息即判离线。默认 3,钳制在 1..=100。
-fn offline_threshold_reports(app: &App) -> i64 {
+/// 消息即判离线。默认 3,钳制在 1..=100。`pub(crate)` 的理由同
+/// [`expiry_thresholds`]。
+pub(crate) fn offline_threshold_reports(app: &App) -> i64 {
     app.db
         .get("notification.offline_threshold_reports")
         .and_then(|v| v.parse::<i64>().ok())
@@ -747,26 +749,44 @@ fn notify_offline_nodes(app: &App) -> Result<()> {
 /// notifications once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
+    // 第一轮跳过离线判定:housekeeping 在 listener 绑定之前就 spawn,而
+    // interval 的首个 tick 立即完成。hub 停机超过判定窗口(默认 3 个上报
+    // 周期)后重启,每个节点的 last_seen 都已过期——但那是 hub 停机,不是
+    // 节点掉线;照常判定会把全部节点告警一遍离线,再在它们重新上报后逐个
+    // "恢复"。一小时后的下一轮,重连的节点已经刷新过 last_seen,判定恢复
+    // 正常。
+    let mut first_tick = true;
     loop {
         ticker.tick().await;
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
-        }
-        if let Err(e) = app.db.expire_sessions() {
-            warn!("expiring sessions failed: {e:#}");
-        }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
-        }
-        // 扫描在续期之后:刚续期的节点 days_left 变大,不会落回阈值档,
-        // 同一个 tick 里既续期又提醒同一节点的顺序矛盾不会出现。
-        if let Err(e) = notify_expiring_nodes(&app) {
-            warn!("scanning expiry notifications failed: {e:#}");
-        }
-        if let Err(e) = notify_offline_nodes(&app) {
-            warn!("scanning offline notifications failed: {e:#}");
-        }
+        let offline_scan = !first_tick;
+        first_tick = false;
+        housekeeping_pass(&app, offline_scan);
+    }
+}
+
+/// housekeeping 每轮执行的同步主体,抽成函数是为了让「第一轮跳过离线判定」
+/// 有测试可写:housekeeping 本身是 3600 秒一轮的循环,测试里等不到第二轮。
+fn housekeeping_pass(app: &App, offline_scan: bool) {
+    let keep = app.db.retention_days();
+    if let Err(e) = app.db.prune(keep) {
+        warn!("pruning history failed: {e:#}");
+    }
+    if let Err(e) = app.db.expire_sessions() {
+        warn!("expiring sessions failed: {e:#}");
+    }
+    if let Err(e) = renew_online_nodes(app) {
+        warn!("rolling expiry dates failed: {e:#}");
+    }
+    // 扫描在续期之后:刚续期的节点 days_left 变大,不会落回阈值档,
+    // 同一个 tick 里既续期又提醒同一节点的顺序矛盾不会出现。
+    if let Err(e) = notify_expiring_nodes(app) {
+        warn!("scanning expiry notifications failed: {e:#}");
+    }
+    if !offline_scan {
+        return;
+    }
+    if let Err(e) = notify_offline_nodes(app) {
+        warn!("scanning offline notifications failed: {e:#}");
     }
 }
 
@@ -961,6 +981,26 @@ mod tests {
         notify_offline_nodes(&app).unwrap();
         assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"));
         assert_eq!(dispatches(&app), 3);
+    }
+
+    /// 启动后的第一轮 housekeeping 跳过离线判定:hub 停机超过判定窗口后
+    /// 重启,所有节点的 last_seen 都已过期,但那是 hub 停机而不是节点掉线,
+    /// 照常判定会把每个节点都告警一遍。第二轮起判定照常——重连的节点在那
+    /// 之前已刷新 last_seen。
+    #[test]
+    fn the_first_housekeeping_pass_skips_the_offline_scan() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let now = Utc::now().timestamp();
+        app.db.touch_seen(id, now - OFFLINE_WINDOW_SECS * 10).unwrap();
+
+        housekeeping_pass(&app, false);
+        assert_eq!(dispatches(&app), 0, "停机期间的 last_seen 过期不触发离线告警");
+        assert_eq!(state_of(&app, id), None);
+
+        housekeeping_pass(&app, true);
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"), "之后的每轮照常判定");
+        assert_eq!(dispatches(&app), 1);
     }
 
     #[test]

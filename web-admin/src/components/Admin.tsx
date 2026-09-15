@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
-  api, changes, deletePlugin, disablePlugin, enablePlugin, GIB, listPluginKv, listPlugins, pluginLogs, provisioningSite, setPluginKv, testPlugin, trafficCorrection, upload, uploadPlugin,
+  api, changes, deletePlugin, deletePluginKv, disablePlugin, enablePlugin, GIB, listPluginKv, listPlugins, pluginLogs, provisioningSite, setPluginKv, testPlugin, trafficCorrection, upload, uploadPlugin,
   type Node, type PingTask, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
@@ -1170,10 +1170,11 @@ const EVENT_BADGES: Record<string, { label: string; className: string }> = {
   agent_online: { label: "上线恢复", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
 }
 
-// 启用绿 / 手动停用灰 / 加载失败红。失败原因在 last_error 里，徽标太窄放
-// 不下，hover 的 title 给出末尾 100 字符（错误链的头几层多半是上下文包装）。
+// 启用绿 / 手动停用灰 / 加载失败红。失败判定先于 enabled：后端回滚 enabled 前，
+// 会有短暂 enabled=1 且 status=failed 的窗口，不能让失败插件显示绿色「启用」。
+// 失败原因在 last_error 里，徽标太窄放不下，hover 的 title 给出末尾 100 字符
+// （错误链的头几层多半是上下文包装）。
 function PluginStatus({ plugin }: { plugin: Plugin }) {
-  if (plugin.enabled) return <Badge>启用</Badge>
   if (plugin.status === "failed" || plugin.last_error) {
     return (
       <Badge variant="destructive" className="font-normal" title={plugin.last_error?.slice(-100) ?? ""}>
@@ -1181,12 +1182,13 @@ function PluginStatus({ plugin }: { plugin: Plugin }) {
       </Badge>
     )
   }
+  if (plugin.enabled) return <Badge>启用</Badge>
   return <Badge variant="secondary" className="font-normal">停用</Badge>
 }
 
-// kv 行的可编辑状态：original 为 null 的是新行；cleared 标记的是「删除」——
-// 后端没有删除路由，删除即把值写空（key 保留，插件读到空串）。
-type KvRow = { key: string; value: string; original: string | null; cleared: boolean }
+// kv 行的可编辑状态：original 为 null 的是新行（未保存过，本地移除即可）；
+// 已有行点删除时从 rows 摘除并记入 deleted，保存时统一调后端的 DELETE 路由。
+type KvRow = { key: string; value: string; original: string | null }
 
 // 渠道配置里常见的凭据字段：默认掩码，眼睛按钮切换可见。
 const SECRET_KEY = /token|secret|password/i
@@ -1195,10 +1197,12 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
   const [rows, setRows] = useState<KvRow[] | null>(null)
   const [shown, setShown] = useState<Record<string, boolean>>({})
   const [saving, setSaving] = useState(false)
+  // 已有行里被点删除的 key：保存时逐个 DELETE，取消则丢弃（后端不动）。
+  const [deleted, setDeleted] = useState<string[]>([])
 
   useEffect(() => {
     listPluginKv(plugin.id)
-      .then((pairs) => setRows(pairs.map(({ key, value }) => ({ key, value, original: value, cleared: false }))))
+      .then((pairs) => setRows(pairs.map(({ key, value }) => ({ key, value, original: value }))))
       .catch((e: Error) => { setRows([]); toast.error(e.message) })
   }, [plugin.id])
 
@@ -1210,9 +1214,7 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
     // 与后端 set_plugin_kv 同一套规则，先在本地过一遍，报错能带上 key。
     const writes: [string, string][] = []
     for (const row of rows) {
-      if (row.cleared) {
-        writes.push([row.key, ""])
-      } else if (row.original === null) {
+      if (row.original === null) {
         // 没填完的新行不保存，而不是挡住整个表单。
         if (row.key.trim()) writes.push([row.key.trim(), row.value])
       } else if (row.value !== row.original) {
@@ -1224,11 +1226,12 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
         return toast.error(`key「${key}」不合法：非空、不含 ':'、不超过 128 字节`)
       }
     }
-    if (!writes.length) return onClose()
+    if (!writes.length && !deleted.length) return onClose()
     setSaving(true)
     try {
-      // 逐行写：后端没有批量接口。一行失败就停并报出是哪一步，已写的行是真
-      // 写进去了，重开对话框看到的就是当前值。
+      // 逐行删/写：后端没有批量接口。一步失败就停并报出是哪一步，已完成的
+      // 步骤是真生效了，重开对话框看到的就是当前值。
+      for (const key of deleted) await deletePluginKv(plugin.id, key)
       for (const [key, value] of writes) await setPluginKv(plugin.id, key, value)
       toast.success("插件配置已保存")
       onClose()
@@ -1247,7 +1250,7 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
           <DialogTitle>{plugin.name} 的渠道配置</DialogTitle>
           <DialogDescription className="leading-relaxed">
             插件运行时通过 host_kv_get 读这些值（命名空间 <code>plugin.{plugin.plugin_id}:</code>）。
-            key 非空、不含 ':'、128 字节内；value 8 KiB 内。删除一个已有的 key 会把它的值清空，key 本身保留。
+            key 非空、不含 ':'、128 字节内；value 8 KiB 内。删除一个已有的 key 会连同值一起从后端移除。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
@@ -1262,7 +1265,6 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                     className="w-44 shrink-0"
                     placeholder="key，如 webhook_url"
                     value={row.key}
-                    disabled={row.cleared}
                     onChange={(e) => patch(i, { key: e.target.value })}
                   />
                 ) : (
@@ -1274,12 +1276,11 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                   type={secret && !reveal ? "password" : "text"}
                   className="min-w-0 flex-1"
                   placeholder="value"
-                  value={row.cleared ? "" : row.value}
-                  disabled={row.cleared}
+                  value={row.value}
                   autoComplete="off"
                   onChange={(e) => patch(i, { value: e.target.value })}
                 />
-                {secret && !row.cleared && (
+                {secret && (
                   <Button
                     variant="ghost"
                     size="icon"
@@ -1293,15 +1294,18 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                 <Button
                   variant="ghost"
                   size="icon"
-                  title={row.original === null ? "移除" : row.cleared ? "撤销删除" : "删除（清空值）"}
+                  title={row.original === null ? "移除" : "删除"}
                   aria-label={row.original === null ? "移除" : "删除"}
                   onClick={() =>
                     row.original === null
                       ? setRows((old) => old?.filter((_, j) => j !== i) ?? old)
-                      : patch(i, { cleared: !row.cleared })
+                      : setRows((old) => {
+                          setDeleted((d) => [...d, row.key])
+                          return old?.filter((_, j) => j !== i) ?? old
+                        })
                   }
                 >
-                  <Trash2 className={row.cleared ? "" : "text-destructive"} />
+                  <Trash2 className="text-destructive" />
                 </Button>
               </div>
             )
@@ -1312,7 +1316,7 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setRows((old) => [...(old ?? []), { key: "", value: "", original: null, cleared: false }])}
+            onClick={() => setRows((old) => [...(old ?? []), { key: "", value: "", original: null }])}
           >
             <Plus /> 添加
           </Button>
@@ -1341,13 +1345,15 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   }, [plugins])
 
   useEffect(() => {
-    if (selected == null) return
+    // 删除插件后 pulse 递增会带着旧 id 重查：selected 已不在最新列表里就跳过，
+    // 免得和「删除成功」并排弹一个 404。
+    if (selected == null || !plugins.some((p) => p.id === selected)) return
     setEntries(null)
     pluginLogs(selected)
       .then(setEntries)
       .catch((e: Error) => { setEntries([]); toast.error(e.message) })
     // pulse：列表页的动作（测试、启停、删除）之后由父组件递增，日志随之刷新。
-  }, [selected, pulse, tick])
+  }, [selected, pulse, tick, plugins])
 
   if (!plugins.length || selected == null) return null
   const shown = (entries ?? []).filter((entry) => events.includes(entry.event_type))

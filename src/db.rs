@@ -590,6 +590,14 @@ impl Db {
         Ok(())
     }
 
+    /// 删除一行 setting。面板删除插件的单个 kv 行用;键名是调用方拼好的
+    /// 精确键,无需 LIKE。删除不存在的行不是错误:两处面板同时打开,后点
+    /// 的那个同样达成目标(与 `drop_session` 对同一竞态的处理一致)。
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM setting WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     // ---- nodes ----
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
@@ -709,11 +717,16 @@ impl Db {
 
     pub fn delete_node(&self, id: i64) -> Result<()> {
         let conn = self.conn();
-        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly. SQLite reassigns a
-        // deleted node's id to the next node created, which would otherwise
-        // inherit the removed machine's latency chart.
+        // `ping_record` and `notification_log` carry no foreign key to `node` --
+        // the former is WITHOUT ROWID and keyed for the chart query, the latter
+        // is keyed by its own idempotency scheme -- so both are cleared
+        // explicitly. SQLite reassigns a deleted node's id to the next node
+        // created, which would otherwise inherit the removed machine's latency
+        // chart and notification history: a leftover state row reading
+        // "already offline" would suppress the new machine's first offline
+        // alert, and leftover dispatch rows its expiry reminders.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        conn.execute("DELETE FROM notification_log WHERE node_id = ?1", [id])?;
         conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -1715,6 +1728,26 @@ impl Db {
         Ok(())
     }
 
+    /// 删除插件的行与它的全部 kv 行,一条事务里两条 DELETE。此前是两次
+    /// 独立调用:行删成功、kv 清理失败时调用方拿到 500,而重试在 api 的
+    /// plugin_or_404 门上变成 404,kv 孤儿从此永久留在 setting 表里。行删
+    /// 失败(行已不在)整体回滚并报错,与 [`Db::delete_plugin`] 一致。
+    /// kv 的模式与转义理由见 [`Db::plugin_kv`]。
+    pub fn delete_plugin_with_kv(&self, id: i64, plugin_id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let gone = tx.execute("DELETE FROM plugin WHERE id=?1", [id])?;
+        if gone == 0 {
+            anyhow::bail!("no plugin {id}");
+        }
+        tx.execute(
+            "DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'",
+            [format!("plugin.{}:%", like_escaped(plugin_id))],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 一个插件的全部 kv 行,`plugin.<plugin_id>:` 前缀,去掉前缀后的 key 与
     /// 值成对返回,按 key 排序让面板的列表稳定。U5 的 KV 面板与删除清理用。
     ///
@@ -2380,6 +2413,9 @@ mod tests {
         db.accumulate(id, "b", Some((10, 10))).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_ping(id, task, 1, 42).unwrap();
+        // 两种通知行:一条状态行,一条到期派发。
+        db.transition_state_event(id, "agent_offline", 1).unwrap();
+        db.record_dispatch(id, "expiry_soon", 42, 1).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
@@ -2392,6 +2428,19 @@ mod tests {
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
         assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+
+        // `notification_log` 同样没有外键,同一个复用的 id 会继承旧机器的
+        // 通知历史:一条遗留的状态行读作"已经离线",新机器第一次真正掉线
+        // 的告警会被它压掉。
+        let log_rows = |id: i64| {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM notification_log WHERE node_id=?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(log_rows(fresh), 0, "the reused id inherits no notification history");
+        assert_eq!(db.current_state_event(fresh).unwrap(), None);
     }
 
     /// The mirror of the sweep above, on the other key of the same table. SQLite
@@ -2950,6 +2999,29 @@ mod tests {
         db.delete_plugin(second.id).unwrap();
         assert!(db.get_plugin(second.id).unwrap().is_none());
         assert!(db.delete_plugin(second.id).is_err(), "deleting a removed plugin must not report success");
+    }
+
+    /// 删除插件是行与 kv 行一条事务:两端一起消失,行不在时整体报错而不
+    /// 是留下半删状态。前缀的 LIKE 转义由 [`Db::plugin_kv`] 的测试覆盖,
+    /// 这里只证两条 DELETE 在一个事务里。
+    #[test]
+    fn deleting_a_plugin_takes_its_kv_rows_in_the_same_transaction() {
+        let db = db();
+        let row = db.create_plugin("mailer", "Mailer", "1.0.0", "{}", b"m", "sha").unwrap();
+        db.set("plugin.mailer:token", "x").unwrap();
+        db.set("plugin.mailer:webhook", "y").unwrap();
+        db.set("plugin.other:token", "kept").unwrap();
+
+        db.delete_plugin_with_kv(row.id, "mailer").unwrap();
+        assert!(db.get_plugin(row.id).unwrap().is_none(), "行删了");
+        assert_eq!(db.get("plugin.mailer:token"), None, "kv 行随插件一起删");
+        assert_eq!(db.get("plugin.mailer:webhook"), None);
+        assert_eq!(db.get("plugin.other:token").as_deref(), Some("kept"), "别的插件的行不动");
+
+        assert!(
+            db.delete_plugin_with_kv(row.id, "mailer").is_err(),
+            "deleting a removed plugin must not report success"
+        );
     }
 
     /// kv 的前缀匹配必须按字符比较,而不是按 LIKE 的通配符:`_` 与 `%` 在
