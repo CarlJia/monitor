@@ -122,6 +122,91 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return res.status === 204 ? (undefined as T) : res.json()
 }
 
+// ---- plugins（U7）：通知插件的上传、启停删、测试、日志与 kv ----
+
+export type Plugin = {
+  id: number
+  plugin_id: string
+  name: string
+  version: string
+  enabled: boolean
+  status: string
+  last_error: string | null
+  uploaded_at: number
+  subscribes: string[]
+}
+
+/** 派发日志的一条（R16）：内存环形缓冲的快照，重启后为空。 */
+export type PluginLogEntry = {
+  /** Unix 秒。 */
+  at: number
+  plugin_id: string
+  event_type: string
+  elapsed_ms: number
+  result: string
+}
+
+export type PluginKv = { key: string; value: string }
+
+/**
+ * 上传插件包（R11）。multipart 的 `plugin` 字段带 tar.gz，后端上限 8 MiB。
+ * 单独于 `api()`：FormData 不能带 json 的 content-type；413 是代理拦的，
+ * 网络断在 fetch 自己身上——两者都要一句人说的话。
+ */
+export async function uploadPlugin(file: File): Promise<{
+  id: number
+  plugin_id: string
+  status: string
+  last_error: string | null
+}> {
+  const form = new FormData()
+  form.append("plugin", file)
+  let res: Response
+  try {
+    res = await fetch("/api/plugins", { method: "POST", body: form })
+  } catch {
+    throw new ApiError(0, "上传失败，请检查网络")
+  }
+  if (!res.ok) {
+    if (res.status === 413) throw new ApiError(413, "文件过大")
+    throw new ApiError(res.status, (await res.text()) || res.statusText)
+  }
+  return res.json()
+}
+
+export const listPlugins = () => api<Plugin[]>("/plugins")
+
+export const deletePlugin = (id: number) => api<void>(`/plugins/${id}`, { method: "DELETE" })
+
+export const enablePlugin = (id: number) =>
+  api<{ ok: boolean }>(`/plugins/${id}/enable`, { method: "POST" })
+
+export const disablePlugin = (id: number) =>
+  api<{ ok: boolean }>(`/plugins/${id}/disable`, { method: "POST" })
+
+/** 测试通知（R12）：合成一个明天的 ExpirySoon 事件走真实派发路径。 */
+export const testPlugin = (id: number) =>
+  api<{ plugin_id: string; wasm_result: string; elapsed_ms: number }>(`/plugins/${id}/test`, {
+    method: "POST",
+  })
+
+/** 一个插件最近的 100 条派发记录（R16）。 */
+export const pluginLogs = (id: number) => api<PluginLogEntry[]>(`/plugins/${id}/logs`)
+
+/** 写一个插件的 kv 行（R13）。key 校验在后端 set_plugin_kv。 */
+export const setPluginKv = (id: number, key: string, value: string) =>
+  api<{ ok: boolean }>(`/plugins/${id}/kv/${encodeURIComponent(key)}`, {
+    method: "PUT",
+    body: JSON.stringify({ value }),
+  })
+
+/** 删一个插件的 kv 行（R13）。204 成功；404 插件不存在；key 校验与 PUT 一致。 */
+export const deletePluginKv = (id: number, key: string) =>
+  api<void>(`/plugins/${id}/kv/${encodeURIComponent(key)}`, { method: "DELETE" })
+
+/** 列出一个插件的全部 kv 行（R13）。 */
+export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)
+
 /**
  * 4 MiB: the only size a reverse proxy must pass, whatever the file behind it
  * weighs. The hub accepts up to 8 MiB per request, so this can change without

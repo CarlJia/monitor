@@ -210,8 +210,8 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // signal.
                 Some(Ok(Message::Text(text))) =>
                     match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
-                    Ok(true) => locate(app.clone(), node_id, ip.clone()),
-                    Ok(false) => {}
+                    Ok(Some(geo)) => locate(app.clone(), node_id, geo),
+                    Ok(None) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
                 },
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
@@ -236,20 +236,27 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
 /// that one would mark a node offline while it is reporting normally.
 fn release(app: &App, node_id: i64, session: u64) -> bool {
     let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
-    if !agents.get(&node_id).is_some_and(|a| a.session == session) {
+    if agents.get(&node_id).is_none_or(|a| a.session != session) {
         return false;
     }
     agents.remove(&node_id);
     true
 }
 
-/// Handles one inbound frame and reports whether the node is now owed a country
-/// lookup. The lookup itself is an outbound request and happens off this path;
-/// see `locate`.
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
+/// Handles one inbound frame and reports the address a country lookup must be
+/// asked about, if the node is owed one. The lookup itself is an outbound
+/// request and happens off this path; see `locate`.
+///
+/// `serve` passes the same address to both `save_facts` and `locate`, so the
+/// country always belongs to the address that was asked about.
+fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<String>> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
-        "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
+        "hello" => {
+            let geo = geo_address(&rpc.params, ip);
+            let owed = app.db.save_facts(node_id, &rpc.params, &geo)?;
+            return Ok(owed.then_some(geo));
+        }
         "report" => report(app, node_id, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -264,7 +271,26 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
         }
         other => debug!("node {node_id} sent unknown method {other}"),
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// The address a node's country belongs to: a public address the agent says
+/// it holds, else the one it connected from.
+///
+/// Behind a CDN the peer is an edge node that changes every reconnect, and
+/// `save_facts` clears the country on each new address -- so a hub proxied by
+/// one would leave the badge permanently empty and even a landed answer wrong
+/// (the edge's country, not the node's). The agent's own `ipv6`/`ipv4` fields
+/// describe the machine itself and are stable across reconnects; private ones
+/// -- a NAT'd v4, a link-local v6 -- say nothing about where in the world it
+/// is and are skipped for a public peer.
+fn geo_address(facts: &serde_json::Value, peer: &str) -> String {
+    let own = ["ipv6", "ipv4"]
+        .iter()
+        .filter_map(|k| facts.get(k).and_then(|v| v.as_str()))
+        .filter_map(|v| v.trim().parse::<std::net::IpAddr>().ok())
+        .find(|ip| !crate::auth::behind_local_proxy(*ip));
+    own.map_or_else(|| peer.to_owned(), |ip| ip.to_string())
 }
 
 /// When each node was last looked up.
@@ -740,6 +766,39 @@ mod tests {
         assert_eq!(n.hostname, "vps-1");
         assert_eq!(n.cpu_cores, 4);
         assert_eq!(n.ip, "198.51.100.4");
+    }
+
+    /// Behind a CDN the peer address is an edge node that changes every
+    /// reconnect, so `save_facts` clears the country on each one and the
+    /// hourly gate never lets a lookup land. The address the agent reports
+    /// about itself -- a public one it holds -- is stable and locatable, so
+    /// it is what the country must belong to.
+    #[test]
+    fn a_node_behind_a_proxy_is_located_by_its_reported_public_address() {
+        let app = app();
+        let id = node(&app);
+        let hello = |v6: &str| {
+            json!({"jsonrpc": "2.0", "method": "hello",
+                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}})
+            .to_string()
+        };
+
+        // The peer is a CDN edge; the address the agent holds is public v6.
+        dispatch(&app, id, "104.23.175.81", &hello("2001:b030:112d:71f::45")).unwrap();
+        assert_eq!(app.db.node(id).unwrap().unwrap().ip, "2001:b030:112d:71f::45");
+
+        // A different edge on reconnect: the address the country belongs to
+        // has not changed, so the badge must survive the reconnect.
+        app.db.set_country(id, "TW", "2001:b030:112d:71f::45").unwrap();
+        dispatch(&app, id, "104.23.176.200", &hello("2001:b030:112d:71f::45")).unwrap();
+        let n = app.db.node(id).unwrap().unwrap();
+        assert_eq!(n.country, "TW", "a CDN edge rotating must not void the country");
+        assert_eq!(n.ip, "2001:b030:112d:71f::45");
+
+        // Only private addresses and a proxy peer: nothing to locate, so the
+        // peer is what the panel shows.
+        dispatch(&app, id, "104.23.175.81", &hello("fe80::be24:11ff:fe83:c1b3")).unwrap();
+        assert_eq!(app.db.node(id).unwrap().unwrap().ip, "104.23.175.81");
     }
 
     #[test]

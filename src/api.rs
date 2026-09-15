@@ -17,6 +17,7 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::plugin;
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -35,11 +36,11 @@ impl FromRequestParts<Shared> for Admin {
     }
 }
 
-fn fail(e: impl std::fmt::Display) -> Response {
+pub(crate) fn fail(e: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
 }
 
-fn bad(message: &str) -> Response {
+pub(crate) fn bad(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
 }
 
@@ -852,6 +853,8 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "notification.offline_threshold_reports",
+    "notification.expiry_thresholds",
 ];
 
 // ---- the database itself ----
@@ -887,8 +890,8 @@ pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 /// interrupted attempt left behind, and nothing is ever left to collect.
 #[derive(Deserialize)]
 pub struct Chunk {
-    offset: u64,
-    total: u64,
+    pub(crate) offset: u64,
+    pub(crate) total: u64,
 }
 
 /// Appends one piece to `path`, returning the file's length afterwards; the
@@ -1093,6 +1096,17 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            // The plugin table was replaced wholesale, so the in-memory registry
+            // must be rebuilt from the restored rows, as at startup: left alone
+            // it would keep dispatching to a plugin the backup no longer carries
+            // and never load one it newly finds enabled. Same shape as the
+            // agents clear above -- in-memory state that a page copy just
+            // orphaned.
+            {
+                let mut reg = app.plugins.write().unwrap_or_else(|e| e.into_inner());
+                *reg = plugin::Registry::empty(app.engine.clone());
+                reg.init(&app);
+            }
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -1385,6 +1399,25 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
     // `retention_days()` already holds the default `prune` and the data page read,
     // so it answers here as well.
     out.insert("retention_days".into(), json!(app.db.retention_days().to_string()));
+    // The two notification keys follow the same shape: both have read-side
+    // fallbacks in `main`, so a hub where they were never set answered "" here
+    // and then `setting_error` refused the settings form echoing it back --
+    // failing the entire page over a field that was never edited. Echoing the
+    // effective value keeps the GET-PUT round trip closed, as `retention_days`
+    // above already does. The readers in `main` are the single source of the
+    // fallback, shared here rather than restated.
+    out.insert(
+        "notification.offline_threshold_reports".into(),
+        json!(crate::offline_threshold_reports(&app).to_string()),
+    );
+    out.insert(
+        "notification.expiry_thresholds".into(),
+        json!(crate::expiry_thresholds(&app)
+            .iter()
+            .map(|days| days.to_string())
+            .collect::<Vec<_>>()
+            .join(",")),
+    );
     out.insert(
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
@@ -1432,9 +1465,34 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
+        // 通知阈值(U7/D4):读侧在 main.rs 的 offline_threshold_reports,1..=100
+        // 之外与解析失败都会被 clamp/回退,这里挡在写入之前——存进去的值读出来
+        // 必须还是它自己。
+        "notification.offline_threshold_reports"
+            if !value.parse::<i64>().is_ok_and(|n| (1..=100).contains(&n)) =>
+        {
+            Some("离线判定阈值必须是 1 到 100 之间的整数（连续 N 个上报周期无消息即判离线）".into())
+        }
+        // 与 main.rs 的 expiry_thresholds 同一套宽松写法:`"[7,3,1]"` 与
+        // `"7,3,1"` 都收。读侧会剔除坏项并在全部失效时回退默认,这里同样挡在
+        // 写入之前,且要求至少一项有效。
+        "notification.expiry_thresholds" if !valid_expiry_thresholds(value) => {
+            Some("到期提醒阈值必须是逗号分隔的 1 到 365 之间的天数，如 7,3,1".into())
+        }
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
+}
+
+/// `notification.expiry_thresholds` 的静态校验。共享解析
+/// ([`crate::db::parse_expiry_thresholds`],与读侧 main.rs 同一份)只保留合法
+/// 项,写侧比读侧严:任何一项非法都拒绝整个值,否则 `"7,x"` 会存进去、读出来
+/// 变成 `[7]`,面板回显的不再是操作员输入的值。解析前后项数一致即每项都
+/// 合法;至少一项有效由非空保证。
+fn valid_expiry_thresholds(value: &str) -> bool {
+    let items = crate::db::parse_expiry_thresholds(value);
+    let tokens = value.trim().trim_start_matches('[').trim_end_matches(']').split(',').count();
+    !items.is_empty() && items.len() == tokens
 }
 
 pub async fn save_settings(
@@ -2325,8 +2383,13 @@ mod tests {
             )
         };
 
-        let held: Vec<_> =
-            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        // `acquire().await` rather than `try_acquire().expect`: other tests in
+        // this binary hold a permit briefly while passing through `metrics`, and
+        // an instant grab of all four raced them as the suite grew.
+        let mut held = Vec::new();
+        for _ in 0..HISTORY_SLOTS {
+            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+        }
         assert_eq!(ask().await.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
         assert_eq!(ask().await.status(), StatusCode::OK, "a finished query gives its slot back");
@@ -2334,8 +2397,10 @@ mod tests {
         // An unauthorised caller is told so rather than asked to retry later: the
         // gate sits behind the visibility check deliberately.
         app.db.set("public_page", "off").unwrap();
-        let held: Vec<_> =
-            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        let mut held = Vec::new();
+        for _ in 0..HISTORY_SLOTS {
+            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+        }
         assert_eq!(ask().await.status(), StatusCode::UNAUTHORIZED);
         drop(held);
     }
@@ -2536,18 +2601,30 @@ mod tests {
     /// What `settings` returns must be what `save_settings` accepts. The panel
     /// echoes the whole form back and the write is all-or-nothing, so one key
     /// returned in a form the write refuses fails the entire page, naming a field
-    /// that was never edited.
+    /// that was never edited. The two notification keys are the newest of the
+    /// same shape: unset on a fresh hub, both must answer their effective
+    /// defaults rather than "".
     #[tokio::test]
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
         assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(
+            read["notification.offline_threshold_reports"], "3",
+            "未设置的离线阈值回显生效默认值,而不是空串"
+        );
+        assert_eq!(
+            read["notification.expiry_thresholds"], "7,3,1",
+            "未设置的到期阈值回显生效默认值,而不是空串"
+        );
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
             "site_name": read["site_name"],
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
+            "notification.offline_threshold_reports": read["notification.offline_threshold_reports"],
+            "notification.expiry_thresholds": read["notification.expiry_thresholds"],
             "public_page": "on",
         });
         assert_eq!(
@@ -2556,6 +2633,11 @@ mod tests {
             "a fresh hub's own settings must survive a round trip"
         );
         assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(
+            app.db.get("notification.offline_threshold_reports").as_deref(),
+            Some("3"),
+            "and the stored threshold is the one that was shown"
+        );
     }
 
     #[tokio::test]
@@ -2569,5 +2651,58 @@ mod tests {
         assert_eq!(body["github_secret_set"], true);
         assert!(body.get("github_client_secret").is_none());
         assert!(!body.to_string().contains("super-secret"));
+    }
+
+    /// 通知阈值两个 key(U7):读侧带出,合法值（两种 expiry 写法）落库,非法值
+    /// 400 且什么都不写。
+    #[tokio::test]
+    async fn notification_threshold_settings_round_trip() {
+        let app = std::sync::Arc::new(app());
+        let Json(read) = settings(Admin, State(app.clone())).await;
+        assert!(read.get("notification.offline_threshold_reports").is_some());
+        assert!(read.get("notification.expiry_thresholds").is_some());
+
+        let put = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
+
+        // 合法值:expiry 两种写法都收。
+        assert_eq!(
+            put(json!({"notification.offline_threshold_reports": "5"})).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(app.db.get("notification.offline_threshold_reports").as_deref(), Some("5"));
+        for good in ["[7,3,1]", "7, 3, 1"] {
+            assert_eq!(
+                put(json!({"notification.expiry_thresholds": good})).await.status(),
+                StatusCode::OK,
+                "{good:?}"
+            );
+        }
+        assert_eq!(app.db.get("notification.expiry_thresholds").as_deref(), Some("7, 3, 1"));
+
+        // 非法值:范围外、非数字、空串、坏项混杂。全部 400 且不落库。
+        for junk in ["", "0", "101", "-3", "abc", "3.5"] {
+            assert_eq!(
+                put(json!({"notification.offline_threshold_reports": junk})).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{junk:?}"
+            );
+        }
+        for junk in ["", "abc", "7,x", "0", "366", "[", "7;3", "-1,3"] {
+            assert_eq!(
+                put(json!({"notification.expiry_thresholds": junk})).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{junk:?}"
+            );
+        }
+        assert_eq!(
+            app.db.get("notification.offline_threshold_reports").as_deref(),
+            Some("5"),
+            "被拒绝的值不能覆盖已存的合法值"
+        );
+        assert_eq!(
+            app.db.get("notification.expiry_thresholds").as_deref(),
+            Some("7, 3, 1"),
+            "被拒绝的值不能覆盖已存的合法值"
+        );
     }
 }

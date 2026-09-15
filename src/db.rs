@@ -12,7 +12,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+pub use crate::db_plugins::{parse_expiry_thresholds, PluginRow};
+
 pub struct Db(Mutex<Connection>);
+
+/// 供本文件与 db_plugins 的测试共用的内存库。
+#[cfg(test)]
+pub(crate) fn db() -> Db {
+    Db::open(":memory:").unwrap()
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -117,12 +125,41 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+-- Uploaded notification plugins: the manifest and the wasm module itself, so a
+-- restart needs nothing from the filesystem beyond the database.
+CREATE TABLE IF NOT EXISTS plugin (
+  id INTEGER PRIMARY KEY,
+  plugin_id TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  version TEXT NOT NULL DEFAULT '',
+  manifest_json TEXT NOT NULL DEFAULT '',
+  wasm_blob BLOB NOT NULL,
+  wasm_sha256 TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'disabled',
+  last_error TEXT,
+  uploaded_at INTEGER NOT NULL
+);
+
+-- One row per dispatch the hub has made. The key is the idempotency key: the
+-- same node, event and billing cycle must never notify twice, while a state
+-- event (agent_offline/agent_online) holds one mutable row per node per side.
+CREATE TABLE IF NOT EXISTS notification_log (
+  node_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  threshold_or_state_key INTEGER NOT NULL,
+  sent_at INTEGER NOT NULL,
+  success INTEGER NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (node_id, event_type, threshold_or_state_key)
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -219,6 +256,41 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
+/// v4 adds the `plugin` and `notification_log` tables and moves nothing. On a
+/// database opened through `Db::open` the schema batch has already created
+/// them by the time any migration runs; a backup candidate in `check_backup`
+/// is migrated on a bare connection, so the tables are created here rather
+/// than assumed. The DDL must match SCHEMA's -- a drift is caught loudly by
+/// `check_backup`, which compares a migrated backup's columns against a
+/// database SCHEMA built.
+fn migrate_to_4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin (
+           id INTEGER PRIMARY KEY,
+           plugin_id TEXT NOT NULL UNIQUE,
+           name TEXT NOT NULL DEFAULT '',
+           version TEXT NOT NULL DEFAULT '',
+           manifest_json TEXT NOT NULL DEFAULT '',
+           wasm_blob BLOB NOT NULL,
+           wasm_sha256 TEXT NOT NULL DEFAULT '',
+           enabled INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'disabled',
+           last_error TEXT,
+           uploaded_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS notification_log (
+           node_id INTEGER NOT NULL,
+           event_type TEXT NOT NULL,
+           threshold_or_state_key INTEGER NOT NULL,
+           sent_at INTEGER NOT NULL,
+           success INTEGER NOT NULL DEFAULT 0,
+           detail TEXT NOT NULL DEFAULT '',
+           PRIMARY KEY (node_id, event_type, threshold_or_state_key)
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -235,13 +307,26 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 3 {
         migrate_to_3(conn)?;
     }
+    if from < 4 {
+        migrate_to_4(conn)?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
-    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+const TABLES: [&str; 10] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "plugin",
+    "notification_log",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -459,7 +544,7 @@ impl Db {
         Ok(Self(Mutex::new(conn)))
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -601,11 +686,16 @@ impl Db {
 
     pub fn delete_node(&self, id: i64) -> Result<()> {
         let conn = self.conn();
-        // `ping_record` carries no foreign key -- it is WITHOUT ROWID and keyed
-        // for the chart query -- so it is cleared explicitly. SQLite reassigns a
-        // deleted node's id to the next node created, which would otherwise
-        // inherit the removed machine's latency chart.
+        // `ping_record` and `notification_log` carry no foreign key to `node` --
+        // the former is WITHOUT ROWID and keyed for the chart query, the latter
+        // is keyed by its own idempotency scheme -- so both are cleared
+        // explicitly. SQLite reassigns a deleted node's id to the next node
+        // created, which would otherwise inherit the removed machine's latency
+        // chart and notification history: a leftover state row reading
+        // "already offline" would suppress the new machine's first offline
+        // alert, and leftover dispatch rows its expiry reminders.
         conn.execute("DELETE FROM ping_record WHERE node_id = ?1", [id])?;
+        conn.execute("DELETE FROM notification_log WHERE node_id = ?1", [id])?;
         conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -1329,7 +1419,7 @@ impl Db {
         if plotted > 0 {
             anyhow::bail!("the file carries views or triggers, which a hub backup never does");
         }
-        for table in TABLES {
+        for table in &TABLES[..8] {
             let found: i64 = candidate.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
@@ -1358,6 +1448,21 @@ impl Db {
         // arrangement in which the restore has failed and the original data is
         // also gone.
         migrate(&candidate, version)?;
+        // The tables a migration adds are checked after it has run: a v3
+        // backup arrives without them, and it is exactly the file the migration
+        // exists to fix. Everything a pre-v4 hub wrote is checked before the
+        // migration touches the file, so a file missing those is still refused
+        // before anything is written.
+        for table in &TABLES[8..] {
+            let found: i64 = candidate.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )?;
+            if found == 0 {
+                anyhow::bail!("the file is not a hub backup: no {table} table");
+            }
+        }
         // The migration lands in a -wal beside a backup taken from a running hub.
         // Checkpointed here so the copy below reads a single file.
         let _ = candidate.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
@@ -1556,10 +1661,6 @@ pub fn period_start(today: NaiveDate, reset_day: u32) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn db() -> Db {
-        Db::open(":memory:").unwrap()
-    }
 
     /// PRAGMA settings are per connection, so a value read through any other
     /// handle proves nothing about the one the hub writes through.
@@ -1937,6 +2038,9 @@ mod tests {
         db.accumulate(id, "b", Some((10, 10))).unwrap();
         db.insert_metric(id, 1, &serde_json::json!({"cpu": 1.0})).unwrap();
         db.insert_ping(id, task, 1, 42).unwrap();
+        // 两种通知行:一条状态行,一条到期派发。
+        db.transition_state_event(id, "agent_offline", 1).unwrap();
+        db.record_dispatch(id, "expiry_soon", 42, 1).unwrap();
         db.delete_node(id).unwrap();
         assert!(db.node(id).unwrap().is_none());
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
@@ -1949,6 +2053,19 @@ mod tests {
         assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
         assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+
+        // `notification_log` 同样没有外键,同一个复用的 id 会继承旧机器的
+        // 通知历史:一条遗留的状态行读作"已经离线",新机器第一次真正掉线
+        // 的告警会被它压掉。
+        let log_rows = |id: i64| {
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM notification_log WHERE node_id=?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(log_rows(fresh), 0, "the reused id inherits no notification history");
+        assert_eq!(db.current_state_event(fresh).unwrap(), None);
     }
 
     /// The mirror of the sweep above, on the other key of the same table. SQLite
@@ -2350,5 +2467,109 @@ mod tests {
         // Editing an existing probe does not count as adding one.
         let first = db.ping_tasks().unwrap()[0].id;
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
+    }
+
+    /// A fresh database carries the two tables this build expects, and the
+    /// backup gates rely on `TABLES` naming every one of them.
+    #[test]
+    fn a_fresh_database_is_on_schema_v4_with_the_new_tables() {
+        let db = db();
+        let conn = db.conn();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        let table = |name: &str| {
+            conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(table("plugin"), 1);
+        assert_eq!(table("notification_log"), 1);
+        drop(conn);
+
+        assert!(TABLES.contains(&"plugin"));
+        assert!(TABLES.contains(&"notification_log"));
+    }
+
+    /// A database left at v3 by the previous build: opening it must stamp v4,
+    /// add both tables, and keep the rows it already held. Opening the result
+    /// again must not redo anything that cannot be redone.
+    #[test]
+    fn a_v3_database_upgrades_to_v4_and_reopens_cleanly() {
+        let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A hub at v3: this build's schema minus the two v4 tables, carrying a
+        // node that must survive the upgrade.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "DROP TABLE plugin;
+             DROP TABLE notification_log;
+             INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Db::open(path).unwrap();
+        let conn = db.conn();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        for table in ["plugin", "notification_log"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} must exist after the upgrade");
+        }
+        drop(conn);
+        assert_eq!(db.nodes().unwrap().len(), 1, "the node the v3 hub had survives");
+
+        // Reopening a v4 database is a no-op: the migration chain stops before
+        // v4 and the stamp is already in place.
+        drop(db);
+        let again = Db::open(path).unwrap();
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        drop(again);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A backup taken by a v3 hub carries neither new table, and restore is
+    /// the one path that migrates a file `Db::open` never sees: `check_backup`
+    /// opens the upload on a bare connection. The migration must create the
+    /// v4 tables there, or every backup older than this build is refused.
+    #[test]
+    fn a_v3_backup_survives_check_backup() {
+        let scratch = Scratch::new();
+        let live = Db::open(&scratch.0).unwrap();
+        node(&live, 1);
+
+        // The upload: this build's schema minus the two v4 tables, stamped as
+        // a v3 hub would have left it.
+        let old_path = format!("{}.copy", scratch.0);
+        let old = Connection::open(&old_path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch("DROP TABLE plugin; DROP TABLE notification_log; PRAGMA user_version = 3;")
+            .unwrap();
+        drop(old);
+
+        // The candidate carries no foreign tables or rows, only the shape; it
+        // must pass every gate and come out with the v4 tables created.
+        live.check_backup(&old_path).unwrap();
+        let checked = Connection::open(&old_path).unwrap();
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        for table in ["plugin", "notification_log"] {
+            let found: i64 = checked
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} must exist on the migrated upload");
+        }
     }
 }

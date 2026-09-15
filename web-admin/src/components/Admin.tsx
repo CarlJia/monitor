@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Puzzle, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
+import { ConfirmDialog } from "./ConfirmDialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -12,8 +13,13 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import {
+  api, changes, GIB, provisioningSite, trafficCorrection, upload,
+  type Node, type PingTask,
+} from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+
+import { Plugins } from "./Plugins"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -80,29 +86,6 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
 }
 
 
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
-  title: string
-  description: string
-  confirmLabel: string
-  busy?: boolean
-  onClose: () => void
-  onConfirm: () => void
-}) {
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription className="leading-relaxed">{description}</DialogDescription>
-        </DialogHeader>
-        <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
 
 function CreateNode({ onClose, onSaved }: {
   onClose: () => void
@@ -328,7 +311,7 @@ function BillingForm({ node, onClose, onSaved }: {
               <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
+                  {["USD", "CNY", "EUR", "GBP", "JPY", "CAD"].map((c) => (
                     <SelectItem key={c} value={c}>{c}</SelectItem>
                   ))}
                 </SelectContent>
@@ -1206,6 +1189,24 @@ function SettingsTab() {
               placeholder="https://ghfast.top"
             />
           </Field>
+          {/* 通知阈值（U7/D4）：读侧未设置时返回 ""，占位符给的就是默认值。 */}
+          <Field label="离线判定阈值（次未上报）" hint="连续 N 个上报周期（60 秒/次）没有消息即判离线并发通知，1–100">
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              value={String(s["notification.offline_threshold_reports"] ?? "")}
+              onChange={(e) => set("notification.offline_threshold_reports", e.target.value)}
+              placeholder="3"
+            />
+          </Field>
+          <Field label="到期提醒阈值（天）" hint="逗号分隔。剩余天数恰好等于某个档位时通知，每档 1–365">
+            <Input
+              value={String(s["notification.expiry_thresholds"] ?? "")}
+              onChange={(e) => set("notification.expiry_thresholds", e.target.value)}
+              placeholder="7,3,1"
+            />
+          </Field>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
@@ -1229,6 +1230,12 @@ function SettingsTab() {
                 retention_days: String(s.retention_days || "7"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
+                // 通知阈值同一条规则：未设置时 hub 回 ""，写回默认值而不是被
+                // 后端的非空校验挡下。
+                "notification.offline_threshold_reports": String(
+                  s["notification.offline_threshold_reports"] || "3",
+                ),
+                "notification.expiry_thresholds": String(s["notification.expiry_thresholds"] || "7,3,1"),
               })
             }
           >
@@ -1543,6 +1550,7 @@ function Data() {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
+  { path: "/admin/plugins", label: "插件", icon: Puzzle },
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
@@ -1588,6 +1596,8 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
+        ) : path === "/admin/plugins" ? (
+          <Plugins />
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/themes" ? (

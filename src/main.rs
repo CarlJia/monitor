@@ -6,9 +6,13 @@
 
 mod agent_ws;
 mod api;
+mod api_plugins;
 mod auth;
 mod db;
+mod db_plugins;
 mod frontend;
+mod notification_bus;
+mod plugin;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -21,7 +25,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Local, Months, NaiveDate};
+use chrono::{Local, Months, NaiveDate, Utc};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -55,10 +59,19 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// The plugin registry the notification bus dispatches into. Not an Arc:
+    /// `App` itself already lives in one, so the lock is the only shared
+    /// access to spell out. `RwLock` because emitting only reads while
+    /// enabling, disabling and hot-reloading a plugin writes.
+    pub plugins: RwLock<plugin::Registry>,
+    /// 进程唯一的 wasm 引擎:插件的编译产物(Module)在它内部共享。fuel 计量
+    /// 在 [`plugin::new_engine`] 的 Config 里开启。见 `plugin` 模块的资源模型说明。
+    pub engine: wasmtime::Engine,
 }
 
 impl App {
     fn new(db: Db, site: String, themes: PathBuf) -> Self {
+        let engine = plugin::new_engine();
         Self {
             db,
             agents: RwLock::default(),
@@ -71,6 +84,11 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            // 占位 Registry:插件预加载要等 App 进入 Arc 之后(Registry 以 Weak
+            // 回指 App,构造期没有 Arc 可指),由 main 调 Registry::init 完成。
+            // 两处 engine 是同一实例,克隆只是 Arc 引用计数。
+            plugins: RwLock::new(plugin::Registry::empty(engine.clone())),
+            engine,
         }
     }
 
@@ -325,6 +343,9 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
+    // 插件预加载(KTD10):enabled 的插件逐个编译装载,失败者记 last_error、
+    // 不影响其他。放在 Arc::new 之后,因为 Registry 以 Weak 回指 App。
+    app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -402,6 +423,20 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // Plugins. The upload lives in the merged router below with the chunked
+        // routes, because a plugin tar.gz is megabytes against this layer's
+        // 64 KiB ceiling; everything else is a few bytes of id and key.
+        .route("/api/plugins", get(api_plugins::list_plugins))
+        .route("/api/plugins/{id}", delete(api_plugins::delete_plugin))
+        .route("/api/plugins/{id}/enable", post(api_plugins::enable_plugin))
+        .route("/api/plugins/{id}/disable", post(api_plugins::disable_plugin))
+        .route("/api/plugins/{id}/test", post(api_plugins::test_plugin))
+        .route("/api/plugins/{id}/logs", get(api_plugins::plugin_dispatch_log))
+        .route("/api/plugins/{id}/kv", get(api_plugins::list_plugin_kv))
+        .route(
+            "/api/plugins/{id}/kv/{key}",
+            put(api_plugins::set_plugin_kv).delete(api_plugins::delete_plugin_kv_route),
+        )
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
@@ -418,7 +453,16 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
+                // A plugin package is uploaded in one request, bounded by
+                // api_plugins::MAX_PLUGIN on the handler itself; this layer's job is
+                // only to let those bytes past the 64 KiB ceiling above.
+                .route("/api/plugins", post(api_plugins::upload_plugin))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                // The multipart extractor applies its own default body limit on
+                // top of the layer above, and that default is 2 MiB -- without
+                // this a plugin tar.gz between 2 and 8 MiB fails parsing. The
+                // two other routes here take the raw body and never see it.
+                .layer(axum::extract::DefaultBodyLimit::max(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
         // Excludes the agent binary and database backups: both are already
@@ -594,21 +638,160 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Expires sessions, trims history and rolls over expiry dates once an hour.
+/// 读 `notification.expiry_thresholds` 设置,空值(未设置、解析失败或没有
+/// 任何有效项)回退默认 `[7, 3, 1]`——与 `retention_days` 同一读取模式:坏值
+/// 静默回退,不挡住扫描本身。解析本体见 [`db::parse_expiry_thresholds`],
+/// 与写侧(api)共用。`pub(crate)` 是因为 api 的 settings 读侧要回显同一
+/// 生效值,保证 GET-PUT 往返闭合。
+pub(crate) fn expiry_thresholds(app: &App) -> Vec<i64> {
+    let raw = app.db.get("notification.expiry_thresholds").unwrap_or_default();
+    let parsed = db::parse_expiry_thresholds(&raw);
+    if parsed.is_empty() {
+        vec![7, 3, 1]
+    } else {
+        parsed
+    }
+}
+
+/// 解析 `notification.offline_threshold_reports`:连续 N 个上报周期没有
+/// 消息即判离线。默认 3,钳制在 1..=100。`pub(crate)` 的理由同
+/// [`expiry_thresholds`]。
+pub(crate) fn offline_threshold_reports(app: &App) -> i64 {
+    app.db
+        .get("notification.offline_threshold_reports")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(3)
+        .clamp(1, 100)
+}
+
+/// 到期扫描(R4):剩余天数恰好落在某个阈值档上时 emit `ExpirySoon`。
+/// 去重不在这一层——emit 按「节点 x 阈值档 x 账期」的幂等键挡掉同一
+/// 账期的重复提醒(R5)。
+fn notify_expiring_nodes(app: &App) -> Result<()> {
+    let thresholds = expiry_thresholds(app);
+    // 与 renew_online_nodes 同样的本地时区:到期日是人输入的日期,面板
+    // 也按本地日期展示。
+    let today = Local::now().date_naive();
+    for node in app.db.nodes()? {
+        let Some(expires_at) = node.expires_at.as_deref() else { continue };
+        let Ok(expires) = expires_at.parse::<NaiveDate>() else {
+            warn!("node {} 的到期日 {expires_at:?} 无法解析,跳过到期提醒", node.name);
+            continue;
+        };
+        let days_left = (expires - today).num_days();
+        // 精确等值匹配,阈值之外的 5 天、2 天不提醒;已过期(<= 0)也不
+        // 提醒——那是续期逻辑或人工处理的事。
+        if days_left > 0 && thresholds.contains(&days_left) {
+            notification_bus::emit(
+                app,
+                &notification_bus::Event::ExpirySoon {
+                    node_id: node.id,
+                    name: node.name.clone(),
+                    expires_at: expires_at.to_owned(),
+                    days_left,
+                    threshold_days: days_left,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// agent 的上报周期,离线判定的计量单位。hub 侧拿不到某个 agent 真实的
+/// report_interval,v1 按 60 秒兜底(A11/KTD11 已把该假设写进文档);未来
+/// 真实周期接入 hub 时,替换 `notify_offline_nodes` 里 max 的左参即可。
+const OFFLINE_WINDOW_SECS: i64 = 60;
+
+/// 离线/在线判定(R3):连续 N 个上报周期没有消息判离线;重新活跃且上一
+/// 状态是离线则判恢复。emit 内部按状态行去重(R5):同一离线窗口不重复
+/// 告警,恢复会清掉对侧的行。
+fn notify_offline_nodes(app: &App) -> Result<()> {
+    let reports = offline_threshold_reports(app);
+    let report_interval = OFFLINE_WINDOW_SECS; // v1 的 60s 兜底假设,见上。
+    let offline_after_secs = report_interval.max(OFFLINE_WINDOW_SECS) * reports;
+    let now = Utc::now().timestamp();
+    let (offline, active): (Vec<_>, Vec<_>) = app
+        .db
+        .nodes()?
+        .into_iter()
+        // last_seen=0 是从未上报的新建节点:不算离线,也没有状态行可恢复。
+        .partition(|n| n.last_seen != 0 && now - n.last_seen > offline_after_secs);
+    // 先离线、后恢复(A10):两个集合互斥,顺序写明,同一 tick 内的 emit
+    // 不互相覆盖。
+    for node in offline {
+        notification_bus::emit(
+            app,
+            &notification_bus::Event::AgentOffline {
+                node_id: node.id,
+                name: node.name.clone(),
+                observed_at: now,
+                last_seen_at: node.last_seen,
+            },
+        )?;
+    }
+    for node in active {
+        // 窗口内活跃且上一状态是离线:恢复。没有状态行(从未离线)的
+        // 节点查不到 agent_offline,自然跳过。
+        if app
+            .db
+            .current_state_event(node.id)?
+            .is_some_and(|(state, _)| state == notification_bus::Event::AGENT_OFFLINE)
+        {
+            notification_bus::emit(
+                app,
+                &notification_bus::Event::AgentOnline {
+                    node_id: node.id,
+                    name: node.name.clone(),
+                    observed_at: now,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Expires sessions, trims history, rolls over expiry dates and scans for
+/// notifications once an hour.
 async fn housekeeping(app: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
+    // 第一轮跳过离线判定:housekeeping 在 listener 绑定之前就 spawn,而
+    // interval 的首个 tick 立即完成。hub 停机超过判定窗口(默认 3 个上报
+    // 周期)后重启,每个节点的 last_seen 都已过期——但那是 hub 停机,不是
+    // 节点掉线;照常判定会把全部节点告警一遍离线,再在它们重新上报后逐个
+    // "恢复"。一小时后的下一轮,重连的节点已经刷新过 last_seen,判定恢复
+    // 正常。
+    let mut first_tick = true;
     loop {
         ticker.tick().await;
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
-        }
-        if let Err(e) = app.db.expire_sessions() {
-            warn!("expiring sessions failed: {e:#}");
-        }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
-        }
+        let offline_scan = !first_tick;
+        first_tick = false;
+        housekeeping_pass(&app, offline_scan);
+    }
+}
+
+/// housekeeping 每轮执行的同步主体,抽成函数是为了让「第一轮跳过离线判定」
+/// 有测试可写:housekeeping 本身是 3600 秒一轮的循环,测试里等不到第二轮。
+fn housekeeping_pass(app: &App, offline_scan: bool) {
+    let keep = app.db.retention_days();
+    if let Err(e) = app.db.prune(keep) {
+        warn!("pruning history failed: {e:#}");
+    }
+    if let Err(e) = app.db.expire_sessions() {
+        warn!("expiring sessions failed: {e:#}");
+    }
+    if let Err(e) = renew_online_nodes(app) {
+        warn!("rolling expiry dates failed: {e:#}");
+    }
+    // 扫描在续期之后:刚续期的节点 days_left 变大,不会落回阈值档,
+    // 同一个 tick 里既续期又提醒同一节点的顺序矛盾不会出现。
+    if let Err(e) = notify_expiring_nodes(app) {
+        warn!("scanning expiry notifications failed: {e:#}");
+    }
+    if !offline_scan {
+        return;
+    }
+    if let Err(e) = notify_offline_nodes(app) {
+        warn!("scanning offline notifications failed: {e:#}");
     }
 }
 
@@ -650,6 +833,225 @@ mod tests {
         // Not yet due, and one-off billing: both left unchanged.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
+    }
+
+    // ---- notification scanning (U6) ----
+
+    /// 建一个带 token 的节点,返回 id。token 以节点名充当(token 列有
+    /// UNIQUE 约束),到期日与 last_seen 由测试用 `set_expiry` /
+    /// `touch_seen` 单独控制。
+    fn add_node(app: &App, name: &str) -> i64 {
+        app.db.create_node(&db::Node { name: name.into(), ..Default::default() }, name).unwrap()
+    }
+
+    /// 断言全部走 db 侧与 Registry 计数:emit 转发的次数是「真的发了」的
+    /// 唯一证据,被去重挡掉的 emit 不计。
+    fn dispatches(app: &App) -> usize {
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_count()
+    }
+
+    /// 与 bus 相同的幂等键编码,用来查 `notification_log` 里的行。
+    fn expiry_key(expires_at: &str, threshold_days: i64) -> i64 {
+        notification_bus::Event::ExpirySoon {
+            node_id: 0,
+            name: String::new(),
+            expires_at: expires_at.into(),
+            days_left: 0,
+            threshold_days,
+        }
+        .threshold_or_state_key()
+    }
+
+    /// today 加减整天的日期,测试不依赖具体某一天。
+    fn around(today: NaiveDate, days: i64) -> NaiveDate {
+        if days >= 0 {
+            today.checked_add_days(chrono::Days::new(days as u64)).unwrap()
+        } else {
+            today.checked_sub_days(chrono::Days::new((-days) as u64)).unwrap()
+        }
+    }
+
+    fn state_of(app: &App, id: i64) -> Option<String> {
+        app.db.current_state_event(id).unwrap().map(|(t, _)| t)
+    }
+
+    #[test]
+    fn an_expiry_tier_fires_once_per_scan_cycle() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let expires = around(Local::now().date_naive(), 7).to_string();
+        app.db.set_expiry(id, &expires).unwrap();
+
+        notify_expiring_nodes(&app).unwrap();
+        assert!(app.db.dispatch_already_sent(id, "expiry_soon", expiry_key(&expires, 7)).unwrap());
+        assert_eq!(dispatches(&app), 1);
+
+        // 同一天里每小时的 tick 再扫:同一账期同一档,幂等键已占用。
+        notify_expiring_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 1, "同一账期不得重复提醒");
+    }
+
+    #[test]
+    fn tiers_off_the_list_and_past_dates_stay_silent() {
+        let app = app("");
+        let today = Local::now().date_naive();
+        // 阈值之外:5 天不在 [7, 3, 1] 里。
+        let off_tier = add_node(&app, "off-tier");
+        app.db.set_expiry(off_tier, &around(today, 5).to_string()).unwrap();
+        // 已过期:当天与昨天,那是续期逻辑或人工处理的事。
+        let due = add_node(&app, "due");
+        app.db.set_expiry(due, &today.to_string()).unwrap();
+        let past = add_node(&app, "past");
+        app.db.set_expiry(past, &around(today, -1).to_string()).unwrap();
+        // 没有到期日。
+        add_node(&app, "none");
+
+        notify_expiring_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 0, "阈值外、已过期、无到期日都不触发");
+    }
+
+    /// 账期顺延一个周期(31 天)后,新账期的同一档位是新的幂等键:31 天
+    /// 过去、days_left 再次到 7 时还能再提醒一次。同日无法真正快进 31 天,
+    /// 所以用「新日期的档位键未被占用」表述,emit 对新键放行由 bus 自己的
+    /// 测试覆盖。
+    #[test]
+    fn a_renewed_cycle_frees_the_tier_again() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let today = Local::now().date_naive();
+        let first = around(today, 7);
+        app.db.set_expiry(id, &first.to_string()).unwrap();
+        notify_expiring_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 1);
+
+        // 续期顺延一个周期:days_left 变成 38,本轮静默。
+        let next = around(first, 31);
+        app.db.set_expiry(id, &next.to_string()).unwrap();
+        notify_expiring_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 1, "阈值之外的天数不触发");
+        assert!(
+            !app.db.dispatch_already_sent(id, "expiry_soon", expiry_key(&next.to_string(), 7)).unwrap(),
+            "新账期的档位键必须是空的"
+        );
+    }
+
+    #[test]
+    fn a_node_that_never_reported_judges_nothing() {
+        let app = app("");
+        let id = add_node(&app, "fresh");
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 0);
+        assert_eq!(state_of(&app, id), None, "last_seen=0 不参与任何判定");
+    }
+
+    #[test]
+    fn silence_past_three_windows_is_offline_once() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let now = Utc::now().timestamp();
+        app.db.touch_seen(id, now - OFFLINE_WINDOW_SECS * 3 - 1).unwrap();
+
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"));
+        assert_eq!(dispatches(&app), 1);
+
+        // 同一离线窗口内再扫:状态行还是 offline,不重复告警。
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 1, "同一离线窗口不重复告警");
+    }
+
+    #[test]
+    fn an_offline_node_recovers_and_can_drop_offline_again() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let now = Utc::now().timestamp();
+
+        // 离线。
+        app.db.touch_seen(id, now - OFFLINE_WINDOW_SECS * 5).unwrap();
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"));
+
+        // 重新上报:恢复,状态行翻到 online。
+        app.db.touch_seen(id, now - 10).unwrap();
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_online"));
+        assert_eq!(dispatches(&app), 2);
+
+        // 已在线再扫:无事发生。
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(dispatches(&app), 2);
+
+        // 再次失联:新的离线窗口,重新告警。
+        app.db.touch_seen(id, now - OFFLINE_WINDOW_SECS * 5).unwrap();
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"));
+        assert_eq!(dispatches(&app), 3);
+    }
+
+    /// 启动后的第一轮 housekeeping 跳过离线判定:hub 停机超过判定窗口后
+    /// 重启,所有节点的 last_seen 都已过期,但那是 hub 停机而不是节点掉线,
+    /// 照常判定会把每个节点都告警一遍。第二轮起判定照常——重连的节点在那
+    /// 之前已刷新 last_seen。
+    #[test]
+    fn the_first_housekeeping_pass_skips_the_offline_scan() {
+        let app = app("");
+        let id = add_node(&app, "edge-1");
+        let now = Utc::now().timestamp();
+        app.db.touch_seen(id, now - OFFLINE_WINDOW_SECS * 10).unwrap();
+
+        housekeeping_pass(&app, false);
+        assert_eq!(dispatches(&app), 0, "停机期间的 last_seen 过期不触发离线告警");
+        assert_eq!(state_of(&app, id), None);
+
+        housekeeping_pass(&app, true);
+        assert_eq!(state_of(&app, id).as_deref(), Some("agent_offline"), "之后的每轮照常判定");
+        assert_eq!(dispatches(&app), 1);
+    }
+
+    #[test]
+    fn threshold_settings_override_the_defaults() {
+        let app = app("");
+        let now = Utc::now().timestamp();
+        // 一档失联即离线:61 秒未上报就触发,默认的 3 档要 181 秒。
+        app.db.set("notification.offline_threshold_reports", "1").unwrap();
+        let quick = add_node(&app, "quick");
+        app.db.touch_seen(quick, now - OFFLINE_WINDOW_SECS - 1).unwrap();
+        notify_offline_nodes(&app).unwrap();
+        assert_eq!(state_of(&app, quick).as_deref(), Some("agent_offline"));
+
+        // 过期阈值只剩 1 天档:7 天不触发,1 天触发。
+        app.db.set("notification.expiry_thresholds", "[1]").unwrap();
+        let today = Local::now().date_naive();
+        let seven = add_node(&app, "seven");
+        app.db.set_expiry(seven, &around(today, 7).to_string()).unwrap();
+        let one = add_node(&app, "one");
+        app.db.set_expiry(one, &around(today, 1).to_string()).unwrap();
+        notify_expiring_nodes(&app).unwrap();
+        assert!(!app
+            .db
+            .dispatch_already_sent(seven, "expiry_soon", expiry_key(&around(today, 7).to_string(), 7))
+            .unwrap());
+        assert!(app
+            .db
+            .dispatch_already_sent(one, "expiry_soon", expiry_key(&around(today, 1).to_string(), 1))
+            .unwrap());
+    }
+
+    #[test]
+    fn expiry_thresholds_parse_both_formats_and_fall_back() {
+        let app = app("");
+        assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "未设置时是默认档");
+        for set in ["[7, 3, 1]", "7,3,1"] {
+            app.db.set("notification.expiry_thresholds", set).unwrap();
+            assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "{set}");
+        }
+        // 坏值与空列表整体回退;超界项被剔除,有效项保留。
+        for bad in ["", "[]", "abc", "0,400"] {
+            app.db.set("notification.expiry_thresholds", bad).unwrap();
+            assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "{bad}");
+        }
+        app.db.set("notification.expiry_thresholds", "0,5,400").unwrap();
+        assert_eq!(expiry_thresholds(&app), vec![5]);
     }
 
     #[tokio::test]
