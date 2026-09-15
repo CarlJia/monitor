@@ -9,6 +9,8 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod notification_bus;
+mod plugin;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -55,6 +57,11 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// The plugin registry the notification bus dispatches into. Not an Arc:
+    /// `App` itself already lives in one, so the lock is the only shared
+    /// access to spell out. `RwLock` because emitting only reads while
+    /// enabling, disabling and hot-reloading a plugin writes.
+    pub plugins: RwLock<plugin::Registry>,
 }
 
 impl App {
@@ -71,6 +78,7 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            plugins: RwLock::new(plugin::Registry::default()),
         }
     }
 
