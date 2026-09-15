@@ -1682,6 +1682,36 @@ impl Db {
         Ok(())
     }
 
+    /// 一个插件的全部 kv 行,`plugin.<plugin_id>:` 前缀,去掉前缀后的 key 与
+    /// 值成对返回,按 key 排序让面板的列表稳定。U5 的 KV 面板与删除清理用。
+    ///
+    /// 前缀匹配走 LIKE,而 plugin_id 只禁 `:` 不禁 `_` 与 `%`——它们在 LIKE 里
+    /// 是通配符,一个 `com.example_tg` 的前缀会匹配到 `com.exampleXtg` 的行,所以
+    /// 调用方传入的 plugin_id 必须经 [`like_escaped`] 转义后才能拼进模式。
+    pub fn plugin_kv(&self, plugin_id: &str) -> Result<Vec<(String, String)>> {
+        let prefix = format!("plugin.{plugin_id}:");
+        let pattern = format!("{}%", like_escaped(&prefix));
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT key, value FROM setting WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")?;
+        let rows = stmt.query_map([pattern], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let pairs = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            // 前缀里的 `%` 已转义,剥离是纯字符串操作,长度必然吻合。
+            .map(|(key, value)| (key[prefix.len()..].to_owned(), value))
+            .collect();
+        Ok(pairs)
+    }
+
+    /// 删除一个插件的全部 kv 行(删除插件时调用),返回删掉的行数。
+    /// 模式与转义的理由见 [`Db::plugin_kv`]。
+    pub fn delete_plugin_kv(&self, plugin_id: &str) -> Result<usize> {
+        let pattern = format!("plugin.{}:%", like_escaped(plugin_id));
+        let gone = self.conn().execute("DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'", [pattern])?;
+        Ok(gone)
+    }
+
     // ---- notification log ----
 
     /// True once this dispatch has been recorded. The ExpirySoon idempotency
@@ -1793,6 +1823,13 @@ impl Db {
             )
             .optional()?)
     }
+}
+
+/// 转义一个要拼进 LIKE 模式的字符串:`%` 与 `_` 是通配符,`\` 是转义符本身。
+/// 配合 `ESCAPE '\'` 使用。plugin_id 允许 `_`(如 `com.example_tg`),不转义时
+/// `plugin.<id>:%` 会匹配到别的插件(`com.exampleXtg`)的 kv 行。
+fn like_escaped(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 /// Column order matches every plugin SELECT, which spell out their columns
@@ -2866,6 +2903,42 @@ mod tests {
         db.delete_plugin(second.id).unwrap();
         assert!(db.get_plugin(second.id).unwrap().is_none());
         assert!(db.delete_plugin(second.id).is_err(), "deleting a removed plugin must not report success");
+    }
+
+    /// kv 的前缀匹配必须按字符比较,而不是按 LIKE 的通配符:`_` 与 `%` 在
+    /// plugin_id 里合法,不转义时一个插件的删除会吃掉另一个插件的行。
+    #[test]
+    fn plugin_kv_prefixes_match_the_plugin_id_not_like_wildcards() {
+        let db = db();
+        // 三个 `a?b`:一个下划线(合法 plugin_id)、一个点(前缀碰撞的另一半)、
+        // 一个百分号。外加一个名字以 `a_b` 开头但更长的插件。
+        for (key, value) in [
+            ("plugin.a_b:token", "underscore"),
+            ("plugin.a.b:token", "dot"),
+            ("plugin.a%b:token", "percent"),
+            ("plugin.aXb:token", "wildcard-victim"),
+            ("plugin.a_bee:token", "longer-name"),
+        ] {
+            db.set(key, value).unwrap();
+        }
+
+        let kv = db.plugin_kv("a_b").unwrap();
+        assert_eq!(kv, vec![("token".into(), "underscore".into())], "`_` 不能当通配符用");
+        let kv = db.plugin_kv("a.b").unwrap();
+        assert_eq!(kv, vec![("token".into(), "dot".into())], "点号前缀不能吃进带后缀的名字");
+
+        // 删除同样只碰自己的命名空间。
+        assert_eq!(db.delete_plugin_kv("a_b").unwrap(), 1);
+        assert_eq!(db.get("plugin.a_b:token"), None);
+        assert_eq!(
+            db.get("plugin.aXb:token").as_deref(),
+            Some("wildcard-victim"),
+            "`a_b` 的删除不得匹配 `aXb`"
+        );
+        assert_eq!(db.get("plugin.a_bee:token").as_deref(), Some("longer-name"), "也不得匹配 `a_bee`");
+        // `%` 同理:`a%b` 的模式不匹配 `aXb`。
+        assert_eq!(db.delete_plugin_kv("a%b").unwrap(), 1);
+        assert_eq!(db.get("plugin.aXb:token").as_deref(), Some("wildcard-victim"));
     }
 
     /// The ExpirySoon idempotency key in action: the first record wins, the

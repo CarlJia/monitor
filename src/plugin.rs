@@ -158,10 +158,8 @@ impl Registry {
     /// 后调用)。加载失败时把 `failed` 与原因落库并返回 Err,API 层转成 400;
     /// 成功时清掉 last_error。
     pub fn enable_plugin(&mut self, app: &App, plugin_row_id: i64) -> Result<()> {
-        let row = app
-            .db
-            .get_plugin(plugin_row_id)?
-            .with_context(|| format!("插件 {plugin_row_id} 不存在"))?;
+        let row =
+            app.db.get_plugin(plugin_row_id)?.with_context(|| format!("插件 {plugin_row_id} 不存在"))?;
         match load(&self.engine, &row) {
             Ok(plugin) => {
                 app.db.set_plugin_status(plugin_row_id, "enabled", None)?;
@@ -350,9 +348,13 @@ fn write_back(app: &App, event: &Event, entries: &[DispatchEntry]) {
             .collect();
         truncate(&failed.join("; "), DETAIL_MAX)
     };
-    if let Err(e) =
-        app.db.mark_dispatch_result(event.node_id(), event.type_name(), event.threshold_or_state_key(), success, &detail)
-    {
+    if let Err(e) = app.db.mark_dispatch_result(
+        event.node_id(),
+        event.type_name(),
+        event.threshold_or_state_key(),
+        success,
+        &detail,
+    ) {
         warn!("回写派发结果失败: {e:#}");
     }
 }
@@ -1371,8 +1373,13 @@ subscribes = ["expiry_soon", "agent_offline"]
         let app = runtime_app();
         let id = install(&app, "com.test.a", &["expiry_soon"], compile(MINIMAL_WAT));
         for _ in 0..=DISPATCH_LOG_CAP {
-            let entry =
-                app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id, &expiry_event()).await.unwrap();
+            let entry = app
+                .plugins
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .dispatch_one(id, &expiry_event())
+                .await
+                .unwrap();
             assert_eq!(entry.result, "success");
         }
         assert_eq!(snapshot(&app).len(), DISPATCH_LOG_CAP, "1001 条进 1000 容量的环,最旧一条被淘汰");
@@ -1388,10 +1395,8 @@ subscribes = ["expiry_soon", "agent_offline"]
         let (ok, detail) = app.db.notification_log_row(7, "expiry_soon", key).unwrap().unwrap();
         assert!(!ok && detail.is_empty(), "派发前 success=0");
         app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&event);
-        let (_, detail) = until(|| {
-            app.db.notification_log_row(7, "expiry_soon", key).unwrap().filter(|(ok, _)| *ok)
-        })
-        .await;
+        let (_, detail) =
+            until(|| app.db.notification_log_row(7, "expiry_soon", key).unwrap().filter(|(ok, _)| *ok)).await;
         assert_eq!(detail, "");
     }
 
@@ -1426,7 +1431,13 @@ subscribes = ["expiry_soon", "agent_offline"]
     async fn dispatch_one_returns_the_newest_log_entry() {
         let app = runtime_app();
         let id = install(&app, "com.test.a", &["expiry_soon"], compile(MINIMAL_WAT));
-        let entry = app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id, &expiry_event()).await.unwrap();
+        let entry = app
+            .plugins
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .dispatch_one(id, &expiry_event())
+            .await
+            .unwrap();
         assert_eq!(entry.result, "success");
         assert_eq!(entry.event_type, "expiry_soon");
         assert_eq!(entry.plugin_id, "com.test.a");
@@ -1436,7 +1447,8 @@ subscribes = ["expiry_soon", "agent_offline"]
         assert_eq!(snap[0].result, entry.result);
         assert_eq!(snap[0].elapsed_ms, entry.elapsed_ms);
         // 未加载的行号:明确的 Err 而不是静默成功。
-        let err = app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id + 1, &expiry_event()).await;
+        let err =
+            app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id + 1, &expiry_event()).await;
         assert!(err.is_err());
     }
 }

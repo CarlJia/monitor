@@ -13,7 +13,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = { version = "0.8", features = ["ws", "macros"] }
+# "multipart": 插件上传(R11)接收 multipart/form-data 的 tar.gz。
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
@@ -48,6 +49,9 @@ serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["test-util"] }
 # 插件测试需要用 WAT 文本现场编译 wasm fixture;dev-dependencies 不进发布产物。
 wat = "1"
+# 插件上传测试要经 router 整调(oneshot),验证 main 的分层挂载;
+# dev-dependencies 不进发布产物。
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 codegen-units = 1

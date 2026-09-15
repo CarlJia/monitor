@@ -421,6 +421,17 @@ async fn main() -> Result<()> {
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // Plugins. The upload lives in the merged router below with the chunked
+        // routes, because a plugin tar.gz is megabytes against this layer's
+        // 64 KiB ceiling; everything else is a few bytes of id and key.
+        .route("/api/plugins", get(api::list_plugins))
+        .route("/api/plugins/{id}", delete(api::delete_plugin))
+        .route("/api/plugins/{id}/enable", post(api::enable_plugin))
+        .route("/api/plugins/{id}/disable", post(api::disable_plugin))
+        .route("/api/plugins/{id}/test", post(api::test_plugin))
+        .route("/api/plugins/{id}/logs", get(api::plugin_dispatch_log))
+        .route("/api/plugins/{id}/kv", get(api::list_plugin_kv))
+        .route("/api/plugins/{id}/kv/{key}", put(api::set_plugin_kv))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
@@ -437,7 +448,16 @@ async fn main() -> Result<()> {
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
+                // A plugin package is uploaded in one request, bounded by
+                // api::MAX_PLUGIN on the handler itself; this layer's job is
+                // only to let those bytes past the 64 KiB ceiling above.
+                .route("/api/plugins", post(api::upload_plugin))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                // The multipart extractor applies its own default body limit on
+                // top of the layer above, and that default is 2 MiB -- without
+                // this a plugin tar.gz between 2 and 8 MiB fails parsing. The
+                // two other routes here take the raw body and never see it.
+                .layer(axum::extract::DefaultBodyLimit::max(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
         // Excludes the agent binary and database backups: both are already
