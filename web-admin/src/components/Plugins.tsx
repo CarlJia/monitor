@@ -15,7 +15,7 @@ import {
   type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 
-import { ConfirmDialog } from "./Admin"
+import { ConfirmDialog } from "./ConfirmDialog"
 
 // ---- 插件（U7）：上传、列表、启停删、测试、日志与 kv ----
 

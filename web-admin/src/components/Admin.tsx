@@ -3,6 +3,7 @@ import { flushSync } from "react-dom"
 import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Puzzle, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
+import { ConfirmDialog } from "./ConfirmDialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -85,30 +86,6 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
 }
 
 
-// Shared by every page's destructive action; the plugin page imports it too.
-export function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
-  title: string
-  description: string
-  confirmLabel: string
-  busy?: boolean
-  onClose: () => void
-  onConfirm: () => void
-}) {
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription className="leading-relaxed">{description}</DialogDescription>
-        </DialogHeader>
-        <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
 
 function CreateNode({ onClose, onSaved }: {
   onClose: () => void
