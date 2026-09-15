@@ -69,6 +69,7 @@ pub struct App {
 
 impl App {
     fn new(db: Db, site: String, themes: PathBuf) -> Self {
+        let engine = plugin::new_engine();
         Self {
             db,
             agents: RwLock::default(),
@@ -81,8 +82,11 @@ impl App {
                 .expect("http client"),
             site,
             themes,
-            plugins: RwLock::new(plugin::Registry::default()),
-            engine: plugin::new_engine(),
+            // 占位 Registry:插件预加载要等 App 进入 Arc 之后(Registry 以 Weak
+            // 回指 App,构造期没有 Arc 可指),由 main 调 Registry::init 完成。
+            // 两处 engine 是同一实例,克隆只是 Arc 引用计数。
+            plugins: RwLock::new(plugin::Registry::empty(engine.clone())),
+            engine,
         }
     }
 
@@ -337,6 +341,9 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes));
+    // 插件预加载(KTD10):enabled 的插件逐个编译装载,失败者记 last_error、
+    // 不影响其他。放在 Arc::new 之后,因为 Registry 以 Weak 回指 App。
+    app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {

@@ -1773,6 +1773,26 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// One dispatch row's outcome: `(success, detail)`. None when no such row
+    /// stands. The read side of `mark_dispatch_result`, for the panel's log view
+    /// and for the dispatch loop's tests.
+    pub fn notification_log_row(
+        &self,
+        node_id: i64,
+        event_type: &str,
+        key: i64,
+    ) -> Result<Option<(bool, String)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT success, detail FROM notification_log
+                  WHERE node_id=?1 AND event_type=?2 AND threshold_or_state_key=?3",
+                params![node_id, event_type, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
 }
 
 /// Column order matches every plugin SELECT, which spell out their columns

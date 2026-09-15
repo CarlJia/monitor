@@ -1,14 +1,16 @@
 //! WASM plugin runtime.
 //!
-//! U2 shipped the Registry stub the notification bus calls into; this module
-//! adds everything needed to actually run a plugin (U3):
+//! U2 shipped the Registry stub the notification bus calls into; U3 added
+//! everything needed to actually run a plugin; U4 replaced the stub with the
+//! real [`Registry`]:
 //!
 //! - [`Manifest::parse`] 校验 manifest(R7),
 //! - [`load`] 把 db 行变成 [`LoadedPlugin`](R6 的前半段:编译 + 导出契约检查),
 //! - [`call_on_event`] 每次事件新建 Store、注入宿主函数、以 fuel 限额调用插件,
-//! - 6 个宿主函数(R8)。
-//!
-//! U4 把这三段接进 dispatch 循环并替换 Registry。
+//! - 6 个宿主函数(R8),
+//! - [`Registry`] 启动预加载 enabled 插件(R10)、按 manifest.subscribes 派发
+//!   (R5)、以超时/fuel 隔离每个插件(R9)、维护 dispatch_log 环形缓冲(R16)
+//!   并回写 notification_log(R14)。
 //!
 //! # wasm 模块契约(U8 的示例插件按此实现)
 //!
@@ -30,43 +32,347 @@
 //! 与 `Module`(均 Send+Sync);实例与 Store 每次调用重建——fuel 记在 Store 上,
 //! 复用会让首次耗尽 fuel 的插件永久死亡,也无法并发调用。
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use serde::Deserialize;
-use tracing::warn;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 use wasmtime::{Caller, Extern, Linker, Memory, Store};
 
 use crate::notification_bus::Event;
 use crate::{db::PluginRow, App};
 
 // ---------------------------------------------------------------------------
-// Registry stub(U2)——U4 用真实运行时替换。
+// Registry(U4):启动预加载、按 manifest.subscribes 的事件路由、dispatch_log
+// 环形缓冲、notification_log 回写。
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+/// dispatch_log 的容量(KTD12)。环形:push_back 满了 pop_front,最近 1000 次
+/// 派发结果始终可见,面板与测试都据此判断一次派发是否真的发生、结果如何。
+pub const DISPATCH_LOG_CAP: usize = 1000;
 
-/// Placeholder until U4: dispatch is a no-op, so event sources can be
-/// built and tested before the runtime exists. The counter exists because the
-/// stub has no state to inspect and the bus's tests need to confirm an
-/// emission was not only recorded but forwarded; U3/U4 replace this struct
-/// with the real runtime, whose dispatch results are visible in
-/// `notification_log` directly.
-#[derive(Default)]
+/// fuel 限额的 setting key(KTD6)。每次派发都重读,改完下一次扫描即生效。
+const SETTING_FUEL_LIMIT: &str = "plugin.fuel_limit";
+/// 墙钟超时的 setting key(KTD6),单位毫秒。与 fuel 同读,理由相同。
+const SETTING_TIMEOUT_MS: &str = "plugin.timeout_ms";
+/// 超时缺省值:留出宿主开销后,略宽于插件 http 的 4 秒上限(见 [`HTTP_TIMEOUT`])。
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+
+/// 回写 detail 的长度上限:面板单元格放得下,又足够诊断。
+const DETAIL_MAX: usize = 500;
+
+/// 一次 `on_event` 调用的审计记录。`result` 取值:
+///
+/// | 值 | 含义 |
+/// |----|------|
+/// | `success` | 插件返回 0 |
+/// | `other:<错误码>` | 插件返回了自定义的非 0 错误码 |
+/// | `timeout` | 超过 `plugin.timeout_ms` 的墙钟预算 |
+/// | `fuel_exhausted` | trap 且错误链含 fuel(死循环被 KTD6 截断) |
+/// | `host_error:<原因>` | 其余 trap / 实例化失败 / 任务崩溃 |
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchEntry {
+    /// Unix 秒。
+    pub at: i64,
+    /// manifest 的 plugin_id,不是 db 行号:日志是给人看的。
+    pub plugin_id: String,
+    pub event_type: String,
+    pub elapsed_ms: u64,
+    pub result: String,
+}
+
+/// 插件注册表。`App.plugins` 持有它,它以 `Weak` 回指 `App`:强引用会组成
+/// 循环(App → Registry → App),而两者都活到进程结束,循环的代价只是延迟
+/// 释放;`Weak` 把这点代价也省了——App 在,upgrade 必成;App 拆了,派发本来
+/// 就无事可做。
 pub struct Registry {
+    /// `App.engine` 的克隆(Engine 内部是 Arc,克隆廉价),与 App 共享同一
+    /// 实例,插件 Module 的编译产物因此在两者间互通。
+    engine: wasmtime::Engine,
+    /// 见结构体文档:回指 App 的 `Weak`。由 [`Registry::init`] 在 App 进入
+    /// Arc 之后写入——构造期还没有 Arc 可指。
+    app: Weak<App>,
+    /// key = plugin 表的行 id。enable/disable/remove 都以行 id 为准。
+    loaded: HashMap<i64, LoadedPlugin>,
+    /// 环形缓冲套一层 Arc:fire-and-forget 的汇总任务要在 dispatch 返回之后
+    /// 继续写入,那时 `&self` 已不可借。
+    dispatch_log: Arc<Mutex<VecDeque<DispatchEntry>>>,
+    /// 已转发进 Registry 的事件数(不论有没有订阅者)。notification_bus 的
+    /// 测试据此区分"记录了幂等行"和"真的转发了"。
     dispatched: AtomicUsize,
 }
 
 impl Registry {
-    pub fn dispatch(&self, _event: &Event) {
-        self.dispatched.fetch_add(1, Ordering::Relaxed);
+    /// `App::new` 里的占位构造:engine 就位、无插件、无回指。真正的初始化
+    /// 在 App 被 Arc 包裹后由 [`Registry::init`] 完成。未 init 的 Registry
+    /// 派发是 no-op——bus 的测试用不经 Arc 的 App 调 emit,依赖的正是这一点。
+    pub fn empty(engine: wasmtime::Engine) -> Registry {
+        Registry {
+            engine,
+            app: Weak::new(),
+            loaded: HashMap::new(),
+            dispatch_log: Arc::new(Mutex::new(VecDeque::new())),
+            dispatched: AtomicUsize::new(0),
+        }
+    }
+
+    /// 启动预加载(KTD10):写入 `Weak` 回指,再把 enabled=1 的插件逐个装进
+    /// 来。一个插件失败只影响它自己:状态落库为 `failed` 并带上原因,其余
+    /// 插件照常加载。main 在 `Arc::new(App::new(..))` 之后调用一次。
+    pub fn init(&mut self, app: &Arc<App>) {
+        self.app = Arc::downgrade(app);
+        let rows = match app.db.list_plugins() {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("读取插件列表失败,本次不加载任何插件: {e:#}");
+                return;
+            }
+        };
+        for row in rows {
+            if !row.enabled {
+                continue;
+            }
+            match load(&self.engine, &row) {
+                Ok(plugin) => {
+                    // 成功也落库:上一次启动若把它标成 failed,不清掉就永远
+                    // 看不到它已经恢复。
+                    if let Err(e) = app.db.set_plugin_status(row.id, "enabled", None) {
+                        warn!(plugin = %row.plugin_id, "写插件状态失败: {e:#}");
+                    }
+                    info!(plugin = %row.plugin_id, "插件已加载");
+                    self.loaded.insert(row.id, plugin);
+                }
+                Err(e) => {
+                    warn!(plugin = %row.plugin_id, "插件加载失败,已停用: {e:#}");
+                    let _ = app.db.set_plugin_status(row.id, "failed", Some(&format!("{e:#}")));
+                }
+            }
+        }
+    }
+
+    /// 把一个已在 db 里 enabled 的插件装进内存(U5 的 enable API 在写完 db
+    /// 后调用)。加载失败时把 `failed` 与原因落库并返回 Err,API 层转成 400;
+    /// 成功时清掉 last_error。
+    pub fn enable_plugin(&mut self, app: &App, plugin_row_id: i64) -> Result<()> {
+        let row = app
+            .db
+            .get_plugin(plugin_row_id)?
+            .with_context(|| format!("插件 {plugin_row_id} 不存在"))?;
+        match load(&self.engine, &row) {
+            Ok(plugin) => {
+                app.db.set_plugin_status(plugin_row_id, "enabled", None)?;
+                self.loaded.insert(plugin_row_id, plugin);
+                Ok(())
+            }
+            Err(e) => {
+                app.db.set_plugin_status(plugin_row_id, "failed", Some(&format!("{e:#}")))?;
+                Err(e)
+            }
+        }
+    }
+
+    /// 移出内存即可;db 的 enabled 列由 API 层写,这里假定已经写完。
+    /// 不在 loaded 里也照常返回:与"禁用一个加载失败的插件"是同一种无事可做。
+    pub fn disable_plugin(&mut self, plugin_row_id: i64) {
+        self.loaded.remove(&plugin_row_id);
+    }
+
+    /// 删除插件(U5 的 delete API):db 行由 API 层删,内存这边同步摘除。
+    pub fn remove_plugin(&mut self, plugin_row_id: i64) {
+        self.loaded.remove(&plugin_row_id);
+    }
+
+    pub fn is_loaded(&self, plugin_row_id: i64) -> bool {
+        self.loaded.contains_key(&plugin_row_id)
     }
 
     pub fn dispatch_count(&self) -> usize {
         self.dispatched.load(Ordering::Relaxed)
     }
+
+    /// 派发日志快照,最新在前(新 → 旧):面板要的是"刚发生了什么",倒序让
+    /// 最新条目在数组头部,前端不必再反转。
+    pub fn dispatch_log_snapshot(&self) -> Vec<DispatchEntry> {
+        self.dispatch_log.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().cloned().collect()
+    }
+
+    /// 派发到所有订阅该事件的已启用插件(R5),fire-and-forget:emit 的调用
+    /// 链是同步的,不等插件。
+    ///
+    /// 0 个订阅者不记 entry、不回写——dispatch_log 只记真的调用了插件的派发,
+    /// 幂等行保持 success=0 恰好说明"没有插件在听"。
+    ///
+    /// 每个插件一个任务 + 外层 timeout(KTD8),全部完成后按 R14 回写
+    /// notification_log。回写在一个汇总任务里做:dispatch 自己不 async,没有
+    /// "等它们跑完"的自然位置,汇总任务补上这个位置。
+    pub fn dispatch(&self, event: &Event) {
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        let subscribers: Vec<LoadedPlugin> = self
+            .loaded
+            .values()
+            .filter(|p| p.manifest.subscribes.iter().any(|s| s == event.type_name()))
+            .cloned()
+            .collect();
+        if subscribers.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.upgrade() else { return };
+        // spawn 需要运行时上下文;emit 可能在任何线程被调。没有运行时就没有
+        // 派发,记一条而不是 panic。
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!("插件派发需要 tokio 运行时,当前线程没有;{} 事件被丢弃", event.type_name());
+            return;
+        };
+        let fuel = setting_u64(&app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let timeout_ms = setting_u64(&app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        let engine = self.engine.clone();
+        let log = self.dispatch_log.clone();
+        let event = event.clone();
+        handle.spawn(async move {
+            let mut handles = Vec::with_capacity(subscribers.len());
+            for plugin in subscribers {
+                // id 抄一份:run_one 拿走了 plugin 本体,join 失败(任务崩溃)时
+                // 合成 entry 还需要它。
+                let plugin_id = plugin.manifest.plugin_id.clone();
+                let task = run_one(engine.clone(), app.clone(), plugin, event.clone(), fuel, timeout_ms);
+                handles.push((plugin_id, tokio::spawn(task)));
+            }
+            let mut entries = Vec::with_capacity(handles.len());
+            for (plugin_id, h) in handles {
+                match h.await {
+                    Ok(entry) => entries.push(entry),
+                    Err(join) => entries.push(DispatchEntry {
+                        at: Utc::now().timestamp(),
+                        plugin_id,
+                        event_type: event.type_name().into(),
+                        elapsed_ms: 0,
+                        result: format!("host_error:{join}"),
+                    }),
+                }
+            }
+            for entry in &entries {
+                push_entry(&log, entry.clone());
+            }
+            write_back(&app, &event, &entries);
+        });
+    }
+
+    /// 单插件派发一次并等待结果,U5 的"测试通知"接口。与 [`Registry::dispatch`]
+    /// 走同一条执行路径(含超时与 fuel),但不写 notification_log:合成事件不
+    /// 占幂等键,真实事件的成功与否不该被一次手工测试覆盖。
+    pub async fn dispatch_one(&self, plugin_row_id: i64, event: &Event) -> Result<DispatchEntry> {
+        let Some(plugin) = self.loaded.get(&plugin_row_id) else {
+            bail!("插件 {plugin_row_id} 未加载");
+        };
+        let plugin = plugin.clone();
+        let Some(app) = self.app.upgrade() else {
+            bail!("App 已拆除,无法派发");
+        };
+        let fuel = setting_u64(&app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let timeout_ms = setting_u64(&app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        let entry = run_one(self.engine.clone(), app, plugin, event.clone(), fuel, timeout_ms).await;
+        push_entry(&self.dispatch_log, entry.clone());
+        Ok(entry)
+    }
+}
+
+/// 单个插件处理一个事件,产出审计 entry。超时与 fuel 双重隔离(KTD8/KTD6):
+///
+/// wasm 执行放在 block_in_place 里——它把执行从调度线程挪开,又保留运行时
+/// 上下文(host_http_post 要 `Handle::try_current`);但 block_in_place 是
+/// 同步阻塞,直接在本任务里调用会让外层的 timeout 永远等不到 poll。所以再
+/// spawn 一层,让本任务只在 worker 上等 JoinHandle,计时由别的 worker 完成。
+/// 超时后那个任务继续烧到 fuel 尽头——fuel 是硬兜底,超时只是不再等它。
+async fn run_one(
+    engine: wasmtime::Engine,
+    app: Arc<App>,
+    plugin: LoadedPlugin,
+    event: Event,
+    fuel_limit: u64,
+    timeout_ms: u64,
+) -> DispatchEntry {
+    let started = std::time::Instant::now();
+    let plugin_id = plugin.manifest.plugin_id.clone();
+    let event_type = event.type_name();
+    let task = tokio::spawn(async move {
+        tokio::task::block_in_place(move || call_on_event(&engine, &app, &plugin, &event, fuel_limit))
+    });
+    let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
+        Err(_) => "timeout".to_owned(),
+        Ok(Ok(Ok(0))) => "success".to_owned(),
+        Ok(Ok(Ok(code))) => format!("other:插件返回错误码 {code}"),
+        Ok(Ok(Err(e))) => {
+            // trap 的具体信息在错误链深处,格式化整条链再判 fuel。
+            let whole = format!("{e:#}");
+            if whole.to_lowercase().contains("fuel") {
+                "fuel_exhausted".to_owned()
+            } else {
+                format!("host_error:{}", truncate(&whole, DETAIL_MAX))
+            }
+        }
+        Ok(Err(join)) => format!("host_error:{join}"),
+    };
+    DispatchEntry {
+        at: Utc::now().timestamp(),
+        plugin_id,
+        event_type: event_type.into(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        result,
+    }
+}
+
+/// 记一条派发结果,环形淘汰最旧(KTD12)。
+fn push_entry(log: &Arc<Mutex<VecDeque<DispatchEntry>>>, entry: DispatchEntry) {
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    log.push_back(entry);
+    while log.len() > DISPATCH_LOG_CAP {
+        log.pop_front();
+    }
+}
+
+/// R14 回写:所有订阅插件都成功才置 success=1,否则保持 0 并点名失败者。
+/// ExpirySoon 行由 emit 的 record_dispatch 先立好,状态事件行由
+/// transition_state_event 立好,这里只做 UPDATE;行不存在(比如测试直接调
+/// dispatch)时 UPDATE 落空,无害。
+fn write_back(app: &App, event: &Event, entries: &[DispatchEntry]) {
+    let success = entries.iter().all(|e| e.result == "success");
+    let detail = if success {
+        String::new()
+    } else {
+        let failed: Vec<String> = entries
+            .iter()
+            .filter(|e| e.result != "success")
+            .map(|e| format!("{}: {}", e.plugin_id, e.result))
+            .collect();
+        truncate(&failed.join("; "), DETAIL_MAX)
+    };
+    if let Err(e) =
+        app.db.mark_dispatch_result(event.node_id(), event.type_name(), event.threshold_or_state_key(), success, &detail)
+    {
+        warn!("回写派发结果失败: {e:#}");
+    }
+}
+
+/// 读一个 u64 setting,缺省或非法值回落默认——一个手滑的 `abc` 不该把派发
+/// 整个停掉。
+fn setting_u64(app: &App, key: &str, default: u64) -> u64 {
+    app.db.get(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// 按字符边界截断,加省略号标记被截。
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -157,12 +463,12 @@ pub fn new_engine() -> wasmtime::Engine {
 
 /// 一个加载完毕、可以反复调用的插件:manifest 与编译产物。
 ///
-/// 只缓存 `Module`(Send+Sync,编译结果在 Engine 里共享);不持有 instance/store,
-/// 原因见模块文档的"资源模型"。
-#[allow(dead_code)] // U4 的 dispatch 循环接入
+/// 只缓存 `Module`(Send+Sync,编译结果在 Engine 里共享,clone 是 Arc 语义);
+/// 不持有 instance/store,原因见模块文档的"资源模型"。派发把整个
+/// `LoadedPlugin` clone 进任务:manifest 与 Module 都是 Arc 克隆,廉价。
+#[derive(Clone)]
 pub struct LoadedPlugin {
     pub manifest: Manifest,
-    #[allow(dead_code)] // U4 的 dispatch 循环读它实例化
     module: wasmtime::Module,
 }
 
@@ -175,7 +481,6 @@ impl std::fmt::Debug for LoadedPlugin {
 /// 把 db 行变成可调用的插件:解析 manifest、编译 wasm、检查导出契约。
 /// manifest 与模块二进制各自独立报错——上传 API 需要区分"manifest 写错了"和
 /// "模块编译不过"。
-#[allow(dead_code)] // U4 的 dispatch 循环接入
 pub fn load(engine: &wasmtime::Engine, row: &PluginRow) -> Result<LoadedPlugin> {
     let manifest = Manifest::parse(&row.manifest_json)
         .with_context(|| format!("插件 {}({}) 的 manifest 无效", row.id, row.plugin_id))?;
@@ -199,8 +504,8 @@ pub fn load(engine: &wasmtime::Engine, row: &PluginRow) -> Result<LoadedPlugin> 
 // 宿主函数(R8)
 // ---------------------------------------------------------------------------
 
-/// 每次调用的默认 fuel 限额(KTD6)。U4 读 setting `plugin.fuel_limit` 覆写。
-#[allow(dead_code)] // U4 读 setting 接入
+/// 每次调用的默认 fuel 限额(KTD6)。dispatch 每次读 setting
+/// `plugin.fuel_limit` 覆写,缺省回落到这里。
 pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
 
 /// 单个插件的 kv 值上限:8 KiB,足够放渠道配置,又不会让 setting 表被一个插件
@@ -514,8 +819,8 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
 /// 把一个事件交给插件处理,返回 `on_event` 的 i32(0 = 成功,非 0 = 插件自定义
 /// 错误码)。trap(fuel 耗尽、越界访问等)返回 `Err`。
 ///
-/// 超时不在这一层:U4 在外面套 tokio 超时;http 的单请求超时见 [`HTTP_TIMEOUT`]。
-#[allow(dead_code)] // U4 的 dispatch 循环接入
+/// 超时不在这一层:Registry 的派发循环在外面套 tokio 超时;http 的单请求
+/// 超时见 [`HTTP_TIMEOUT`]。
 pub fn call_on_event(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
@@ -877,5 +1182,261 @@ subscribes = ["expiry_soon", "agent_offline"]
         // trap 信息在错误链深处,格式化整条链再找。
         let whole = format!("{err:#}");
         assert!(whole.to_lowercase().contains("fuel"), "应是 fuel 耗尽,实际: {whole}");
+    }
+
+    // ---- Registry(U4):路由、隔离、预加载、dispatch_log、回写 ----
+    //
+    // 派发依赖 block_in_place,它只在多线程 runtime 上可用——#[tokio::test]
+    // 缺省是 current_thread,必须显式声明 flavor。
+
+    /// on_event 往自己的 kv 命名空间写 called=1:被调没被调,db 里见。
+    const KV_CALLED_WAT: &str = r#"
+(module
+  (import "host" "kv_set" (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "called")
+  (data (i32.const 2048) "1")
+  (func (export "__alloc") (param $cap i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (drop (call $kv_set (i32.const 1024) (i32.const 6) (i32.const 2048) (i32.const 1)))
+    (i32.const 0)))"#;
+
+    /// 死循环模块:配合小的 fuel 验证 fuel_exhausted,配合大 fuel 与小超时验证
+    /// timeout——两个截断路径都需要一个不会自己停的插件。
+    const SPIN_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (loop (br 0))
+    (i32.const 0)))"#;
+
+    /// App 包进 Arc 后初始化 Registry:真实派发路径需要 Weak 回指 upgrade 成功。
+    fn runtime_app() -> Arc<App> {
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
+        app
+    }
+
+    /// manifest 文本,subscribes 可变。
+    fn manifest_text(plugin_id: &str, subscribes: &[&str]) -> String {
+        let list = subscribes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        format!(
+            "plugin_id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"1.0.0\"\nabi_version = 1\nsubscribes = [{list}]"
+        )
+    }
+
+    /// 只写 db(enabled=1),不碰 Registry:给 init 的预加载路径留一个"db 里有、
+    /// 内存里没有"的起点。
+    fn insert(app: &App, plugin_id: &str, subscribes: &[&str], wasm: Vec<u8>) -> i64 {
+        let row = app
+            .db
+            .create_plugin(plugin_id, plugin_id, "1.0.0", &manifest_text(plugin_id, subscribes), &wasm, "")
+            .unwrap();
+        app.db.set_plugin_enabled(row.id, true).unwrap();
+        row.id
+    }
+
+    /// db 行 + Registry 加载,返回行 id。
+    fn install(app: &App, plugin_id: &str, subscribes: &[&str], wasm: Vec<u8>) -> i64 {
+        let id = insert(app, plugin_id, subscribes, wasm);
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(app, id).unwrap();
+        id
+    }
+
+    fn snapshot(app: &App) -> Vec<DispatchEntry> {
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot()
+    }
+
+    /// fire-and-forget 的派发是异步完成的;轮询直到谓词满足,10 秒上限。
+    async fn until<T>(mut predicate: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..400 {
+            if let Some(v) = predicate() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("条件在 10 秒内未满足");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribers_of_the_event_are_dispatched_to() {
+        let app = runtime_app();
+        install(&app, "com.test.a", &["expiry_soon"], compile(KV_CALLED_WAT));
+        install(&app, "com.test.b", &["expiry_soon"], compile(KV_CALLED_WAT));
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        let entries = until(|| {
+            let s = snapshot(&app);
+            (s.len() == 2).then_some(s)
+        })
+        .await;
+        for entry in &entries {
+            assert_eq!(entry.result, "success", "{entry:?}");
+            assert_eq!(entry.event_type, "expiry_soon");
+        }
+        // 两个插件各写各的命名空间:on_event 真的都跑过了。
+        assert_eq!(app.db.get("plugin.com.test.a:called").as_deref(), Some("1"));
+        assert_eq!(app.db.get("plugin.com.test.b:called").as_deref(), Some("1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_subscribing_to_other_events_is_skipped() {
+        let app = runtime_app();
+        install(&app, "com.test.a", &["expiry_soon"], compile(KV_CALLED_WAT));
+        install(&app, "com.test.b", &["agent_offline"], compile(KV_CALLED_WAT));
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        let entries = until(|| {
+            let s = snapshot(&app);
+            (s.len() == 1).then_some(s)
+        })
+        .await;
+        assert_eq!(entries[0].plugin_id, "com.test.a");
+        assert_eq!(app.db.get("plugin.com.test.b:called"), None, "未订阅者不应被调");
+    }
+
+    /// KTD10:一个插件加载失败只停用它自己,失败原因落库,其余照常。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_that_fails_to_load_does_not_block_the_rest() {
+        let app = Arc::new(App::for_test(Db::open(":memory:").unwrap()));
+        let bad = insert(&app, "com.test.bad", &["expiry_soon"], b"\0asm\xde\xad\xbe\xef".to_vec());
+        let good = insert(&app, "com.test.good", &["expiry_soon"], compile(KV_CALLED_WAT));
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
+        {
+            let reg = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+            assert!(!reg.is_loaded(bad), "坏插件不应进 loaded");
+            assert!(reg.is_loaded(good));
+        }
+        let bad_row = app.db.get_plugin(bad).unwrap().unwrap();
+        assert_eq!(bad_row.status, "failed");
+        assert!(bad_row.last_error.unwrap().contains("编译失败"), "失败原因要落库");
+        // 好插件照常派发。
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        until(|| {
+            let s = snapshot(&app);
+            (s.len() == 1).then_some(s)
+        })
+        .await;
+        assert_eq!(app.db.get("plugin.com.test.good:called").as_deref(), Some("1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_with_no_subscribers_records_nothing() {
+        let app = runtime_app();
+        install(&app, "com.test.a", &["agent_offline"], compile(KV_CALLED_WAT));
+        // expiry_soon 没有订阅者:不记 entry,但 bus 的转发计数仍然递增。
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(snapshot(&app).is_empty(), "dispatch_log 只记真的调用了插件的派发");
+        assert_eq!(app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runaway_plugin_is_cut_off_by_fuel_at_dispatch() {
+        let app = runtime_app();
+        install(&app, "com.test.spin", &["expiry_soon"], compile(SPIN_WAT));
+        app.db.set("plugin.fuel_limit", "10000").unwrap();
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        let entries = until(|| {
+            let s = snapshot(&app);
+            (s.len() == 1).then_some(s)
+        })
+        .await;
+        assert_eq!(entries[0].result, "fuel_exhausted");
+        assert_eq!(entries[0].plugin_id, "com.test.spin");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_plugin_is_cut_off_by_the_timeout() {
+        let app = runtime_app();
+        install(&app, "com.test.spin", &["expiry_soon"], compile(SPIN_WAT));
+        // fuel 大到 50ms 烧不完,超时先生效;超时后后台任务继续烧到 fuel 尽头,
+        // fuel 是硬兜底,超时只是不再等它。
+        app.db.set("plugin.fuel_limit", "400000000").unwrap();
+        app.db.set("plugin.timeout_ms", "50").unwrap();
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&expiry_event());
+        let entries = until(|| {
+            let s = snapshot(&app);
+            (s.len() == 1).then_some(s)
+        })
+        .await;
+        assert_eq!(entries[0].result, "timeout");
+        assert!(entries[0].elapsed_ms >= 50, "超时前的墙钟至少走满预算:{entries:?}");
+    }
+
+    /// 环形淘汰(KTD12)用 dispatch_one 驱动:fire-and-forget 的 dispatch 没有
+    /// "全部完成"的等待点,而 dispatch_one 逐次等待,1001 次后确定性断言。
+    /// 两条路径写的是同一个 push_entry。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_dispatch_log_is_a_ring_of_one_thousand() {
+        let app = runtime_app();
+        let id = install(&app, "com.test.a", &["expiry_soon"], compile(MINIMAL_WAT));
+        for _ in 0..=DISPATCH_LOG_CAP {
+            let entry =
+                app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id, &expiry_event()).await.unwrap();
+            assert_eq!(entry.result, "success");
+        }
+        assert_eq!(snapshot(&app).len(), DISPATCH_LOG_CAP, "1001 条进 1000 容量的环,最旧一条被淘汰");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fully_successful_dispatch_marks_the_log_row() {
+        let app = runtime_app();
+        install(&app, "com.test.a", &["expiry_soon"], compile(KV_CALLED_WAT));
+        let event = expiry_event();
+        let key = event.threshold_or_state_key();
+        app.db.record_dispatch(event.node_id(), "expiry_soon", key, 0).unwrap();
+        let (ok, detail) = app.db.notification_log_row(7, "expiry_soon", key).unwrap().unwrap();
+        assert!(!ok && detail.is_empty(), "派发前 success=0");
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&event);
+        let (_, detail) = until(|| {
+            app.db.notification_log_row(7, "expiry_soon", key).unwrap().filter(|(ok, _)| *ok)
+        })
+        .await;
+        assert_eq!(detail, "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_failure_keeps_the_row_unsuccessful_and_names_the_failure() {
+        let app = runtime_app();
+        install(&app, "com.test.good", &["expiry_soon"], compile(KV_CALLED_WAT));
+        install(&app, "com.test.bad", &["expiry_soon"], compile(SPIN_WAT));
+        // fuel 够 KV 插件跑完一轮、不够死循环停下来:好插件 success,坏插件
+        // fuel_exhausted,一好一坏才构成"部分失败"。
+        app.db.set("plugin.fuel_limit", "200000").unwrap();
+        let event = expiry_event();
+        let key = event.threshold_or_state_key();
+        app.db.record_dispatch(event.node_id(), "expiry_soon", key, 0).unwrap();
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&event);
+        // 两条 entry 都到位后,回写紧随其后;轮询到 detail 非空即回写完成。
+        until(|| {
+            let s = snapshot(&app);
+            (s.len() == 2).then_some(s)
+        })
+        .await;
+        let (ok, detail) = until(|| {
+            app.db.notification_log_row(7, "expiry_soon", key).unwrap().filter(|(_, d)| !d.is_empty())
+        })
+        .await;
+        assert!(!ok, "任一插件失败,success 保持 0");
+        assert!(detail.contains("com.test.bad: fuel_exhausted"), "点名失败者与原因:{detail}");
+        assert!(!detail.contains("com.test.good"), "成功者不进失败名单:{detail}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_one_returns_the_newest_log_entry() {
+        let app = runtime_app();
+        let id = install(&app, "com.test.a", &["expiry_soon"], compile(MINIMAL_WAT));
+        let entry = app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id, &expiry_event()).await.unwrap();
+        assert_eq!(entry.result, "success");
+        assert_eq!(entry.event_type, "expiry_soon");
+        assert_eq!(entry.plugin_id, "com.test.a");
+        let snap = snapshot(&app);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].plugin_id, entry.plugin_id);
+        assert_eq!(snap[0].result, entry.result);
+        assert_eq!(snap[0].elapsed_ms, entry.elapsed_ms);
+        // 未加载的行号:明确的 Err 而不是静默成功。
+        let err = app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id + 1, &expiry_event()).await;
+        assert!(err.is_err());
     }
 }
