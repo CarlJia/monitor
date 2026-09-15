@@ -94,7 +94,6 @@ impl Event {
 /// every skip is `Ok(())`. The `Result` carries only database failures; the
 /// dispatch itself is fire-and-forget, and its outcome is written back by the
 /// runtime (U4) via `mark_dispatch_result` rather than awaited here.
-#[allow(dead_code)] // No event source ships in U2; the scanner and connectivity watchdog arrive with U5/U6.
 pub fn emit(app: &App, event: &Event) -> Result<()> {
     if event.is_state_event() {
         // One row per node holds whichever side the node is on; a repeat of
