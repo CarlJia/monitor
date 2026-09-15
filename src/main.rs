@@ -6,8 +6,10 @@
 
 mod agent_ws;
 mod api;
+mod api_plugins;
 mod auth;
 mod db;
+mod db_plugins;
 mod frontend;
 mod notification_bus;
 mod plugin;
@@ -424,14 +426,17 @@ async fn main() -> Result<()> {
         // Plugins. The upload lives in the merged router below with the chunked
         // routes, because a plugin tar.gz is megabytes against this layer's
         // 64 KiB ceiling; everything else is a few bytes of id and key.
-        .route("/api/plugins", get(api::list_plugins))
-        .route("/api/plugins/{id}", delete(api::delete_plugin))
-        .route("/api/plugins/{id}/enable", post(api::enable_plugin))
-        .route("/api/plugins/{id}/disable", post(api::disable_plugin))
-        .route("/api/plugins/{id}/test", post(api::test_plugin))
-        .route("/api/plugins/{id}/logs", get(api::plugin_dispatch_log))
-        .route("/api/plugins/{id}/kv", get(api::list_plugin_kv))
-        .route("/api/plugins/{id}/kv/{key}", put(api::set_plugin_kv).delete(api::delete_plugin_kv_route))
+        .route("/api/plugins", get(api_plugins::list_plugins))
+        .route("/api/plugins/{id}", delete(api_plugins::delete_plugin))
+        .route("/api/plugins/{id}/enable", post(api_plugins::enable_plugin))
+        .route("/api/plugins/{id}/disable", post(api_plugins::disable_plugin))
+        .route("/api/plugins/{id}/test", post(api_plugins::test_plugin))
+        .route("/api/plugins/{id}/logs", get(api_plugins::plugin_dispatch_log))
+        .route("/api/plugins/{id}/kv", get(api_plugins::list_plugin_kv))
+        .route(
+            "/api/plugins/{id}/kv/{key}",
+            put(api_plugins::set_plugin_kv).delete(api_plugins::delete_plugin_kv_route),
+        )
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
@@ -449,9 +454,9 @@ async fn main() -> Result<()> {
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
                 // A plugin package is uploaded in one request, bounded by
-                // api::MAX_PLUGIN on the handler itself; this layer's job is
+                // api_plugins::MAX_PLUGIN on the handler itself; this layer's job is
                 // only to let those bytes past the 64 KiB ceiling above.
-                .route("/api/plugins", post(api::upload_plugin))
+                .route("/api/plugins", post(api_plugins::upload_plugin))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 // The multipart extractor applies its own default body limit on
                 // top of the layer above, and that default is 2 MiB -- without
