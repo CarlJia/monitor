@@ -1,0 +1,37 @@
+# tg-notify —— 仓库内置的示例通知插件（R17）。
+#
+# 独立 crate：仓库根的 Cargo.toml 是 monitor-hub 的 package，没有 [workspace]，
+# 因此本目录天然不在 hub 的编译范围里，`cargo build` / `cargo test` 互不影响。
+# 目标只有 wasm32-unknown-unknown，产物是 cdylib（一个 .wasm 文件）。
+
+[package]
+name = "tg-notify"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Telegram 通知示例插件（monitor-hub wasm 插件 ABI v1）"
+publish = false
+
+[lib]
+# cdylib：cargo build 产出 target/<triple>/release/tg_notify.wasm。
+crate-type = ["cdylib"]
+name = "tg_notify"
+
+[dependencies]
+# 事件载荷是带 "type" 标签的 JSON，用 serde 反序列化比手写解析器可读得多。
+# wasm32-unknown-unknown 上 std 可用（只是没有网络/时间等系统调用，那些全部
+# 经宿主函数），serde/serde_json 照常工作。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# 冒烟测试（tests/smoke.rs）用 wasmtime 复刻宿主的 6 个宿主函数，把编译出的
+# 真实 wasm 加载起来驱动。features 与 hub（src/plugin.rs）保持同一最小集合。
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+
+[profile.release]
+# 面向体积优化：示例插件的 wasm 越小，上传与加载越快。
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

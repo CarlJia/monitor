@@ -1,0 +1,6 @@
+# tg-notify 的 manifest。字段表见仓库 README 的「插件开发」章节。
+plugin_id = "com.example.tg-notify"
+name = "Telegram 通知"
+version = "0.1.0"
+abi_version = 1
+subscribes = ["expiry_soon", "agent_offline", "agent_online"]
