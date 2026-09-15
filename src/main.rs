@@ -62,6 +62,9 @@ pub struct App {
     /// access to spell out. `RwLock` because emitting only reads while
     /// enabling, disabling and hot-reloading a plugin writes.
     pub plugins: RwLock<plugin::Registry>,
+    /// 进程唯一的 wasm 引擎:插件的编译产物(Module)在它内部共享。fuel 计量
+    /// 在 [`plugin::new_engine`] 的 Config 里开启。见 `plugin` 模块的资源模型说明。
+    pub engine: wasmtime::Engine,
 }
 
 impl App {
@@ -79,6 +82,7 @@ impl App {
             site,
             themes,
             plugins: RwLock::new(plugin::Registry::default()),
+            engine: plugin::new_engine(),
         }
     }
 

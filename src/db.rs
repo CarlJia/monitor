@@ -308,8 +308,16 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
 
 /// Every table a backup must carry before this build will restore it.
 const TABLES: [&str; 10] = [
-    "setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session",
-    "plugin", "notification_log",
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "plugin",
+    "notification_log",
 ];
 
 /// One node's stored configuration and last known facts.
@@ -1694,13 +1702,7 @@ impl Db {
     /// insert: the check and the write are not one statement, and a dispatch
     /// racing itself must land as one row. Returns false when the row already
     /// stood, so the caller knows it was the duplicate.
-    pub fn record_dispatch(
-        &self,
-        node_id: i64,
-        event_type: &str,
-        key: i64,
-        sent_at: i64,
-    ) -> Result<bool> {
+    pub fn record_dispatch(&self, node_id: i64, event_type: &str, key: i64, sent_at: i64) -> Result<bool> {
         let inserted = self.conn().execute(
             "INSERT OR IGNORE INTO notification_log
                (node_id, event_type, threshold_or_state_key, sent_at, success, detail)
@@ -1729,12 +1731,7 @@ impl Db {
     /// Flips the node to `event_type` and clears the opposite side's row, both
     /// or neither. Returns false without writing when the node is already in
     /// that state: an offline node flapping its connection must not re-alert.
-    pub fn transition_state_event(
-        &self,
-        node_id: i64,
-        event_type: &str,
-        sent_at: i64,
-    ) -> Result<bool> {
+    pub fn transition_state_event(&self, node_id: i64, event_type: &str, sent_at: i64) -> Result<bool> {
         if self.current_state_event(node_id)?.is_some_and(|(current, _)| current == event_type) {
             return Ok(false);
         }
@@ -2700,16 +2697,11 @@ mod tests {
     fn a_fresh_database_is_on_schema_v4_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
-            4
-        );
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         let table = |name: &str| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
+                r.get::<_, i64>(0)
+            })
             .unwrap()
         };
         assert_eq!(table("plugin"), 1);
@@ -2744,10 +2736,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
-            4
-        );
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         for table in ["plugin", "notification_log"] {
             let found: i64 = conn
                 .query_row(
@@ -2765,10 +2754,7 @@ mod tests {
         // v4 and the stamp is already in place.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(
-            again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
-            4
-        );
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         drop(again);
         let _ = std::fs::remove_file(&file);
     }
@@ -2788,20 +2774,15 @@ mod tests {
         let old_path = format!("{}.copy", scratch.0);
         let old = Connection::open(&old_path).unwrap();
         old.execute_batch(SCHEMA).unwrap();
-        old.execute_batch(
-            "DROP TABLE plugin; DROP TABLE notification_log; PRAGMA user_version = 3;",
-        )
-        .unwrap();
+        old.execute_batch("DROP TABLE plugin; DROP TABLE notification_log; PRAGMA user_version = 3;")
+            .unwrap();
         drop(old);
 
         // The candidate carries no foreign tables or rows, only the shape; it
         // must pass every gate and come out with the v4 tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(
-            checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
-            4
-        );
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         for table in ["plugin", "notification_log"] {
             let found: i64 = checked
                 .query_row(
@@ -2821,10 +2802,12 @@ mod tests {
     fn plugins_round_trip_and_a_duplicate_plugin_id_is_refused() {
         let db = db();
         let wasm = b"\0asm-fake-module".to_vec();
-        let created = db
-            .create_plugin("mailer", "Mailer", "1.0.0", "{\"entry\":\"send\"}", &wasm, "sha")
-            .unwrap();
-        assert_eq!((created.id, created.plugin_id.as_str(), created.status.as_str()), (1, "mailer", "disabled"));
+        let created =
+            db.create_plugin("mailer", "Mailer", "1.0.0", "{\"entry\":\"send\"}", &wasm, "sha").unwrap();
+        assert_eq!(
+            (created.id, created.plugin_id.as_str(), created.status.as_str()),
+            (1, "mailer", "disabled")
+        );
         assert!(!created.enabled);
 
         let back = db.get_plugin(created.id).unwrap().unwrap();
@@ -2855,7 +2838,10 @@ mod tests {
         assert!(enabled.enabled && enabled.status == "enabled" && enabled.last_error.is_none());
 
         db.set_plugin_status(created.id, "error", Some("wasm would not start")).unwrap();
-        assert_eq!(db.get_plugin(created.id).unwrap().unwrap().last_error.as_deref(), Some("wasm would not start"));
+        assert_eq!(
+            db.get_plugin(created.id).unwrap().unwrap().last_error.as_deref(),
+            Some("wasm would not start")
+        );
 
         db.delete_plugin(second.id).unwrap();
         assert!(db.get_plugin(second.id).unwrap().is_none());
@@ -2897,7 +2883,10 @@ mod tests {
         let db = db();
         assert_eq!(db.current_state_event(5).unwrap(), None, "never reported, never recorded");
 
-        assert!(db.transition_state_event(5, "agent_offline", 100).unwrap(), "the first offline is a transition");
+        assert!(
+            db.transition_state_event(5, "agent_offline", 100).unwrap(),
+            "the first offline is a transition"
+        );
         assert!(!db.transition_state_event(5, "agent_offline", 200).unwrap(), "a repeat is not");
         assert_eq!(db.current_state_event(5).unwrap(), Some(("agent_offline".into(), 100)));
 

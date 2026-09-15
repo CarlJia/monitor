@@ -31,12 +31,23 @@ tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 插件运行时。编译期裁剪:wasmtime 默认 features 会拉入 wasi、component-model、
+# gc、cache、profiling 等一大批 v1 用不到的东西;`cranelift`(编译 wasm 到本机码,
+# 含 fuel metering 支持)+ `runtime`(Store/Linker/调用机制)+ `std` + `anyhow`
+# (`wasmtime::Error` 到 `anyhow::Error` 的转换,不然错误无法穿过 `Result<T>`)
+# 是一个能跑纯核心 wasm 模块的最小集合。版本取 48.x:crates.io 上最新稳定版
+# (49 还在 rc)。
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+# 插件 manifest(TOML)解析。默认 features 已含 serde 支持。
+toml = "1"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
 # Only the tests need a movable clock; the relay deadline spans minutes.
 # dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util"] }
+# 插件测试需要用 WAT 文本现场编译 wasm fixture;dev-dependencies 不进发布产物。
+wat = "1"
 
 [profile.release]
 codegen-units = 1

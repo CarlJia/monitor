@@ -101,7 +101,11 @@ pub fn emit(app: &App, event: &Event) -> Result<()> {
         // the same side is the same outage window and must not re-alert. The
         // transition also clears the opposite side's row in the same
         // transaction, so `current_state_event` is authoritative.
-        if app.db.current_state_event(event.node_id())?.is_some_and(|(current, _)| current == event.type_name()) {
+        if app
+            .db
+            .current_state_event(event.node_id())?
+            .is_some_and(|(current, _)| current == event.type_name())
+        {
             return Ok(());
         }
         if !app.db.transition_state_event(event.node_id(), event.type_name(), Utc::now().timestamp())? {
@@ -178,19 +182,12 @@ mod tests {
     #[test]
     fn state_events_transition_rather_than_accumulate() {
         let app = app();
-        let offline = Event::AgentOffline {
-            node_id: 5,
-            name: "edge-1".into(),
-            observed_at: 100,
-            last_seen_at: 90,
-        };
+        let offline =
+            Event::AgentOffline { node_id: 5, name: "edge-1".into(), observed_at: 100, last_seen_at: 90 };
         let online = Event::AgentOnline { node_id: 5, name: "edge-1".into(), observed_at: 300 };
 
         emit(&app, &offline).unwrap();
-        assert_eq!(
-            app.db.current_state_event(5).unwrap().map(|(t, _)| t),
-            Some("agent_offline".into())
-        );
+        assert_eq!(app.db.current_state_event(5).unwrap().map(|(t, _)| t), Some("agent_offline".into()));
 
         // Same side again within the same window: no re-dispatch.
         emit(&app, &offline).unwrap();
@@ -199,10 +196,7 @@ mod tests {
         // Coming back clears the offline row rather than joining it: the key
         // both sides share would otherwise report the outage forever.
         emit(&app, &online).unwrap();
-        assert_eq!(
-            app.db.current_state_event(5).unwrap().map(|(t, _)| t),
-            Some("agent_online".into())
-        );
+        assert_eq!(app.db.current_state_event(5).unwrap().map(|(t, _)| t), Some("agent_online".into()));
         assert!(!recorded(&app, 5, "agent_offline", 0), "the opposite side's row must be cleared");
 
         // Going offline again is a new outage and must re-alert.
@@ -226,12 +220,8 @@ mod tests {
         // day count, so no tier's dates bleed into the next tier's.
         assert_eq!(k("2026-12-31", 1) / 1_000_000, 1);
         // State events are keyed by the node alone.
-        let offline = Event::AgentOffline {
-            node_id: 1,
-            name: String::new(),
-            observed_at: 0,
-            last_seen_at: 0,
-        };
+        let offline =
+            Event::AgentOffline { node_id: 1, name: String::new(), observed_at: 0, last_seen_at: 0 };
         let online = Event::AgentOnline { node_id: 1, name: String::new(), observed_at: 0 };
         assert_eq!(offline.threshold_or_state_key(), 0);
         assert_eq!(online.threshold_or_state_key(), 0);
@@ -254,12 +244,8 @@ mod tests {
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}"#
         );
-        let event = Event::AgentOffline {
-            node_id: 5,
-            name: "edge-1".into(),
-            observed_at: 100,
-            last_seen_at: 90,
-        };
+        let event =
+            Event::AgentOffline { node_id: 5, name: "edge-1".into(), observed_at: 100, last_seen_at: 90 };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"agent_offline","node_id":5,"name":"edge-1","observed_at":100,"last_seen_at":90}"#
