@@ -2325,8 +2325,13 @@ mod tests {
             )
         };
 
-        let held: Vec<_> =
-            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        // `acquire().await` rather than `try_acquire().expect`: other tests in
+        // this binary hold a permit briefly while passing through `metrics`, and
+        // an instant grab of all four raced them as the suite grew.
+        let mut held = Vec::new();
+        for _ in 0..HISTORY_SLOTS {
+            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+        }
         assert_eq!(ask().await.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
         assert_eq!(ask().await.status(), StatusCode::OK, "a finished query gives its slot back");
@@ -2334,8 +2339,10 @@ mod tests {
         // An unauthorised caller is told so rather than asked to retry later: the
         // gate sits behind the visibility check deliberately.
         app.db.set("public_page", "off").unwrap();
-        let held: Vec<_> =
-            (0..HISTORY_SLOTS).map(|_| HISTORY_GATE.try_acquire().expect("up to the limit")).collect();
+        let mut held = Vec::new();
+        for _ in 0..HISTORY_SLOTS {
+            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+        }
         assert_eq!(ask().await.status(), StatusCode::UNAUTHORIZED);
         drop(held);
     }
