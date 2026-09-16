@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Puzzle, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Puzzle, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { ConfirmDialog } from "./ConfirmDialog"
@@ -15,10 +15,11 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
   api, changes, GIB, provisioningSite, trafficCorrection, upload,
-  type Node, type PingTask,
+  type Node, type PingTask, type PluginUsage,
 } from "@/lib/api"
-import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
+import { bytes, FOREVER, monthUsage, uptime } from "@/lib/format"
 
+import { PluginPageView } from "./PluginPage"
 import { Plugins } from "./Plugins"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -255,94 +256,6 @@ function NodeForm({ node, onClose, onSaved }: {
   )
 }
 
-function BillingForm({ node, onClose, onSaved }: {
-  node: Node
-  onClose: () => void
-  onSaved: () => void
-}) {
-  const [form, setForm] = useState(node)
-  // Text rather than a number: a numeric state cannot represent an empty field,
-  // so clearing it would snap back to 0 mid-entry. Empty means free.
-  const [price, setPrice] = useState(node.price > 0 ? String(node.price) : "")
-  const [saving, setSaving] = useState(false)
-  const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
-
-  async function save() {
-    setSaving(true)
-    try {
-      await api(`/nodes/${node.id}`, {
-        method: "PUT",
-        body: JSON.stringify(changes(node, {
-          price: Math.max(0, Number(price) || 0),
-          currency: form.currency,
-          billing_cycle: form.billing_cycle,
-          expires_at: form.expires_at || null,
-        })),
-      })
-      toast.success("续费设置已保存")
-      onClose()
-      onSaved()
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>{node.name}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="价格" hint="留空或 0 为免费">
-              <Input
-                type="number"
-                min="0"
-                step="0.01"
-                value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                placeholder="免费"
-              />
-            </Field>
-            <Field label="货币">
-              <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {["USD", "CNY", "EUR", "GBP", "JPY", "CAD"].map((c) => (
-                    <SelectItem key={c} value={c}>{c}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
-          </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="付款周期">
-              <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {Object.entries(CYCLES).map(([k, v]) => (
-                    <SelectItem key={k} value={k}>{v}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="到期时间">
-              <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
-            </Field>
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={save} disabled={saving}>保存</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
@@ -537,7 +450,6 @@ function InstallDialog({ node, site, onClose, onRotated }: {
 function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
-  const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
@@ -620,8 +532,6 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
               <TableHead className="w-[22%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
               <TableHead className="w-[16%]">流量</TableHead>
-              <TableHead className="w-[10%]">价格</TableHead>
-              <TableHead className="w-[12%]">到期</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -696,19 +606,12 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
                 </TableCell>
-                <TableCell className="tnum text-sm">
-                  {n.price > 0 ? money(n.price, n.currency) : "免费"}
-                </TableCell>
-                <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
                     <Pencil />
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
-                    <CalendarClock />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
                     <Trash2 className="text-destructive" />
@@ -718,7 +621,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             ))}
             {nodes.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，右上角添加
                 </TableCell>
               </TableRow>
@@ -739,9 +642,6 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
-      )}
-      {billing && (
-        <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
       {registering && <RegisterDialog site={site} reg={reg} onClose={() => { setRegistering(false); refresh() }} />}
 
@@ -1200,13 +1100,6 @@ function SettingsTab() {
               placeholder="3"
             />
           </Field>
-          <Field label="到期提醒阈值（天）" hint="逗号分隔。剩余天数恰好等于某个档位时通知，每档 1–365">
-            <Input
-              value={String(s["notification.expiry_thresholds"] ?? "")}
-              onChange={(e) => set("notification.expiry_thresholds", e.target.value)}
-              placeholder="7,3,1"
-            />
-          </Field>
         </div>
         {/* 不是 <label>：点文字不该切换开关，只有开关自己可点。
             aria-labelledby 保住读屏软件那边的关联。 */}
@@ -1235,7 +1128,6 @@ function SettingsTab() {
                 "notification.offline_threshold_reports": String(
                   s["notification.offline_threshold_reports"] || "3",
                 ),
-                "notification.expiry_thresholds": String(s["notification.expiry_thresholds"] || "7,3,1"),
               })
             }
           >
@@ -1386,6 +1278,8 @@ type DbInfo = {
   oldest: number | null
   retention: number
   rows: Record<string, number>
+  /** 每个插件占用的 plugin_data 字节/行 + setting 中 kv 的字节（U9/KTD11）。 */
+  plugins: PluginUsage[]
 }
 
 // The only two tables whose row count indicates anything about size. Every other
@@ -1531,6 +1425,45 @@ function Data() {
           onConfirm={vacuum}
         />
       )}
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">插件数据</h3>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            插件写在自身 plugin_data 表里的字节与行数，以及它在 setting 表里渠道配置（kv）的字节。
+            宿主只展示；删除入口在「插件」页里，由各插件自行决定清理什么。
+          </p>
+        </div>
+        {info.plugins.length === 0 ? (
+          <p className="text-sm text-muted-foreground">还没有插件。</p>
+        ) : (
+          <Card className="overflow-x-auto p-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[40%]">插件</TableHead>
+                  <TableHead className="text-right">plugin_data 行</TableHead>
+                  <TableHead className="text-right">plugin_data 字节</TableHead>
+                  <TableHead className="text-right">kv 字节</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {info.plugins.map((p) => (
+                  <TableRow key={p.plugin_id}>
+                    <TableCell>
+                      <div className="font-medium">{p.name}</div>
+                      <div className="text-xs text-muted-foreground">{p.plugin_id}</div>
+                    </TableCell>
+                    <TableCell className="tnum text-right">{p.data_rows.toLocaleString()}</TableCell>
+                    <TableCell className="tnum text-right">{bytes(p.data_bytes)}</TableCell>
+                    <TableCell className="tnum text-right">{bytes(p.kv_bytes)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Card>
+        )}
+      </Card>
       {pending && (
         <ConfirmDialog
           title="用备份覆盖当前数据？"
@@ -1572,11 +1505,15 @@ export function Admin({
   site: string
   canProvision: boolean
 }) {
+  // /admin/plugins/:id 是插件页面，路径前缀一致、id 取末段；解析失败
+  // （空串/NaN）就退回插件列表。
+  const pluginId = path.startsWith("/admin/plugins/") ? Number(path.split("/").pop()) : null
   return (
     <div className="flex flex-col gap-6 md:flex-row">
       <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
-          const active = path === to
+          // 插件这一项在列表与子页面都得算「当前」。
+          const active = to === "/admin/plugins" ? path === to || path.startsWith(`${to}/`) : path === to
           return (
             <button
               key={to}
@@ -1594,10 +1531,12 @@ export function Admin({
       </nav>
 
       <div className="min-w-0 flex-1">
-        {path === "/admin/ping" ? (
+        {pluginId && Number.isFinite(pluginId) ? (
+          <PluginPageView id={pluginId} onBack={() => go("/admin/plugins")} />
+        ) : path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/plugins" ? (
-          <Plugins />
+          <Plugins go={go} />
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/themes" ? (
