@@ -45,11 +45,7 @@ fn build_wasm() -> Vec<u8> {
         .current_dir(manifest_dir)
         .output()
         .expect("cargo build 应能启动");
-    assert!(
-        out.status.success(),
-        "wasm 构建失败：\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "wasm 构建失败：\n{}", String::from_utf8_lossy(&out.stderr));
     std::fs::read(format!("{target_dir}/wasm32-unknown-unknown/release/tg_notify.wasm"))
         .expect("应产出 tg_notify.wasm")
 }
@@ -106,11 +102,12 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
 
     let mut linker: Linker<Host> = Linker::new(engine);
 
-    linker.func_wrap("host", "log", |mut caller: Caller<'_, Host>, level: i32, ptr: i32, len: i32| {
-        let text = read_text(&mut caller, ptr, len).unwrap_or_default();
-        caller.data().logs.lock().unwrap().push((level, text));
-    })
-    .unwrap();
+    linker
+        .func_wrap("host", "log", |mut caller: Caller<'_, Host>, level: i32, ptr: i32, len: i32| {
+            let text = read_text(&mut caller, ptr, len).unwrap_or_default();
+            caller.data().logs.lock().unwrap().push((level, text));
+        })
+        .unwrap();
 
     linker.func_wrap("host", "now", || -> i64 { 1_800_000_000 }).unwrap();
 
@@ -206,11 +203,7 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
 }
 
 /// 按生产路径驱动一次 on_event：经 __alloc 分配载荷缓冲、写入、调用。
-fn send_event(
-    store: &mut Store<Host>,
-    instance: &wasmtime::Instance,
-    payload: &str,
-) -> i32 {
+fn send_event(store: &mut Store<Host>, instance: &wasmtime::Instance, payload: &str) -> i32 {
     let alloc = instance.get_typed_func::<(i32,), i32>(&mut *store, "__alloc").unwrap();
     let on_event = instance.get_typed_func::<(i32, i32), i32>(&mut *store, "on_event").unwrap();
     let mem: Memory = instance.get_memory(&mut *store, "memory").unwrap();
@@ -230,10 +223,7 @@ const CASES: &[(&str, &str)] = &[
         r#"{"type":"agent_offline","node_id":5,"name":"edge-1","observed_at":100,"last_seen_at":90}"#,
         "🔴 节点 edge-1 已离线",
     ),
-    (
-        r#"{"type":"agent_online","node_id":5,"name":"edge-1","observed_at":300}"#,
-        "🟢 节点 edge-1 已恢复在线",
-    ),
+    (r#"{"type":"agent_online","node_id":5,"name":"edge-1","observed_at":300}"#, "🟢 节点 edge-1 已恢复在线"),
 ];
 
 /// 三种事件都渲染成中文文案发到 Telegram，URL 带上 kv 里的 bot token。

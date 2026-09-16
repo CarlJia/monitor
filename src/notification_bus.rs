@@ -131,7 +131,7 @@ impl Event {
     pub fn threshold_or_state_key(&self) -> i64 {
         match self {
             Event::AgentOffline { .. } | Event::AgentOnline { .. } => 0,
-            Event::Plugin { name, payload } => {
+            Event::Plugin { payload, .. } => {
                 let threshold = payload.get("threshold_days").and_then(|v| v.as_i64()).unwrap_or(0);
                 let day = payload
                     .get("expires_at")
@@ -141,10 +141,14 @@ impl Event {
                     .unwrap_or(0);
                 let base = threshold * 1_000_000 + day;
                 if base == 0 {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    name.hash(&mut h);
-                    h.finish() as i64
+                    // 没有 `threshold_days`、也没有 `expires_at` 的插件事件:键会
+                    // 退化成一个常量,同一 (节点, 事件名) 的第二次发射被永久去重
+                    // ——但两次的 payload 可能完全不同。用 payload 的内容哈希补
+                    // 足身份:内容相同的重复仍按同一条处理,内容不同的各自派发。
+                    //
+                    // FNV-1a 而不是 `DefaultHasher`:后者算法未指定,跨 Rust 版本
+                    // 会变,而这个值要持久化进 notification_log,变了就会重发。
+                    fnv1a(payload.to_string().as_bytes()) as i64
                 } else {
                     base
                 }
@@ -158,6 +162,18 @@ impl Event {
     pub fn is_state_event(&self) -> bool {
         matches!(self, Event::AgentOffline { .. } | Event::AgentOnline { .. })
     }
+}
+
+/// FNV-1a(64 位)。用于给没有 `threshold_days`/`expires_at` 的插件事件算一个
+/// 稳定的内容键——`DefaultHasher` 的算法未指定,跨 Rust 版本会变,而这个值要
+/// 持久化进 `notification_log`,变了会把已抑制的告警重新发一遍。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Emits an event: deduplicate, record, then hand to the plugin registry.

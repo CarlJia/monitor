@@ -286,31 +286,76 @@ impl Db {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// 一个插件的记录数与总字节数(面板空间占用展示用,R11)。
+    /// 一个插件的记录数与总**字节**数(面板空间占用展示用,R11)。
+    ///
+    /// `LENGTH(CAST(data AS BLOB))` 而不是 `LENGTH(data)`:`length()` 对 TEXT
+    /// 返回**字符**数,与 Rust 侧按字节的 `str::len()` 混算会让 CJK 内容少算
+    /// 约 3 倍,配额与占用展示一起失真。
     pub fn plugin_data_usage(&self, plugin_id: &str) -> Result<(i64, i64)> {
         Ok(self.conn().query_row(
-            "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM plugin_data WHERE plugin_id=?1",
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
             params![plugin_id],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )?)
     }
 
-    /// 全部插件的记录数与总字节数,按 plugin_id 聚合(R11 数据页)。
-    pub fn plugin_data_usage_all(&self) -> Result<Vec<(String, i64, i64)>> {
+    /// 写一行并**在同一条事务里**强制单插件总字节配额。检查与写入分开做时,
+    /// 同一插件的两次并发写会各自读到同一份旧用量、各自判定通过,合起来越过
+    /// 上限——而配额正是用来限制磁盘占用的。`BEGIN IMMEDIATE` 立刻取写锁,
+    /// 两个并发写不会都通过检查。
+    ///
+    /// 返回 `Ok(None)` 表示超配额且未写入;`Ok(Some(created))` 表示已写入
+    /// (`created` 为 true 时是新建而非覆盖)。
+    pub fn plugin_data_put_within_quota(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        data: &str,
+        max_bytes: i64,
+    ) -> Result<Option<bool>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT plugin_id, COUNT(*), COALESCE(SUM(LENGTH(data)),0)
-             FROM plugin_data GROUP BY plugin_id ORDER BY plugin_id",
-        )?;
-        let rows =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// 删除一个插件的全部记录(删除插件时调用),返回删掉的行数。
-    pub fn delete_plugin_data(&self, plugin_id: &str) -> Result<usize> {
-        let gone = self.conn().execute("DELETE FROM plugin_data WHERE plugin_id=?1", params![plugin_id])?;
-        Ok(gone)
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let attempted = (|| -> Result<Option<bool>> {
+            let used: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
+                params![plugin_id],
+                |r| r.get(0),
+            )?;
+            let existing: i64 = conn
+                .query_row(
+                    "SELECT LENGTH(CAST(data AS BLOB)) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                    params![plugin_id, key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            // 覆盖写要先扣掉被替换的旧值,否则反复覆盖同一行会把用量算高。
+            if used - existing + data.len() as i64 > max_bytes {
+                return Ok(None);
+            }
+            let existed = existing > 0
+                || conn.query_row(
+                    "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                    params![plugin_id, key],
+                    |r| r.get::<_, i64>(0),
+                )? > 0;
+            conn.execute(
+                "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
+                params![plugin_id, key, data, Utc::now().timestamp()],
+            )?;
+            Ok(Some(!existed))
+        })();
+        match attempted {
+            Ok(v) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// 删除一行 setting。面板删除插件的单个 kv 行用;键名是调用方拼好的

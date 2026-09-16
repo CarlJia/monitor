@@ -50,8 +50,14 @@ extern "C" {
     /// -5 非 2xx）。
     #[link_name = "http_post"]
     fn host_http_post(
-        method_ptr: i32, method_len: i32, url_ptr: i32, url_len: i32, body_ptr: i32,
-        body_len: i32, resp_ptr: i32, resp_cap: i32,
+        method_ptr: i32,
+        method_len: i32,
+        url_ptr: i32,
+        url_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+        resp_ptr: i32,
+        resp_cap: i32,
     ) -> i32;
     /// 读 kv：返回写入 out 的字节数，0 = 无值，-1 = 越界/非法 UTF-8。
     #[link_name = "kv_get"]
@@ -237,12 +243,12 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
     const RESP_CAP: i32 = 4096;
     let resp_ptr = __alloc(RESP_CAP);
 
-    // 4) 发送。返回负数是宿主错误码：10 - code 落在 11..=15，与其它错误码错开。
+    // 4) 发送。返回负数是宿主错误码：10 - code 落在 11..=19，与其它错误码错开。
     let n = unsafe {
         host_http_post(method_ptr, method_len, url_ptr, url_len, body_ptr, body_len, resp_ptr, RESP_CAP)
     };
     if n < 0 {
-        log(3, &format!("tg-notify: sendMessage 失败，宿主错误码 {n}（-1 越界 -2 非 https -3 非 POST -4 网络 -5 非 2xx）"));
+        log(3, &format!("tg-notify: sendMessage 失败，宿主错误码 {n}（-1 越界 -2 非 https -3 非 POST -4 网络 -5 非 2xx -9 私有地址被拒）"));
         return 10 - n;
     }
     0

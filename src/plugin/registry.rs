@@ -238,18 +238,24 @@ impl Registry {
     /// 单插件派发一次并等待结果,U5 的"测试通知"接口。与 [`Registry::dispatch`]
     /// 走同一条执行路径(含超时与 fuel),但不写 notification_log:合成事件不
     /// 占幂等键,真实事件的成功与否不该被一次手工测试覆盖。
-    pub async fn dispatch_one(&self, plugin_row_id: i64, event: &Event) -> Result<DispatchEntry> {
-        let Some(plugin) = self.loaded.get(&plugin_row_id) else {
-            bail!("插件 {plugin_row_id} 未加载");
+    ///
+    /// 与 [`Registry::dispatch_ticks`] 同理:只在取快照时借一次读锁,不横跨
+    /// `run_one` 的 await——插件在 on_event 里发事件会重入同一把读锁。
+    pub async fn dispatch_one(app: &App, plugin_row_id: i64, event: &Event) -> Result<DispatchEntry> {
+        let (engine, dispatch_log, app_arc, plugin) = {
+            let reg = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+            let Some(plugin) = reg.loaded.get(&plugin_row_id).cloned() else {
+                bail!("插件 {plugin_row_id} 未加载");
+            };
+            let Some(app_arc) = reg.app.upgrade() else {
+                bail!("App 已拆除,无法派发");
+            };
+            (reg.engine.clone(), reg.dispatch_log.clone(), app_arc, plugin)
         };
-        let plugin = plugin.clone();
-        let Some(app) = self.app.upgrade() else {
-            bail!("App 已拆除,无法派发");
-        };
-        let fuel = setting_u64(&app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
-        let timeout_ms = setting_u64(&app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-        let entry = run_one(self.engine.clone(), app, plugin, event.clone(), fuel, timeout_ms).await;
-        push_entry(&self.dispatch_log, entry.clone());
+        let fuel = setting_u64(app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        let entry = run_one(engine, app_arc, plugin, event.clone(), fuel, timeout_ms).await;
+        push_entry(&dispatch_log, entry.clone());
         Ok(entry)
     }
 
@@ -257,18 +263,28 @@ impl Registry {
     /// 与事件派发同一套 fuel/超时隔离。tick 失败只 warn 不中断其他插件。
     /// 同步执行——housekeeping_pass 是同步的,tick 数量少(每插件一次无参调用),
     /// 不值得再起 fire-and-forget 任务;失败落 dispatch_log 供面板排查。
-    pub fn dispatch_ticks(&self, app: &App) {
-        let plugins: Vec<LoadedPlugin> = self.loaded.values().filter(|p| p.manifest.tick).cloned().collect();
+    ///
+    /// 关联函数而非 `&self` 方法:调用方(housekeeping)不再持锁,**这里只在
+    /// 取快照的那一小段借一次读锁**。guard 若横跨插件执行,插件在 `on_tick`
+    /// 里发事件会经 notification_bus 再取同一把读锁,写者(启停插件)排队时自
+    /// 死锁——std 明确把"读后排队写者、再读"列为可能死锁。
+    pub fn dispatch_ticks(app: &App) {
+        let (engine, dispatch_log, app_arc, plugins) = {
+            let reg = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+            let Some(app_arc) = reg.app.upgrade() else { return };
+            let plugins: Vec<LoadedPlugin> =
+                reg.loaded.values().filter(|p| p.manifest.tick).cloned().collect();
+            (reg.engine.clone(), reg.dispatch_log.clone(), app_arc, plugins)
+        };
         if plugins.is_empty() {
             return;
         }
         let fuel = setting_u64(app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
         let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-        let Some(app_arc) = self.app.upgrade() else { return };
         for plugin in plugins {
             let plugin_id = plugin.manifest.plugin_id.clone();
             let started = std::time::Instant::now();
-            let result = match call_hook(&self.engine, &app_arc, &plugin, "on_tick", fuel, timeout_ms) {
+            let result = match call_hook(&engine, &app_arc, &plugin, "on_tick", fuel, timeout_ms) {
                 Ok(0) => RESULT_SUCCESS.to_owned(),
                 Ok(code) => format!("other:{code}"),
                 Err(e) => {
@@ -282,7 +298,7 @@ impl Registry {
                 }
             };
             push_entry(
-                &self.dispatch_log,
+                &dispatch_log,
                 DispatchEntry {
                     at: Utc::now().timestamp(),
                     plugin_id,
@@ -296,17 +312,23 @@ impl Registry {
 
     /// 调用一个插件的「入参 JSON、返回 JSON」导出(`render_page`/`on_action`/
     /// `on_cleanup`),U5/U9 的页面与清理 API 用。未加载返回 Err(调用方转 404)。
-    pub fn call_json(&self, plugin_row_id: i64, hook: &str, input: &[u8]) -> Result<Vec<u8>> {
-        let Some(plugin) = self.loaded.get(&plugin_row_id) else {
-            bail!("插件 {plugin_row_id} 未加载");
+    ///
+    /// 与 [`Registry::dispatch_ticks`] 同理:锁只在取快照时借一次,不横跨插件
+    /// 执行——插件在 `on_action` 里发事件同样会重入这把读锁。
+    pub fn call_json(app: &App, plugin_row_id: i64, hook: &str, input: &[u8]) -> Result<Vec<u8>> {
+        let (engine, app_arc, plugin) = {
+            let reg = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+            let Some(plugin) = reg.loaded.get(&plugin_row_id).cloned() else {
+                bail!("插件 {plugin_row_id} 未加载");
+            };
+            let Some(app_arc) = reg.app.upgrade() else {
+                bail!("App 已拆除");
+            };
+            (reg.engine.clone(), app_arc, plugin)
         };
-        let plugin = plugin.clone();
-        let Some(app) = self.app.upgrade() else {
-            bail!("App 已拆除");
-        };
-        let fuel = setting_u64(&app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
-        let timeout_ms = setting_u64(&app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-        call_json_hook(&self.engine, &app, &plugin, hook, input, fuel, timeout_ms)
+        let fuel = setting_u64(app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        call_json_hook(&engine, &app_arc, &plugin, hook, input, fuel, timeout_ms)
     }
 
     /// 一个已加载插件的 manifest(U5:page 端点要读 page 声明判 404 与标题)。
@@ -410,12 +432,6 @@ fn setting_u64(app: &App, key: &str, default: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-// `dispatch_one` is awaited through a read guard of the plugin registry in
-// single-tenant tests: each test owns its `App`, the guard can contend with
-// nothing, and restructuring to hand the registry out of the lock would test a
-// different shape than production uses. The production path (`api_plugins::test_plugin`)
-// keeps the guard off the await via `spawn_blocking`.
-#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::db::Db;
@@ -575,13 +591,7 @@ mod tests {
         let app = runtime_app();
         let id = install(&app, "com.test.a", &["plugin_expiry_soon"], compile(MINIMAL_WAT));
         for _ in 0..=DISPATCH_LOG_CAP {
-            let entry = app
-                .plugins
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .dispatch_one(id, &expiry_event())
-                .await
-                .unwrap();
+            let entry = Registry::dispatch_one(&app, id, &expiry_event()).await.unwrap();
             assert_eq!(entry.result, "success");
         }
         assert_eq!(snapshot(&app).len(), DISPATCH_LOG_CAP, "1001 条进 1000 容量的环,最旧一条被淘汰");
@@ -635,13 +645,7 @@ mod tests {
     async fn dispatch_one_returns_the_newest_log_entry() {
         let app = runtime_app();
         let id = install(&app, "com.test.a", &["plugin_expiry_soon"], compile(MINIMAL_WAT));
-        let entry = app
-            .plugins
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .dispatch_one(id, &expiry_event())
-            .await
-            .unwrap();
+        let entry = Registry::dispatch_one(&app, id, &expiry_event()).await.unwrap();
         assert_eq!(entry.result, "success");
         assert_eq!(entry.event_type, "plugin_expiry_soon");
         assert_eq!(entry.plugin_id, "com.test.a");
@@ -651,8 +655,7 @@ mod tests {
         assert_eq!(snap[0].result, entry.result);
         assert_eq!(snap[0].elapsed_ms, entry.elapsed_ms);
         // 未加载的行号:明确的 Err 而不是静默成功。
-        let err =
-            app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_one(id + 1, &expiry_event()).await;
+        let err = Registry::dispatch_one(&app, id + 1, &expiry_event()).await;
         assert!(err.is_err());
     }
 }

@@ -43,8 +43,11 @@ function FormBlock({ block, busy, onSubmit }: {
     if (row.id !== undefined) payload.id = row.id
     for (const f of fields) {
       if (inputType(f) === "number") {
-        // 空串→NaN→跳过，保留服务端原值。插件不会收到 NaN。
-        const n = Number(draft(i, f))
+        // 空串要跳过而不是转成 0:`Number("")` 是 0,用户清空价格本意是"没填",
+        // 存成 0 会把它静默标成"免费"。非空但解析不出数字的也跳过,保留服务端原值。
+        const raw = draft(i, f).trim()
+        if (raw === "") continue
+        const n = Number(raw)
         if (!Number.isNaN(n)) payload[f] = n
       } else {
         payload[f] = draft(i, f)

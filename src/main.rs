@@ -51,6 +51,12 @@ pub struct App {
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
     pub http: reqwest::Client,
+    /// 插件 http 专用 client。与 `http` 分开的唯一原因是重定向策略:
+    /// `reqwest` 0.12 只能在 Client 上设,而宿主自身的调用(GitHub release、
+    /// 主题、运维配置的代理镜像)**需要**跟随重定向,插件请求**不能**——
+    /// SSRF 预检只看得到首个 URL,跟随时任一公网开放重定向都能把请求带到
+    /// 云元数据/回环/内网。分开之后插件侧的出网也天然与宿主隔离。
+    pub plugin_http: reqwest::Client,
     /// 历史查询的在途闸门(见 `api::HISTORY_SLOTS`)。放在 App 上而非模块级
     /// 静态量:它是 hub 实例的状态,每个测试各自的 App 拿到各自的闸门,并行
     /// 测试之间不再互相挤占。`Arc` 是为了让 handler 取到 owned permit——
@@ -88,6 +94,11 @@ impl App {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("http client"),
+            plugin_http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("plugin http client"),
             history_gate: Arc::new(tokio::sync::Semaphore::const_new(api::HISTORY_SLOTS)),
             site,
             themes,
@@ -700,7 +711,7 @@ fn housekeeping_pass(app: &App, offline_scan: bool) {
     // 到期日续期与到期提醒(原 renew_online_nodes/notify_expiring_nodes)已退役,
     // 迁入财务插件的 on_tick(U6/KTD7):插件在自己的存储上滚动到期日并经
     // emit_event 发 plugin_expiry_soon。宿主只负责按 manifest.tick 派发 tick。
-    app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_ticks(app);
+    plugin::Registry::dispatch_ticks(app);
     if !offline_scan {
         return;
     }
@@ -735,12 +746,6 @@ mod tests {
         let addr: SocketAddr = default_listen().parse().expect("the default must parse");
         assert!(addr.ip().is_unspecified(), "{addr}");
         assert_eq!(addr.port(), 28_080);
-    }
-
-    #[test]
-    fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
-        // 到期日滚动逻辑随宿主到期检测退役迁入财务插件(U6/KTD7),其单元
-        // 测试在插件的 smoke 测试里覆盖(AE4)。宿主不再持有该逻辑。
     }
 
     // ---- notification scanning (U6) ----

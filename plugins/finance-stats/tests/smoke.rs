@@ -213,25 +213,29 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
         .unwrap();
 
     linker
-        .func_wrap("host", "data_list", |mut caller: Caller<'_, Host>, pp: i32, pl: i32, out_ptr: i32, out_cap: i32| -> i32 {
-            let Some(prefix) = read_text(&mut caller, pp, pl) else { return -1 };
-            let mut rows: Vec<serde_json::Value> = caller
-                .data()
-                .data
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(k, _)| k.starts_with(&prefix))
-                .map(|(k, v)| serde_json::json!({"key": k, "data": v}))
-                .collect();
-            rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
-            let bytes = serde_json::to_vec(&rows).unwrap();
-            let n = bytes.len().min(out_cap.max(0) as usize);
-            if out_ptr > 0 && n > 0 && !write_mem(&mut caller, out_ptr, &bytes[..n]) {
-                return -1;
-            }
-            n as i32
-        })
+        .func_wrap(
+            "host",
+            "data_list",
+            |mut caller: Caller<'_, Host>, pp: i32, pl: i32, out_ptr: i32, out_cap: i32| -> i32 {
+                let Some(prefix) = read_text(&mut caller, pp, pl) else { return -1 };
+                let mut rows: Vec<serde_json::Value> = caller
+                    .data()
+                    .data
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| serde_json::json!({"key": k, "data": v}))
+                    .collect();
+                rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+                let bytes = serde_json::to_vec(&rows).unwrap();
+                let n = bytes.len().min(out_cap.max(0) as usize);
+                if out_ptr > 0 && n > 0 && !write_mem(&mut caller, out_ptr, &bytes[..n]) {
+                    return -1;
+                }
+                n as i32
+            },
+        )
         .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).expect("应满足导出契约并实例化");
@@ -271,7 +275,9 @@ fn tick(store: &mut Store<Host>, instance: &wasmtime::Instance) -> Vec<String> {
 }
 
 fn fx_json(base: &str) -> String {
-    format!(r#"{{"amount":1.0,"base":"{base}","date":"2027-01-15","rates":{{"USD":0.14,"CNY":1.0,"EUR":0.13}}}}"#)
+    format!(
+        r#"{{"amount":1.0,"base":"{base}","date":"2027-01-15","rates":{{"USD":0.14,"CNY":1.0,"EUR":0.13}}}}"#
+    )
 }
 
 /// 造一个 seed 插件数据记录的辅助：直接往桩宿主的数据表里塞。
@@ -388,7 +394,8 @@ fn page_totals_convert_and_skip_free() {
     seed(&store, "node:2", &node_record("free", 0.0, "USD", "monthly", None));
 
     call_unit(&mut store, &instance, "on_tick");
-    let page: serde_json::Value = serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
     let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
     let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
     // 10 USD * 12 = 120 USD/年 → /0.14 ≈ 857.14 CNY。免费节点不计入。
@@ -410,7 +417,8 @@ fn remaining_value_prorates_within_cycle() {
     seed(&store, "node:1", &node_record("edge", 10.0, "USD", "monthly", Some(&in15)));
 
     call_unit(&mut store, &instance, "on_tick");
-    let page: serde_json::Value = serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
     let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
     let remaining = stats["items"][1]["value"].as_str().unwrap().parse::<f64>().unwrap();
     let expect = 5.0 / 0.14;
@@ -443,7 +451,8 @@ fn cleanup_prunes_deleted_nodes() {
     seed(&store, "node:1", &node_record("kept", 1.0, "USD", "monthly", None));
     seed(&store, "node:99", &node_record("gone", 1.0, "USD", "monthly", None));
 
-    let out: serde_json::Value = serde_json::from_str(&call_json(&mut store, &instance, "on_cleanup", "{}")).unwrap();
+    let out: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "on_cleanup", "{}")).unwrap();
     assert_eq!(out["pruned"], 1, "只清掉已删除的节点");
     let data = store.data().data.lock().unwrap().clone();
     assert!(data.contains_key("node:1"), "保留的节点不动");

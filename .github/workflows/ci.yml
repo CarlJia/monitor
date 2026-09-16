@@ -44,3 +44,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+      # 插件是独立 crate(不在根 workspace 里),上面那条 `cargo test` 不会覆盖
+      # 它们——而它们正是宿主到期/财务行为的替代覆盖所在。冒烟测试会嵌套构建
+      # wasm32 产物,所以目标也要装。
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo test
+        working-directory: plugins/tg-notify
+      - run: cargo test
+        working-directory: plugins/finance-stats

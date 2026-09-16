@@ -169,6 +169,18 @@ CREATE TABLE IF NOT EXISTS plugin_data (
 /// database already in service.
 const SCHEMA_VERSION: i64 = 6;
 
+/// 两段式删列迁移(GATED_VERSION)未完成时停留的版本号。写成一个**绝对**的
+/// 常量而不是 `SCHEMA_VERSION - 1`:后者会随下一次升版一起漂走,把「v6 迁移
+/// 没跑过」的库盖成一个它其实没到过的版本。
+const GATED_VERSION: i64 = 5;
+
+/// node 表退役的四列(U7)。删列迁移的清单与完成判据都引用它,不散写。
+const RETIRED_NODE_COLUMNS: [&str; 4] = ["price", "currency", "billing_cycle", "expires_at"];
+
+/// 财务插件的 plugin_id。删列闸门只认它写下的 `node:` 记录——闸门读的是该
+/// 插件的私有 key 布局,不能因为别的插件恰好用了同一前缀就打开。
+const FINANCE_PLUGIN_ID: &str = "io.github.monitor.finance-stats";
+
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
 fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
@@ -319,24 +331,49 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
 /// 读写——财务数据归财务插件的 `plugin_data`,唯一真源换了地方。
 ///
 /// 删除是不可逆的,所以按 KTD10 两段式执行:只有当财务插件已经把节点导进
-/// 自己的存储(`plugin_data` 里出现 `node:` 记录)之后才动手。导入未完成时
-/// 保留列并返回 `false`,让 `migrate` 把版本停在 5,下一次启动再试——
-/// 「先换二进制、暂不装插件」的部署因此只是列闲置,启用插件后的下一次启动
-/// 自动完成删除。
+/// 自己的存储之后才动手。导入未完成时保留列并返回 `false`,让 `migrate` 把
+/// 版本停在 [`GATED_VERSION`],下一次启动再试——「先换二进制、暂不装插件」
+/// 的部署因此只是列闲置,启用插件后的下一次启动自动完成删除。
 ///
 /// 返回是否真的完成了删列(据此决定能否推进到 v6)。
 fn migrate_to_6(conn: &Connection) -> Result<bool> {
-    if !columns_of(conn, "node")?.contains("price") {
+    // 一个清单同时当「完成判据」与「待删清单」:两处各写一份会漂移——此前
+    // 只看 `price` 的判据,在「price 删掉了、其余还在」的半删状态下会误判成
+    // 已完成,剩下三列就永远留着。
+    let present = columns_of(conn, "node")?;
+    let retired: Vec<&str> = RETIRED_NODE_COLUMNS.iter().copied().filter(|c| present.contains(*c)).collect();
+    if retired.is_empty() {
         return Ok(true); // 已经删过,或本就是一个不含这些列的新库。
     }
-    let imported: i64 =
-        conn.query_row("SELECT COUNT(*) FROM plugin_data WHERE record_key LIKE 'node:%'", [], |r| r.get(0))?;
+    // 闸门按 plugin_id 限定:它读的是某个插件的私有 key 布局,别的插件恰好
+    // 用了 `node:` 前缀不该有资格触发这次不可逆操作。
+    let imported: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM plugin_data WHERE plugin_id = ?1 AND record_key LIKE 'node:%'",
+        [FINANCE_PLUGIN_ID],
+        |r| r.get(0),
+    )?;
     if imported == 0 {
         return Ok(false); // 财务插件还没导入,保留列,下次启动再试。
     }
-    for column in ["price", "currency", "billing_cycle", "expires_at"] {
+    // 旧值不会被迁移(插件读不到这四列),删除即永久丢失。删之前记一行,让
+    // 运维在日志里看到这次动了多少行非默认值,而不是无声无息。
+    let carried: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node
+          WHERE price <> 0 OR currency <> 'USD' OR billing_cycle <> 'monthly' OR expires_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if carried > 0 {
+        info!("schema v6: 删除 node 表退役财务列,{carried} 行带非默认值——不会被迁移,需在财务统计页面重录");
+    }
+    // 四条 ALTER 收在一个事务里:中途失败(磁盘满、SQLITE_BUSY)若留下半删
+    // 状态,下一次会被上面那个判据误当成已完成。SQLite 的 schema 变更可事务,
+    // 与 migrate_to_1 的整表重建同一手法。
+    conn.execute_batch("BEGIN")?;
+    for column in retired {
         conn.execute_batch(&format!("ALTER TABLE node DROP COLUMN {column}"))?;
     }
+    conn.execute_batch("COMMIT")?;
     Ok(true)
 }
 
@@ -362,10 +399,10 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 5 {
         migrate_to_5(conn)?;
     }
-    // v6 是条件迁移:财务列要等财务插件导入完才删。未完成时停在 v5——若照样
-    // stamp 成 6,这一步就永远不会重跑,列再也删不掉。
+    // v6 是条件迁移:财务列要等财务插件导入完才删。未完成时停在 GATED_VERSION
+    // ——若照样 stamp 成 6,这一步就永远不会重跑,列再也删不掉。
     let at_six = if from < 6 { migrate_to_6(conn)? } else { true };
-    let stamped = if at_six { SCHEMA_VERSION } else { SCHEMA_VERSION - 1 };
+    let stamped = if at_six { SCHEMA_VERSION } else { GATED_VERSION };
     conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
 }
@@ -575,10 +612,18 @@ impl Db {
         let fresh = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
             == 0;
+        // 比本二进制新的库在动手之前就拒掉:老代码不认识新 schema,继续跑会在
+        // 未知的表结构上读写,还会把 user_version 盖回自己认识的数字。与
+        // `check_backup` 对上传文件的那道守卫同一句话、同一个理由。
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !fresh && version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "the database is from a newer hub (schema {version}, this one reads {SCHEMA_VERSION}); upgrade first"
+            );
+        }
         conn.execute_batch(SCHEMA)?;
         restrict(path);
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -1363,7 +1408,7 @@ impl Db {
                 .collect::<Result<Vec<_>, _>>()?;
             for (plugin_id, name) in listed {
                 let (data_rows, data_bytes) = conn.query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM plugin_data WHERE plugin_id=?1",
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
                     params![plugin_id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )?;
@@ -2618,6 +2663,32 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// A database stamped newer than this binary is refused before anything
+    /// touches it: an older hub would read and write tables it does not know,
+    /// and would stamp its own version over the newer one.
+    #[test]
+    fn opening_a_newer_database_is_refused() {
+        let file = std::env::temp_dir().join(format!("monitor-newer-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+        let newer = Connection::open(path).unwrap();
+        newer.execute_batch(SCHEMA).unwrap();
+        newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
+        drop(newer);
+
+        let err = match Db::open(path) {
+            Ok(_) => panic!("比本二进制新的库应当被拒"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("newer hub"), "应给出可操作的提示,实际:{err}");
+        // 文件停在原版本,没有被降级盖上本二进制的版本号。
+        let probe = Connection::open(path).unwrap();
+        let v: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "被拒的库不该被改写 user_version");
+        drop(probe);
+        let _ = std::fs::remove_file(&file);
+    }
+
     /// The retired financial columns are dropped in two stages (KTD10): a
     /// pre-v6 database that still carries them waits until the finance plugin
     /// has imported its nodes into `plugin_data`, so an upgrade that swaps the
@@ -2658,6 +2729,17 @@ mod tests {
         let db = Db::open(path).unwrap();
         assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert!(columns_of(&db.conn(), "node").unwrap().contains("price"), "非 node: 记录不开闸");
+        // 别的插件用了同一个 `node:` 前缀也算不开闸:闸门读的是财务插件的私有
+        // key 布局,不能由第三方插件替它触发这次不可逆删列。
+        db.plugin_data_put("com.example.other", "node:1", "{}").unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(
+            columns_of(&db.conn(), "node").unwrap().contains("price"),
+            "别的插件的 node: 记录不开闸——闸门按 plugin_id 限定"
+        );
         drop(db);
 
         // The finance plugin imports: the next open drops the columns and lands

@@ -91,8 +91,8 @@ pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
 pub const KV_VALUE_MAX: usize = 8 * 1024;
 
 /// 插件 http 请求的墙钟超时(A13):4 秒,落在 5 秒的派发预算内,留 1 秒给宿主
-/// 自己的开销。挂在请求上而不是再建一个 client:全局 `app.http` 的 15 秒超时
-/// 服务于面板自身的下载,不能为插件收短。
+/// 自己的开销。挂在请求上:插件走 `App::plugin_http`(不跟随重定向的那个),
+/// 它的 client 级超时是 15 秒,服务于宿主侧下载,不能为插件收短。
 pub(super) const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 单次 http 响应体的硬上限:64 KiB。插件声明的 resp_cap 再大也读这么多——
@@ -138,9 +138,9 @@ const ERR_SSRF: i32 = -9;
 /// (169.254.169.254 落在 169.254/16)、CGNAT、基准测试与各类保留段。
 ///
 /// 这一层只拦**插件发起**的请求。宿主自身的 http 调用(主题下载、GitHub、
-/// 运维配置的 `github_proxy` 镜像)共用同一个 reqwest client,不加此限制——
-/// 把代理指向内网镜像是正当部署,一刀切会把它打断。插件则不同:它的 http
-/// 能力是"往公网 https 发请求",不该成为探内网、云元数据或回环服务的跳板。
+/// 运维配置的 `github_proxy` 镜像)走 `App::http`,不受此限——把代理指向内网
+/// 镜像是正当部署,一刀切会把它打断。插件则不同:它的 http 能力是"往公网
+/// https 发请求",不该成为探内网、云元数据或回环服务的跳板。
 fn address_is_blocked(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
@@ -171,13 +171,17 @@ fn address_is_blocked(addr: IpAddr) -> bool {
 
 /// 检查一个插件 http 目标是否指向公网。`Err` 是立即返回给插件的错误码:URL
 /// 解析不出主机名 → -2(与"非 https"同类,URL 形状不对);解析到的任一地址
-/// 落在受限网段 → -9;解析本身失败 → -4(网络问题,不是策略拒绝)。
+/// 落在受限网段 → -9;解析失败或超预算 → -4(网络/超时,不是策略拒绝)。
+///
+/// `budget` 是本次调用的剩余墙钟预算。解析必须受它约束:`lookup_host` 是
+/// `spawn_blocking` + 系统解析器,没有自己的超时,卡住时(常见 10-40 秒)会
+/// 穿透派发预算——而它是**请求之前**的一步,任何挂在请求上的超时都管不到。
 ///
 /// 先解析、再由 reqwest 自己再解析一次发送,中间留着一个 DNS rebinding 的
 /// 时间窗。这里不追求把它彻底焊死:威胁模型是"管理员安装的插件",而真正
 /// 的隔离来自 wasm 沙箱的其余边界;要焊死需要自定义 reqwest 的 Resolve 实现,
 /// 代价与收益不成比例。
-async fn http_target_is_allowed(url: &str) -> Result<(), i32> {
+async fn http_target_is_allowed(url: &str, budget: Duration) -> Result<(), i32> {
     let parsed = reqwest::Url::parse(url).map_err(|_| -2)?;
     let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
         return Err(-2);
@@ -189,13 +193,82 @@ async fn http_target_is_allowed(url: &str) -> Result<(), i32> {
         return if address_is_blocked(ip) { Err(ERR_SSRF) } else { Ok(()) };
     }
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let resolved = tokio::net::lookup_host((bare, port)).await.map_err(|_| -4)?;
-    for addr in resolved {
+    let Ok(resolved) = tokio::time::timeout(budget, tokio::net::lookup_host((bare, port))).await else {
+        warn!(host = %bare, "SSRF 预检的 DNS 解析超出派发预算");
+        return Err(-4);
+    };
+    for addr in resolved.map_err(|_| -4)? {
         if address_is_blocked(addr.ip()) {
             return Err(ERR_SSRF);
         }
     }
     Ok(())
+}
+
+/// 插件 http 的共同骨架:SSRF 预检 → 按剩余预算发一次请求 → 有界下载。
+/// `http_post` 与 `http_get` 只差方法、请求体与日志词,其余(预检、预算收缩、
+/// 重定向策略、有界读取、错误码映射)全在这里,不重复第二遍。
+///
+/// 返回 `Ok(响应体)` 或 `Err(错误码)`:预检拒绝用预检自己的码(-2/-9)、预检或
+/// 请求超时/网络失败 -4、非 2xx -5。日志都在这里发,调用方只做内存写回。
+#[allow(clippy::too_many_arguments)]
+async fn plugin_http_fetch(
+    app: &App,
+    plugin_id: &str,
+    label: &str,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    download_cap: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, i32> {
+    // 只记 host,不记完整 URL:路径与查询串可能带 token。
+    let host = url.split('/').nth(2).unwrap_or_default();
+    // SSRF 预检。它的 DNS 解析按剩余墙钟预算收缩——`lookup_host` 没有自己的
+    // 超时,卡住会穿透预算,而它是请求之前的一步。
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if let Err(code) = http_target_is_allowed(url, budget).await {
+        warn!(plugin = %plugin_id, host = %host, "{label} 拒绝私有/保留地址或预检超出预算");
+        return Err(code);
+    }
+    // 请求超时按剩余预算收缩:固定 4 秒会让"预算只剩 1 秒"的调用在后台把请求
+    // 跑完,预算就不是硬边界了。
+    let left = deadline.saturating_duration_since(std::time::Instant::now()).min(HTTP_TIMEOUT);
+    // 插件专用 client:不跟随重定向(见 App::plugin_http 的注释)。3xx 因此表现
+    // 为非 2xx(-5),而不是被跟到预检没看过的目标。
+    let mut request = app.plugin_http.request(method, url).timeout(left);
+    if let Some(body) = body {
+        request = request.header("content-type", "application/json").body(body);
+    }
+    let mut resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            warn!(plugin = %plugin_id, host = %host, error = %err, "{label} 请求失败");
+            return Err(-4);
+        }
+    };
+    let status = resp.status();
+    // 有界读取:按 chunk 累计到 download_cap 即停,超出的字节丢弃——截断语义
+    // 与"整读后截断"一致,但大响应体不再整体进内存。
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < download_cap {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = download_cap - buf.len();
+                buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                warn!(plugin = %plugin_id, host = %host, error = %err, "{label} 读取响应失败");
+                return Err(-4);
+            }
+        }
+    }
+    if !status.is_success() {
+        warn!(plugin = %plugin_id, host = %host, status = %status, "{label} 非 2xx 响应");
+        return Err(-5);
+    }
+    Ok(buf)
 }
 
 /// 单条 plugin_data 记录的上限:256 KiB(KTD3)。财务记录是百台机器量的
@@ -260,13 +333,28 @@ pub(crate) struct InstanceHandle {
 ///   即停,超出的字节丢弃——与"整读后截断"同效,但不会把大响应体整个拉进
 ///   内存),也是最终写回的截断长度。`bytes_len` 传 `usize::MAX` 时返回的
 ///   第二项就是纯容量,下载前据此定界。
-fn resp_write_plan(resp_ptr: i32, resp_cap: i32, last: (i32, i32), bytes_len: usize) -> Option<(i32, usize)> {
+///
+/// 决定写回哪块缓冲、写多少字节。`None` 表示没有可用缓冲(调用方返回 0)。
+/// 容量按 `max` 封顶——http 响应用 [`HTTP_RESP_MAX`],`data_list`/`nodes_query`
+/// 这类可能远大于单个响应的结果另有更大的上限(见 [`PLUGIN_DATA_MAX`])。
+fn resp_write_plan_capped(
+    resp_ptr: i32,
+    resp_cap: i32,
+    last: (i32, i32),
+    bytes_len: usize,
+    max: usize,
+) -> Option<(i32, usize)> {
     let (ptr, cap) = if resp_ptr > 0 { (resp_ptr, resp_cap) } else { last };
     if ptr <= 0 || cap < 0 {
         return None;
     }
-    let cap = (cap as usize).min(HTTP_RESP_MAX);
+    let cap = (cap as usize).min(max);
     Some((ptr, bytes_len.min(cap)))
+}
+
+/// http 响应体与其余小结果的写回计划,上限 [`HTTP_RESP_MAX`]。
+fn resp_write_plan(resp_ptr: i32, resp_cap: i32, last: (i32, i32), bytes_len: usize) -> Option<(i32, usize)> {
+    resp_write_plan_capped(resp_ptr, resp_cap, last, bytes_len, HTTP_RESP_MAX)
 }
 
 /// 新建 Store(带 fuel 与墙钟 deadline)、注册宿主函数、实例化。`call_on_event`
@@ -463,15 +551,15 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_post 拒绝非 https URL");
                 return -2;
             }
-            // 只记 host,不记完整 URL:路径与查询串可能带 token。
-            let host = url.split('/').nth(2).unwrap_or_default().to_string();
             let app = caller.data().app.clone();
-            // 下载前先定缓冲与有效容量:容量同时约束下载(读到即停)与写回截断。
-            // 没有可用缓冲也按硬上限有界下载——读完丢弃,不能不设界。
+            // 请求的构造、SSRF 预检与有界下载都在 plugin_http_fetch 里,
+            // 这里只做内存写回。
             let last = {
                 let state = caller.data();
                 (state.resp_ptr, state.resp_cap)
             };
+            // 下载上限同时约束读取(读到即停)与写回截断;没有可用缓冲也按硬上限
+            // 有界下载——读完丢弃,不能不设界。
             let download_cap = resp_write_plan(resp_ptr, resp_cap, last, usize::MAX)
                 .map(|(_, cap)| cap)
                 .unwrap_or(HTTP_RESP_MAX);
@@ -479,46 +567,19 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_post 不在异步运行时上下文中");
                 return -4;
             };
-            // SSRF 防线(v2):目标解析到私有/保留网段就拒绝,不发请求。
-            if let Err(code) = handle.block_on(http_target_is_allowed(&url)) {
-                warn!(plugin = %plugin_id, host = %host, "host_http_post 拒绝私有/保留地址");
-                return code;
-            }
-            let request = app
-                .http
-                .post(&url)
-                .timeout(HTTP_TIMEOUT)
-                .header("content-type", "application/json")
-                .body(body);
-            let outcome = handle.block_on(async {
-                let mut resp = request.send().await?;
-                let status = resp.status();
-                // 有界读取(#4):按 chunk 累计到 download_cap 即停,超出的字节
-                // 丢弃——截断语义与"整读后截断"一致,但大响应体不再整体进内存。
-                let mut buf: Vec<u8> = Vec::new();
-                while buf.len() < download_cap {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => {
-                            let remaining = download_cap - buf.len();
-                            buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                        }
-                        Ok(None) => break,
-                        Err(err) => return Err(err),
-                    }
-                }
-                Ok::<_, reqwest::Error>((status, buf))
-            });
-            let (status, bytes) = match outcome {
-                Ok(ok) => ok,
-                Err(err) => {
-                    warn!(plugin = %plugin_id, host = %host, error = %err, "host_http_post 请求失败");
-                    return -4;
-                }
+            let bytes = match handle.block_on(plugin_http_fetch(
+                &app,
+                &plugin_id,
+                "host_http_post",
+                reqwest::Method::POST,
+                &url,
+                Some(body),
+                download_cap,
+                caller.data().deadline,
+            )) {
+                Ok(bytes) => bytes,
+                Err(code) => return code,
             };
-            if !status.is_success() {
-                warn!(plugin = %plugin_id, host = %host, status = %status, "host_http_post 非 2xx 响应");
-                return -5;
-            }
             // resp_ptr 为 0 时回落到最近一次 host_resp_alloc 的缓冲;没有可用
             // 缓冲但请求已发出:不报错,返回 0 字节。选缓冲与截断见 resp_write_plan。
             let Some((ptr, n)) = resp_write_plan(resp_ptr, resp_cap, last, bytes.len()) else {
@@ -556,12 +617,15 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_get 拒绝非 https URL");
                 return -2;
             }
-            let host = url.split('/').nth(2).unwrap_or_default().to_string();
             let app = caller.data().app.clone();
+            // 请求的构造、SSRF 预检与有界下载都在 plugin_http_fetch 里,
+            // 这里只做内存写回。
             let last = {
                 let state = caller.data();
                 (state.resp_ptr, state.resp_cap)
             };
+            // 下载上限同时约束读取(读到即停)与写回截断;没有可用缓冲也按硬上限
+            // 有界下载——读完丢弃,不能不设界。
             let download_cap = resp_write_plan(resp_ptr, resp_cap, last, usize::MAX)
                 .map(|(_, cap)| cap)
                 .unwrap_or(HTTP_RESP_MAX);
@@ -569,39 +633,21 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_get 不在异步运行时上下文中");
                 return -4;
             };
-            // SSRF 防线(v2):目标解析到私有/保留网段就拒绝,不发请求。
-            if let Err(code) = handle.block_on(http_target_is_allowed(&url)) {
-                warn!(plugin = %plugin_id, host = %host, "host_http_get 拒绝私有/保留地址");
-                return code;
-            }
-            let request = app.http.get(&url).timeout(HTTP_TIMEOUT);
-            let outcome = handle.block_on(async {
-                let mut resp = request.send().await?;
-                let status = resp.status();
-                let mut buf: Vec<u8> = Vec::new();
-                while buf.len() < download_cap {
-                    match resp.chunk().await {
-                        Ok(Some(chunk)) => {
-                            let remaining = download_cap - buf.len();
-                            buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                        }
-                        Ok(None) => break,
-                        Err(err) => return Err(err),
-                    }
-                }
-                Ok::<_, reqwest::Error>((status, buf))
-            });
-            let (status, bytes) = match outcome {
-                Ok(ok) => ok,
-                Err(err) => {
-                    warn!(plugin = %plugin_id, host = %host, error = %err, "host_http_get 请求失败");
-                    return -4;
-                }
+            let bytes = match handle.block_on(plugin_http_fetch(
+                &app,
+                &plugin_id,
+                "host_http_get",
+                reqwest::Method::GET,
+                &url,
+                None,
+                download_cap,
+                caller.data().deadline,
+            )) {
+                Ok(bytes) => bytes,
+                Err(code) => return code,
             };
-            if !status.is_success() {
-                warn!(plugin = %plugin_id, host = %host, status = %status, "host_http_get 非 2xx 响应");
-                return -5;
-            }
+            // resp_ptr 为 0 时回落到最近一次 host_resp_alloc 的缓冲;没有可用
+            // 缓冲但请求已发出:不报错,返回 0 字节。选缓冲与截断见 resp_write_plan。
             let Some((ptr, n)) = resp_write_plan(resp_ptr, resp_cap, last, bytes.len()) else {
                 return 0;
             };
@@ -615,8 +661,9 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     // host_nodes_query(out_ptr, out_cap) -> i32:
     //   只读节点基础信息(R1/KTD2):返回 JSON 数组
     //   `[{"id":1,"name":"edge-1","online":true},...]`,写回 out,返回字节数。
-    //   财务字段(price/currency/... )已不在宿主 node 表——它们归财务插件的
-    //   plugin_data;财务插件首次启用时经这个函数读的是历史列(退役前)。
+    //   只回 id/name/online:财务字段(price/currency/...)自 v2 起归财务插件的
+    //   plugin_data,这个函数读不到它们,也不该读——插件首次启用时只按 id 建
+    //   空白记录,旧值需在插件页面重录。
     linker.func_wrap(
         "host",
         "nodes_query",
@@ -647,15 +694,23 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 })
                 .collect();
             let bytes = serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec());
-            let (ptr, n) = match resp_write_plan(
+            // 节点表可能几百台,远超 http 响应的 64 KiB 上限。按 plugin_data
+            // 配额量级给上限:仍放不下就明确报错,**不截断**——截断的 JSON 在
+            // 插件侧会退化成"空列表",而空列表在这里意味着清空自己的数据。
+            let (ptr, n) = match resp_write_plan_capped(
                 out_ptr,
                 out_cap,
                 (caller.data().resp_ptr, caller.data().resp_cap),
                 bytes.len(),
+                PLUGIN_DATA_MAX as usize,
             ) {
                 Some(plan) => plan,
                 None => return 0,
             };
+            if n < bytes.len() {
+                warn!(plugin = %caller.data().plugin_id, "nodes_query 结果 {} 字节超出插件缓冲上限", bytes.len());
+                return ERR_QUOTA;
+            }
             if !write_mem(&mut caller, ptr, &bytes[..n]) {
                 return ERR_BOUNDS;
             }
@@ -726,22 +781,14 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
             }
             let plugin_id = caller.data().plugin_id.clone();
             let app = caller.data().app.clone();
-            // 配额:排除本 key 的现有占用,加上新值。
-            let (_, used) = match app.db.plugin_data_usage(&plugin_id) {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!(plugin = %plugin_id, "data_put 统计失败: {e:#}");
-                    return ERR_DB;
+            // 配额检查与写入在 db 层的同一事务里做:分成"读用量→判→写"三步
+            // 时,同一插件的两次并发写会各自通过检查,合起来越过上限(KTD3)。
+            match app.db.plugin_data_put_within_quota(&plugin_id, &key, &value, PLUGIN_DATA_MAX) {
+                Ok(Some(_)) => 0,
+                Ok(None) => {
+                    warn!(plugin = %plugin_id, "data_put 超出单插件配额");
+                    ERR_QUOTA
                 }
-            };
-            let existing =
-                app.db.plugin_data_get(&plugin_id, &key).ok().flatten().map(|s| s.len() as i64).unwrap_or(0);
-            if used - existing + value.len() as i64 > PLUGIN_DATA_MAX {
-                warn!(plugin = %plugin_id, "data_put 超出单插件配额");
-                return ERR_QUOTA;
-            }
-            match app.db.plugin_data_put(&plugin_id, &key, &value) {
-                Ok(_) => 0,
                 Err(e) => {
                     warn!(plugin = %plugin_id, "data_put 失败: {e:#}");
                     ERR_DB
@@ -826,9 +873,17 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 rows.into_iter().map(|(key, data)| serde_json::json!({ "key": key, "data": data })).collect();
             let bytes = serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec());
             let last = (caller.data().resp_ptr, caller.data().resp_cap);
-            let Some((ptr, n)) = resp_write_plan(out_ptr, out_cap, last, bytes.len()) else {
+            // 同 nodes_query:按 plugin_data 配额量级给上限,放不下就报错而不是
+            // 截断(截断后的 JSON 会被插件 `unwrap_or_default()` 成空表)。
+            let Some((ptr, n)) =
+                resp_write_plan_capped(out_ptr, out_cap, last, bytes.len(), PLUGIN_DATA_MAX as usize)
+            else {
                 return 0;
             };
+            if n < bytes.len() {
+                warn!(plugin = %caller.data().plugin_id, "data_list 结果 {} 字节超出插件缓冲上限", bytes.len());
+                return ERR_QUOTA;
+            }
             if !write_mem(&mut caller, ptr, &bytes[..n]) {
                 return ERR_BOUNDS;
             }
@@ -889,6 +944,24 @@ pub fn call_on_event(
     Ok(on_event.call(&mut handle.store, (ptr, payload.len() as i32))?)
 }
 
+/// 把一段同步的 wasm 执行挪出调度线程,同时保留运行时上下文——宿主函数要
+/// `Handle::try_current` 才认得 `app.http`,而 `block_in_place` 正是"离开调度
+/// 线程但仍在运行时内"的唯一手段。
+///
+/// 必须这么做,否则宿主函数里的 `Handle::block_on` 会在已 entered 的上下文里
+/// 嵌套 `block_on` 并 panic("Cannot start a runtime from within a runtime")。
+/// release 档 `panic = "abort"`,那会直接终止进程。
+///
+/// 只在多线程运行时上包一层:单线程运行时 `block_in_place` 自身就 panic,而
+/// 完全没有运行时(纯同步测试)时也没有嵌套 `block_on` 可言。生产用的是多线程
+/// 运行时(main),两条测试/同步路径直接跑。
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// 调用一个无参 `() -> i32` 导出(`on_tick`),与 [`call_on_event`] 同一套
 /// fuel/deadline 隔离。tick 不带事件载荷:插件在 on_tick 里经宿主函数
 /// (nodes_query/data_*/http_get/emit_event)自取所需(U4/KTD4)。
@@ -906,7 +979,7 @@ pub fn call_hook(
         .instance
         .get_typed_func::<(), i32>(&mut handle.store, hook)
         .map_err(|_| anyhow::anyhow!("模块缺少 {hook}(load 已按 manifest 声明检查,不应到达这里)"))?;
-    Ok(func.call(&mut handle.store, ())?)
+    run_blocking(|| Ok(func.call(&mut handle.store, ())?))
 }
 
 /// 调用一个「入参 JSON、返回 JSON」的导出(`render_page`/`on_action`/
@@ -945,18 +1018,22 @@ pub fn call_json_hook(
         bail!("__alloc 指针 {in_ptr} 超出线性内存");
     }
     mem.data_mut(&mut handle.store)[start..end].copy_from_slice(input);
-    let n = func.call(&mut handle.store, (in_ptr, input.len() as i32))?;
+    let n = run_blocking(|| func.call(&mut handle.store, (in_ptr, input.len() as i32)))?;
     if n < 0 {
         bail!("{hook} 返回错误码 {n}");
     }
     // 响应体在插件最近一次 host_resp_alloc 记下的缓冲里。
-    let (resp_ptr, _) = {
+    let (resp_ptr, resp_cap) = {
         let s = handle.store.data();
         (s.resp_ptr, s.resp_cap)
     };
     if n == 0 || resp_ptr <= 0 {
         return Ok(Vec::new());
     }
+    // 不信任插件自报的长度:它可能声明 64 字节的缓冲却返回 2^31-1,让宿主
+    // 从线性内存里拷出远超缓冲的字节。按声明的 cap 收窄(0 视作未设,仍按
+    // 声明的长度读,由下面的内存边界兜底)。
+    let n = if resp_cap > 0 { n.min(resp_cap) } else { n };
     let start = resp_ptr as usize;
     let end = start.checked_add(n as usize).context("响应地址溢出")?;
     let data = mem.data(&handle.store);
@@ -1247,6 +1324,22 @@ mod tests {
     fn nodes_query_reports_online_state() {
         let engine = engine();
         let app = app();
+        // 播种两台:一台有 agent 会话(在线)、一台没有。不播种的话返回值是
+        // "[]",旧断言"是个数组"会空过——测试名声称的在线语义从未被验证。
+        let online = app
+            .db
+            .create_node(&crate::db::Node { name: "edge-up".into(), ..Default::default() }, "tok-up")
+            .unwrap();
+        let offline = app
+            .db
+            .create_node(&crate::db::Node { name: "edge-down".into(), ..Default::default() }, "tok-down")
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        app.agents
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(online, crate::agent_ws::Agent::new(1, tx));
+
         let wat = r#"
 (module
   (import "host" "nodes_query" (func $q (param i32 i32) (result i32)))
@@ -1260,7 +1353,12 @@ mod tests {
         let mem = h.instance.get_memory(&mut h.store, "memory").unwrap();
         let bytes = &mem.data(&h.store)[4096..4096 + n as usize];
         let arr: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        assert!(arr.is_array());
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "{arr:?}");
+        let by_id = |id: i64| arr.iter().find(|v| v["id"] == id).cloned().unwrap();
+        assert_eq!(by_id(online)["name"], serde_json::json!("edge-up"));
+        assert_eq!(by_id(online)["online"], serde_json::json!(true), "有会话的节点在线");
+        assert_eq!(by_id(offline)["online"], serde_json::json!(false), "没有会话的节点离线");
     }
 
     // ---- http_get(U3) ----
@@ -1335,13 +1433,13 @@ mod tests {
             "https://[::1]/x",
             "https://localhost/x",
         ] {
-            assert_eq!(http_target_is_allowed(url).await, Err(ERR_SSRF), "{url}");
+            assert_eq!(http_target_is_allowed(url, Duration::from_secs(5)).await, Err(ERR_SSRF), "{url}");
         }
         // 没有主机名的 URL 先一步按 -2 拒掉。scheme 校验不在这里:调用方
         // (http_get/http_post)已在进入前拦掉非 https,这里只看目标地址。
         // 注意 `https:///nohost` 会被 URL 解析器折叠成主机 `nohost`(要走
         // DNS),所以用 `https://` 这个必然缺主机名的形状。
-        assert_eq!(http_target_is_allowed("https://").await, Err(-2));
+        assert_eq!(http_target_is_allowed("https://", Duration::from_secs(5)).await, Err(-2));
     }
 
     /// 端到端:插件的 http_get 打到私网地址,宿主函数返回 -9 而不是发请求。

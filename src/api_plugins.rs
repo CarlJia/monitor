@@ -59,9 +59,28 @@ fn plugin_or_404(app: &App, id: i64) -> Result<String, Response> {
     }
 }
 
-/// 一个插件不满足某能力声明时的 404(未声明 page/cleanup 的路由)。
+/// 一个插件不满足某能力声明时的 404(未声明 page/cleanup 的路由)。纯文本
+/// 响应体,与 `bad`/`fail` 同一形状——面板只有一条错误路径(`res.text()`),
+/// 返回 JSON 会让 toast 里出现 `{"error":"..."}` 的原文。
 fn not_found(message: &str) -> Response {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
+    (StatusCode::NOT_FOUND, message.to_owned()).into_response()
+}
+
+/// 已加载插件的 manifest。未加载返回 400,与 `test_plugin` 对同一状况的回答
+/// 一致——「插件没启用」和「插件没声明这项能力」在面板上都表现为"点了没反应",
+/// 但恢复动作完全不同(去启用 vs 去改 manifest),不能混成同一个 404。
+///
+/// `manifest_of` 只看内存里已加载(启用)的插件,所以先判加载状态再判能力声明。
+///
+/// `#[allow(result_large_err)]` 与 [`plugin_or_404`] 同一理由:Err 装的是现成
+/// 的 Response,调用侧直接 return,装箱省下的那点栈不值得多一次解引用。
+#[allow(clippy::result_large_err)]
+fn loaded_manifest(app: &App, id: i64) -> Result<Manifest, Response> {
+    let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+    if !registry.is_loaded(id) {
+        return Err(bad("插件未启用或加载失败；先启用它再重试"));
+    }
+    registry.manifest_of(id).ok_or_else(|| bad("插件未启用或加载失败；先启用它再重试"))
 }
 
 /// Installs an uploaded plugin package (R11): a `multipart/form-data` request
@@ -351,18 +370,14 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
             "threshold_days": 1,
         }),
     };
-    // 读锁的 guard 不是 Send,不能横跨 handler 的 await(handler 的 future 必须是
-    // Send);而 dispatch_one 又只在 &self 上工作。把它整个挪进 blocking 线程,
-    // 用预先取好的 runtime handle 驱动——guard 只活在那条同步闭包里,内部
-    // run_one 的 spawn 与超时照常落在 runtime 上。
+    // `dispatch_one` 自己只在取插件快照时借一次读锁,执行期间不持锁,所以
+    // 这里不必再套一层 guard。wasm 是 CPU 活,仍挪进 blocking 线程,用预先
+    // 取好的 runtime handle 驱动——run_one 的 spawn 与超时照常落在 runtime 上。
     let outcome = {
         let app = app.clone();
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
-            handle.block_on(registry.dispatch_one(id, &event))
-        })
-        .await
+        tokio::task::spawn_blocking(move || handle.block_on(plugin::Registry::dispatch_one(&app, id, &event)))
+            .await
     };
     match outcome {
         Ok(Ok(entry)) => Json(json!({
@@ -405,14 +420,11 @@ pub async fn render_plugin_page(_: Admin, State(app): State<Shared>, Path(id): P
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let declared = app
-        .plugins
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .manifest_of(id)
-        .map(|m| m.page.is_some())
-        .unwrap_or(false);
-    if !declared {
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if manifest.page.is_none() {
         return not_found("该插件没有声明页面");
     }
     let outcome = call_plugin_json(app.clone(), id, "render_page", b"{}").await;
@@ -424,7 +436,7 @@ pub async fn render_plugin_page(_: Admin, State(app): State<Shared>, Path(id): P
         },
         Err(e) => {
             warn!(plugin = %plugin_id, "render_page 失败: {e:#}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件页面渲染失败"}))).into_response()
+            (StatusCode::BAD_GATEWAY, "插件页面渲染失败").into_response()
         }
     }
 }
@@ -441,14 +453,11 @@ pub async fn plugin_page_action(
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let declared = app
-        .plugins
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .manifest_of(id)
-        .map(|m| m.page.is_some())
-        .unwrap_or(false);
-    if !declared {
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if manifest.page.is_none() {
         return not_found("该插件没有声明页面");
     }
     if body.len() > ACTION_BODY_MAX {
@@ -463,7 +472,7 @@ pub async fn plugin_page_action(
         },
         Err(e) => {
             warn!(plugin = %plugin_id, "on_action 失败: {e:#}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件处理失败"}))).into_response()
+            (StatusCode::BAD_GATEWAY, "插件处理失败").into_response()
         }
     }
 }
@@ -475,14 +484,11 @@ pub async fn plugin_cleanup(_: Admin, State(app): State<Shared>, Path(id): Path<
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let declared = app
-        .plugins
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .manifest_of(id)
-        .map(|m| m.cleanup)
-        .unwrap_or(false);
-    if !declared {
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if !manifest.cleanup {
         return not_found("该插件没有声明清理能力");
     }
     let outcome = call_plugin_json(app.clone(), id, "on_cleanup", b"{}").await;
@@ -494,24 +500,22 @@ pub async fn plugin_cleanup(_: Admin, State(app): State<Shared>, Path(id): Path<
         },
         Err(e) => {
             warn!(plugin = %plugin_id, "on_cleanup 失败: {e:#}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件清理失败"}))).into_response()
+            (StatusCode::BAD_GATEWAY, "插件清理失败").into_response()
         }
     }
 }
 
 /// 调一个插件的 JSON 入/出导出。`Registry::call_json` 走的是与派发同一套
-/// fuel/超时隔离;读锁的 guard 不是 Send,整个调用挪进 blocking 线程
-/// (与 test_plugin 同一手法)。
+/// fuel/超时隔离,并且自己只在取插件快照时借一次读锁——插件执行期间不持锁,
+/// 插件在 `on_action` 里发事件不会重入这把锁。wasm 是 CPU 活,仍挪进 blocking
+/// 线程;这里不再套外层 `block_on`,嵌套 `block_on` 会让宿主里的同名调用
+/// panic。
 async fn call_plugin_json(app: Shared, id: i64, hook: &str, input: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
     let hook = hook.to_owned();
     let input = input.to_vec();
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
-        handle.block_on(async { registry.call_json(id, &hook, &input) })
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?
+    tokio::task::spawn_blocking(move || plugin::Registry::call_json(&app, id, &hook, &input))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
 }
 
 /// 页面 action 请求体的上限,与该路由所在的 64 KiB 层一致。
@@ -1360,10 +1364,11 @@ title = "Finance"
         let app = plugin_app();
         assert_eq!(upload(&app, page_archive()).await.status(), StatusCode::OK);
         let id = app.db.list_plugins().unwrap()[0].id;
-        // 未启用:render_page 未加载 → 404(页面能力依赖已加载的插件)。
+        // 未启用:报 400「插件未启用」而不是 404「没声明页面」——面板按存储的
+        // manifest 显示「页面」按钮,运维该去启用插件,而不是去改 manifest。
         assert_eq!(
             render_plugin_page(Admin, State(app.clone()), Path(id)).await.status(),
-            StatusCode::NOT_FOUND
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         let resp = render_plugin_page(Admin, State(app.clone()), Path(id)).await;
@@ -1382,13 +1387,14 @@ title = "Finance"
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_of(resp).await["title"], "Finance");
 
-        // 未声明 page 的插件:404。
+        // 未声明 page 的插件:启用后仍是 404(声明缺失),与「未启用」的 400 区分。
         assert_eq!(
             upload(&app, plugin_archive(&plugin_manifest("com.example.nopage", 2))).await.status(),
             StatusCode::OK
         );
         let plain =
             app.db.list_plugins().unwrap().iter().find(|p| p.plugin_id == "com.example.nopage").unwrap().id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(plain)).await.status(), StatusCode::OK);
         assert_eq!(
             render_plugin_page(Admin, State(app.clone()), Path(plain)).await.status(),
             StatusCode::NOT_FOUND
@@ -1404,6 +1410,13 @@ title = "Finance"
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
+        // 未启用 → 400「未启用」;启用后没声明 cleanup → 404「没声明清理能力」。
+        // 两者是不同的恢复动作,不能混成一个码。
+        assert_eq!(
+            plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         assert_eq!(plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::NOT_FOUND);
     }
 }

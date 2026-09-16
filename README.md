@@ -28,7 +28,12 @@ hub 支持用 Rust 编写的 WASM 通知插件：节点到期、agent 掉线/恢
 宿主事件）和 [`plugins/finance-stats`](plugins/finance-stats)（财务统计，
 自己发事件 + 面板页面 + 自清理）。
 
-> ABI v1（`abi_version = 1`）已停用，仅 v2。
+> **升级到 2.0.0 的破坏性变更**：ABI v1（`abi_version = 1`）已停用，仅 v2
+> ——已安装的 v1 插件**不再加载**，需对着 v2 重编并重新上传。同时：节点 JSON
+> 去掉 `price`/`currency`/`billing_cycle`/`expires_at` 四个字段、
+> `notification.expiry_thresholds` 设置不再可读、宿主内置的到期提醒退役
+> （改由财务插件发 `plugin_expiry_soon`）。未安装财务插件的部署不再有到期通知。
+> 旧库里的那四列由启动迁移删除（需先启用财务插件完成导入），旧值不会被迁移。
 
 ### 快速开始
 
@@ -64,7 +69,7 @@ title = "财务统计"                    # page.title 在面板导航上显示
 | `abi_version` | 必须为 `2` |
 | `subscribes` | 订阅的宿主事件列表；v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
 | `wasm_entry` | 可选，缺省 `plugin.wasm`：包内 wasm 入口文件名 |
-| `[tick]` | 存在则每 60 秒调度一次 `on_tick` |
+| `[tick]` | 存在则每小时调度一次 `on_tick` |
 | `[page]` | 存在则面板里出现「页面」入口；`title` 必填 |
 | `[cleanup]` | 存在则面板里出现「清理」按钮，调 `on_cleanup` |
 
@@ -89,7 +94,7 @@ title = "财务统计"                    # page.title 在面板导航上显示
 
 | 导出 | 触发时机 |
 |---|---|
-| `on_tick()` | manifest 声明 `[tick]` 时，宿主每 60 秒调一次 |
+| `on_tick()` | manifest 声明 `[tick]` 时，宿主每小时调一次 |
 | `render_page(ptr, len) -> i32` | manifest 声明 `[page]` 时，面板打开页面时调用，返回值为写入响应缓冲的字节数 |
 | `on_action(ptr, len) -> i32` | manifest 声明 `[page]` 时，面板里的交互（按钮/表单提交）调用；与 `render_page` 一样的返回协议 |
 | `on_cleanup(ptr, len) -> i32` | manifest 声明 `[cleanup]` 时，面板里的「清理」按钮调用 |
@@ -110,12 +115,12 @@ title = "财务统计"                    # page.title 在面板导航上显示
 | `host_http_get` | `(url_ptr, url_len, resp_ptr, resp_cap) -> i32` | 固定 GET；同样见错误码表 |
 | `host_kv_get` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | 写入 `out` 的字节数；**0 = 无值或空**；-1 越界/非法 UTF-8 |
 | `host_kv_set` | `(key_ptr, key_len, val_ptr, val_len) -> i32` | 0 成功；-1 越界/值超 8 KiB；-2 写库失败 |
-| `host_nodes_query` | `(out_ptr, out_cap) -> i32` | 把全部节点的精简快照（id/name/online/last_seen）写进缓冲；返回字节数或 -1 越界。仅供只读查询 |
+| `host_nodes_query` | `(out_ptr, out_cap) -> i32` | 把全部节点的精简快照（id/name/online）写进缓冲；返回字节数、-1 越界或 -6 放不下。仅供只读查询 |
 | `host_emit_event` | `(name_ptr, name_len, payload_ptr, payload_len) -> i32` | 0 成功；-1 越界、-7 事件名不以 `plugin_` 开头、-8 内部错误。事件会经通知派发路径送达订阅者 |
 | `host_data_put` | `(key_ptr, key_len, val_ptr, val_len) -> i32` | 写一行；value 上限 256 KiB、单插件总占用上限 16 MiB；超限 -6 |
 | `host_data_get` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | 取一行；0 表示无此 key；-1 越界/非 UTF-8 |
 | `host_data_delete` | `(key_ptr, key_len) -> i32` | 删一行；-1 越界 |
-| `host_data_list` | `(prefix_ptr, prefix_len, out_ptr, out_cap) -> i32` | 按前缀列出 `[len:u32][key:len][key_bytes...]...` 的紧凑形式；-1 越界 |
+| `host_data_list` | `(prefix_ptr, prefix_len, out_ptr, out_cap) -> i32` | 按前缀列出，JSON 数组 `[{"key":"node:1","data":"..."},...]`；返回字节数、-1 越界或 -6 放不下 |
 
 错误码汇总：
 
@@ -134,7 +139,7 @@ title = "财务统计"                    # page.title 在面板导航上显示
 `host_http_post` / `host_http_get` 只允许访问公网 https 地址：私有段
 （10/8、172.16/12、192.168/16）、回环、链路本地与云元数据
 （169.254.169.254）、CGNAT、保留段，以及解析后落进这些网段的主机名，一律
-按 -9 拒绝。这是**插件的**限制——宿主自身的 http 调用（主题、GitHub、运维
+按 -9 拒绝。插件请求**不跟随重定向**（3xx 表现为 -5）——预检只看得到首个 URL，跟随会让任一公网开放重定向绕过它。这是**插件的**限制——宿主自身的 http 调用（主题、GitHub、运维
 配置的 `github_proxy` 镜像）不经过这层，内网镜像照常可用。防线在 DNS 解析
 后判定，但解析与发送之间仍存在 DNS rebinding 的时间窗；威胁模型是「管理员
 安装的插件」，真正的隔离靠 wasm 沙箱的其余边界。
@@ -186,6 +191,14 @@ title = "财务统计"                    # page.title 在面板导航上显示
 （`items: [{label,value}]`）、`select`（提交 `{action, value}`）、
 `table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，提交
 `{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
+
+`form` 的字段名决定控件类型，这是**协议的一部分**（不是实现细节）：名字里
+含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at` 结尾的用日期
+输入框，其余用文本框。字段名不合这套规则就会拿到错误的控件（比如把价格叫
+`unit_cost_value` 仍会被认成数字，但叫 `fee` 就只会是文本框）。
+
+数字字段清空表示"不改这个字段"，不会存成 0——`Number("")` 是 0，而 0 在这类
+字段里通常有实际含义（比如财务插件的 0 表示免费）。
 
 ### 资源限制
 

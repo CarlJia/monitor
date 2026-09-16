@@ -147,9 +147,7 @@ fn data_list(prefix: &str) -> Vec<(String, String)> {
     let text = bytes_to_string(&buf[..n as usize]);
     let rows: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
     rows.into_iter()
-        .filter_map(|r| {
-            Some((r.get("key")?.as_str()?.to_owned(), r.get("data")?.as_str()?.to_owned()))
-        })
+        .filter_map(|r| Some((r.get("key")?.as_str()?.to_owned(), r.get("data")?.as_str()?.to_owned())))
         .collect()
 }
 
@@ -195,13 +193,11 @@ fn default_threshold() -> i64 {
 
 impl Config {
     fn load() -> Config {
-        data_get("config")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| Config {
-                target_currency: default_target(),
-                threshold_days: default_threshold(),
-                imported: false,
-            })
+        data_get("config").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| Config {
+            target_currency: default_target(),
+            threshold_days: default_threshold(),
+            imported: false,
+        })
     }
     fn save(&self) {
         if let Ok(s) = serde_json::to_string(self) {
@@ -225,7 +221,9 @@ fn cycle_months(cycle: &str) -> Option<u32> {
 
 fn today() -> NaiveDate {
     let secs = unsafe { host_now() };
-    DateTime::from_timestamp(secs, 0).map(|d| d.date_naive()).unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+    DateTime::from_timestamp(secs, 0)
+        .map(|d| d.date_naive())
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
 }
 
 /// 节点记录键。
@@ -280,7 +278,12 @@ fn ensure_imported(cfg: &mut Config) {
         return;
     }
     let known: std::collections::HashSet<i64> = all_nodes().into_iter().map(|(id, _)| id).collect();
-    for (id, name) in nodes_basic() {
+    // 查询失败就这次不做也不标记——标记了等于永久放弃导入,下一轮 tick 会重试。
+    let Some(nodes) = nodes_basic() else {
+        log(2, "finance-stats: nodes_query 失败,本轮跳过导入");
+        return;
+    };
+    for (id, name) in nodes {
         if known.contains(&id) {
             continue;
         }
@@ -301,16 +304,22 @@ fn ensure_imported(cfg: &mut Config) {
 }
 
 /// 节点的 (id, name)。供导入建记录与清理对账。
-fn nodes_basic() -> Vec<(i64, String)> {
+///
+/// `None` 表示**宿主查询失败**(负错误码,含结果放不下),与"确实没有节点"
+/// (`Some(空)`)必须分开:清理拿不到存活集合时若把它当成空集合,会把所有
+/// 节点记录全删掉。导入同理——失败时不能标记"已导入",否则再也补不回来。
+fn nodes_basic() -> Option<Vec<(i64, String)>> {
     let mut buf = vec![0u8; BUF];
     let n = unsafe { host_nodes_query(buf.as_mut_ptr() as i32, buf.len() as i32) };
-    if n <= 0 {
-        return Vec::new();
+    if n < 0 {
+        return None;
     }
     let arr: Vec<Value> = serde_json::from_str(&bytes_to_string(&buf[..n as usize])).unwrap_or_default();
-    arr.into_iter()
-        .filter_map(|v| Some((v.get("id")?.as_i64()?, v.get("name")?.as_str()?.to_owned())))
-        .collect()
+    Some(
+        arr.into_iter()
+            .filter_map(|v| Some((v.get("id")?.as_i64()?, v.get("name")?.as_str()?.to_owned())))
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -337,10 +346,8 @@ fn refresh_fx(cfg: &Config) -> bool {
             return false;
         }
     };
-    let rates: HashMap<String, f64> = v
-        .get("rates")
-        .and_then(|r| serde_json::from_value(r.clone()).ok())
-        .unwrap_or_default();
+    let rates: HashMap<String, f64> =
+        v.get("rates").and_then(|r| serde_json::from_value(r.clone()).ok()).unwrap_or_default();
     if rates.is_empty() {
         log(2, "finance-stats: 汇率响应没有 rates");
         return false;
@@ -423,13 +430,17 @@ fn totals(fx: Option<&Fx>, today: NaiveDate) -> Option<((f64, f64), Vec<String>)
         if let Some(c) = annual_cost(&n) {
             match convert(fx, c, &n.currency) {
                 Some(v) => annual += v,
-                None => { missing.insert(n.currency.clone()); }
+                None => {
+                    missing.insert(n.currency.clone());
+                }
             }
         }
         if let Some(r) = remaining_value(&n, today) {
             match convert(fx, r, &n.currency) {
                 Some(v) => remaining += v,
-                None => { missing.insert(n.currency.clone()); }
+                None => {
+                    missing.insert(n.currency.clone());
+                }
             }
         }
     }
@@ -576,11 +587,8 @@ fn build_page() -> Value {
     let mut due: Vec<Value> = Vec::new();
     let mut all: Vec<Value> = Vec::new();
     for (id, n) in all_nodes() {
-        let days_left = n
-            .expires_at
-            .as_deref()
-            .and_then(|d| d.parse::<NaiveDate>().ok())
-            .map(|e| (e - today).num_days());
+        let days_left =
+            n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|e| (e - today).num_days());
         let free = n.price <= 0.0;
         all.push(json!({
             "id": id,
@@ -680,7 +688,12 @@ fn handle_action(input: &str) -> Value {
 
 /// 删掉已不在宿主节点表里的残留记录，返回清理统计。
 fn cleanup() -> Value {
-    let live: std::collections::HashSet<i64> = nodes_basic().into_iter().map(|(id, _)| id).collect();
+    // 拿不到存活集合时**不能**按"空集合"继续:那会把每一台机器的记录都删掉。
+    let Some(nodes) = nodes_basic() else {
+        log(3, "finance-stats: nodes_query 失败,拒绝清理");
+        return json!({ "error": "nodes_query 失败,无法确定存活节点;未清理任何记录" });
+    };
+    let live: std::collections::HashSet<i64> = nodes.into_iter().map(|(id, _)| id).collect();
     let mut pruned = 0i64;
     let mut freed = 0i64;
     for (id, _) in all_nodes() {
@@ -747,4 +760,3 @@ fn respond(value: &Value) -> i32 {
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len()) };
     cap
 }
-
