@@ -279,6 +279,105 @@ pub async fn metrics(
     }
 }
 
+/// How many fleet-wide quality scans may run at once.
+///
+/// The scan reads every visible node's retained probe rows in one pass, holding
+/// the single connection the agents report through for its whole lifetime --
+/// heavier than one history window, which `HISTORY_GATE` already bounds at four.
+/// Two, refused rather than queued, for the reasons given there: the scans
+/// serialise on that one connection, and a queue would admit the same flood later.
+const QUALITY_SLOTS: usize = 2;
+static QUALITY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(QUALITY_SLOTS);
+
+/// The window the batch quality band reports on, in seconds, and the step its
+/// buckets are built at. Short and minute-wide on purpose: the list page shows a
+/// trend across an hour, not a trace, and the cost is set by how many
+/// node-probe-seconds fall inside the window.
+const QUALITY_HOURS: i64 = 1;
+const QUALITY_STEP: i64 = 60;
+
+/// How long one rendered quality response is reused. Just under the list page's
+/// own 60-second poll, so a viewer who opens the page mid-window receives the
+/// frame the last scan built rather than paying for a scan of their own.
+const QUALITY_TTL_MS: i64 = 15_000;
+
+/// The batch network quality for every visible node: one window's bucketed
+/// latency/loss per probe, keyed by node id, with the probe names alongside.
+///
+/// The list page's quality band fetches this once instead of issuing N per-node
+/// history requests, which is what makes the feature reachable at all: N such
+/// requests serialise on `HISTORY_GATE` and would mostly be refused.
+///
+/// Two guards sit in front of the scan. A short TTL cache, keyed by audience,
+/// lets a burst of viewers share one scan; a scan that misses the cache runs
+/// under [`QUALITY_GATE`].
+pub async fn nodes_quality(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    let full = authed(&app, &headers);
+    if !full && !app.public_page() {
+        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+    }
+    // A cached frame needs no permit, so a burst of viewers costs one scan per
+    // TTL rather than one per request. Checked after the auth decision so an
+    // unauthorised caller is told so rather than handed a cached public frame.
+    if let Some(cached) = quality_frame(&app, full) {
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], cached.to_string())
+            .into_response();
+    }
+    // A miss runs one scan under the gate. Refused rather than queued, and the
+    // permit is held across the await so `spawn_blocking` is what makes "in
+    // flight" meaningful -- the same construction `metrics` uses.
+    let Ok(_permit) = QUALITY_GATE.try_acquire() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many quality queries in flight, try again")
+            .into_response();
+    };
+    let built = tokio::task::spawn_blocking(move || build_quality(&app, full)).await;
+    match built {
+        Ok(body) => ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// The cached frame when it is still fresh, else `None`. `full` selects the
+/// audience slot: the admin frame may carry private nodes the public one must not,
+/// exactly as `live_snapshot` splits its two slots.
+fn quality_frame(app: &App, full: bool) -> Option<Utf8Bytes> {
+    let now = Utc::now().timestamp_millis();
+    let slot = usize::from(full);
+    let cache = app.quality.lock().unwrap_or_else(|e| e.into_inner());
+    (0..QUALITY_TTL_MS).contains(&now.saturating_sub(cache[slot].0)).then(|| cache[slot].1.clone())
+}
+
+/// Builds the payload and stores it in the audience's cache slot.
+///
+/// Runs on a blocking worker: it holds the single write connection across the
+/// fleet scan, which is exactly the thing the runtime must not be parked on.
+/// Viewers that arrive while one scan is in flight read the cache the moment it
+/// lands rather than starting a second scan.
+fn build_quality(app: &App, full: bool) -> String {
+    let since = Utc::now().timestamp() - QUALITY_HOURS * 3_600;
+    // A scan failure yields an empty map rather than a 500: one node with a
+    // malformed range must not remove the whole band, matching `safeNodes`'
+    // treatment of a bad report on the theme side.
+    let series = app.db.ping_records_all(since, QUALITY_STEP).unwrap_or_default();
+    // The same visibility filter `visible_nodes` applies, expressed as an id set
+    // so the fold above stays one scan regardless of node count.
+    let visible: std::collections::HashSet<i64> =
+        app.db.nodes().unwrap_or_default().into_iter().filter(|n| full || n.public).map(|n| n.id).collect();
+    let mut out = serde_json::Map::new();
+    for (id, (ping, loss)) in series {
+        if !visible.contains(&id) {
+            continue;
+        }
+        // Names only: targets and assignments remain behind `Admin`, as in `metrics`.
+        let probes = app.db.ping_task_names(id).unwrap_or_else(|_| json!({}));
+        out.insert(id.to_string(), json!({"ping": ping, "probes": probes, "loss": loss}));
+    }
+    let payload = Utf8Bytes::from(json!(out).to_string());
+    let mut cache = app.quality.lock().unwrap_or_else(|e| e.into_inner());
+    cache[usize::from(full)] = (Utc::now().timestamp_millis(), payload.clone());
+    payload.to_string()
+}
+
 /// Widest history window each audience may request.
 ///
 /// The thinning below bounds the response, not the scan behind it: `hours=2160`

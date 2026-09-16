@@ -45,6 +45,11 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// Last rendered batch-quality response per audience, `[public, admin]`,
+    /// with the millisecond it was built. Shared by every viewer of the quality
+    /// band so a burst of them costs one fleet-wide ping scan, not one each.
+    /// See `api::nodes_quality`.
+    pub quality: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -76,6 +81,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            quality: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             http: reqwest::Client::builder()
@@ -400,6 +406,7 @@ async fn main() -> Result<()> {
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
+        .route("/api/nodes/quality", get(api::nodes_quality))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
         // Sign-in.
