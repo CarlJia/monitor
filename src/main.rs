@@ -51,6 +51,12 @@ pub struct App {
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
     pub http: reqwest::Client,
+    /// 历史查询的在途闸门(见 `api::HISTORY_SLOTS`)。放在 App 上而非模块级
+    /// 静态量:它是 hub 实例的状态,每个测试各自的 App 拿到各自的闸门,并行
+    /// 测试之间不再互相挤占。`Arc` 是为了让 handler 取到 owned permit——
+    /// 借用式的 permit 会把整个 App 借住,而 handler 还要把 App 移进
+    /// `spawn_blocking`。
+    pub history_gate: Arc<tokio::sync::Semaphore>,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
     /// panel falls back to its own origin. Behind a reverse proxy it must be
@@ -82,6 +88,7 @@ impl App {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("http client"),
+            history_gate: Arc::new(tokio::sync::Semaphore::const_new(api::HISTORY_SLOTS)),
             site,
             themes,
             // 占位 Registry:插件预加载要等 App 进入 Arc 之后(Registry 以 Weak

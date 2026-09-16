@@ -218,8 +218,12 @@ fn default_hours() -> i64 {
 /// than the machine has threads. Moving the scan off the runtime is what makes
 /// "in flight" meaningful, and is what every other heavy query here already
 /// does.
-const HISTORY_SLOTS: usize = 4;
-static HISTORY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HISTORY_SLOTS);
+///
+/// 闸门容量。闸门本身挂在 [`App`](crate::App) 上,不是这个模块里的静态量:
+/// 它是 hub 实例的状态,一个进程一个实例,放 App 上生产行为完全一致,但每个
+/// 测试各自的 App 拿到各自的闸门——并行的测试不再互相挤占,那个「持满四个
+/// permit」的测试也就不会把别的历史查询测试挤成 503。
+pub(crate) const HISTORY_SLOTS: usize = 4;
 
 pub async fn metrics(
     State(app): State<Shared>,
@@ -233,7 +237,7 @@ pub async fn metrics(
     }
     // After the two point lookups above, so an unauthorised caller is told so
     // rather than asked to retry later.
-    let Ok(_permit) = HISTORY_GATE.try_acquire() else {
+    let Ok(_permit) = app.history_gate.clone().try_acquire_owned() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
             .into_response();
     };
@@ -2350,12 +2354,11 @@ mod tests {
             )
         };
 
-        // `acquire().await` rather than `try_acquire().expect`: other tests in
-        // this binary hold a permit briefly while passing through `metrics`, and
-        // an instant grab of all four raced them as the suite grew.
+        // 闸门在 App 上,这个测试的 App 只归它自己——不会再有别的测试占着
+        // permit,所以可以放心一次性把四个全拿来。
         let mut held = Vec::new();
         for _ in 0..HISTORY_SLOTS {
-            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+            held.push(app.history_gate.clone().try_acquire_owned().expect("这个 App 的闸门没被别人占着"));
         }
         assert_eq!(ask().await.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(held);
@@ -2366,7 +2369,7 @@ mod tests {
         app.db.set("public_page", "off").unwrap();
         let mut held = Vec::new();
         for _ in 0..HISTORY_SLOTS {
-            held.push(HISTORY_GATE.acquire().await.expect("the gate never closes"));
+            held.push(app.history_gate.clone().try_acquire_owned().expect("这个 App 的闸门没被别人占着"));
         }
         assert_eq!(ask().await.status(), StatusCode::UNAUTHORIZED);
         drop(held);
