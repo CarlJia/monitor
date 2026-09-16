@@ -182,11 +182,14 @@ async fn http_target_is_allowed(url: &str) -> Result<(), i32> {
     let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
         return Err(-2);
     };
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // `host_str` 对 IPv6 返回带方括号的形式(`[::1]`),剥掉才认得出是字面 IP。
+    // 不剥的话它会掉进下面的 DNS 分支,判定结果随解析器而变。
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
         return if address_is_blocked(ip) { Err(ERR_SSRF) } else { Ok(()) };
     }
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let resolved = tokio::net::lookup_host((host, port)).await.map_err(|_| -4)?;
+    let resolved = tokio::net::lookup_host((bare, port)).await.map_err(|_| -4)?;
     for addr in resolved {
         if address_is_blocked(addr.ip()) {
             return Err(ERR_SSRF);
