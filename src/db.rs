@@ -48,10 +48,6 @@ CREATE TABLE IF NOT EXISTS node (
   token         TEXT    NOT NULL UNIQUE,
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
-  price         REAL    NOT NULL DEFAULT 0,
-  currency      TEXT    NOT NULL DEFAULT 'USD',
-  billing_cycle TEXT    NOT NULL DEFAULT 'monthly',
-  expires_at    TEXT,
   remark        TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
@@ -171,7 +167,7 @@ CREATE TABLE IF NOT EXISTS plugin_data (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -319,6 +315,31 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6(U7/KTD10)删掉 node 表退役的财务四列。这四列自 ABI v2 起没有任何代码
+/// 读写——财务数据归财务插件的 `plugin_data`,唯一真源换了地方。
+///
+/// 删除是不可逆的,所以按 KTD10 两段式执行:只有当财务插件已经把节点导进
+/// 自己的存储(`plugin_data` 里出现 `node:` 记录)之后才动手。导入未完成时
+/// 保留列并返回 `false`,让 `migrate` 把版本停在 5,下一次启动再试——
+/// 「先换二进制、暂不装插件」的部署因此只是列闲置,启用插件后的下一次启动
+/// 自动完成删除。
+///
+/// 返回是否真的完成了删列(据此决定能否推进到 v6)。
+fn migrate_to_6(conn: &Connection) -> Result<bool> {
+    if !columns_of(conn, "node")?.contains("price") {
+        return Ok(true); // 已经删过,或本就是一个不含这些列的新库。
+    }
+    let imported: i64 =
+        conn.query_row("SELECT COUNT(*) FROM plugin_data WHERE record_key LIKE 'node:%'", [], |r| r.get(0))?;
+    if imported == 0 {
+        return Ok(false); // 财务插件还没导入,保留列,下次启动再试。
+    }
+    for column in ["price", "currency", "billing_cycle", "expires_at"] {
+        conn.execute_batch(&format!("ALTER TABLE node DROP COLUMN {column}"))?;
+    }
+    Ok(true)
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -341,7 +362,11 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 5 {
         migrate_to_5(conn)?;
     }
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    // v6 是条件迁移:财务列要等财务插件导入完才删。未完成时停在 v5——若照样
+    // stamp 成 6,这一步就永远不会重跑,列再也删不掉。
+    let at_six = if from < 6 { migrate_to_6(conn)? } else { true };
+    let stamped = if at_six { SCHEMA_VERSION } else { SCHEMA_VERSION - 1 };
+    conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
 }
 
@@ -363,8 +388,9 @@ const TABLES: [&str; 11] = [
 /// One node's stored configuration and last known facts.
 ///
 /// v2 起财务字段(`price`/`currency`/`billing_cycle`/`expires_at`)从宿主
-/// 退役,迁入财务插件的 `plugin_data` 命名空间。该插件的导入(KTD10)负责
-/// 从历史行的这四列读取并写入自己的存储。宿主新建节点不再接受这些字段。
+/// 退役,迁入财务插件的 `plugin_data` 命名空间。旧库里的这四列由
+/// `migrate_to_6` 在财务插件导入完成后删除;插件读不到旧值,只按 node_id
+/// 建自己的空白记录,价格等需在插件页面重新录入。
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Node {
     #[serde(default)]
@@ -2516,12 +2542,14 @@ mod tests {
     }
 
     /// A fresh database carries the tables this build expects, and the
-    /// backup gates rely on `TABLES` naming every one of them.
+    /// backup gates rely on `TABLES` naming every one of them. A fresh file
+    /// also never grows the retired financial columns: `SCHEMA` no longer
+    /// declares them.
     #[test]
-    fn a_fresh_database_is_on_schema_v5_with_the_new_tables() {
+    fn a_fresh_database_is_on_schema_v6_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         let table = |name: &str| {
             conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
                 r.get::<_, i64>(0)
@@ -2531,6 +2559,10 @@ mod tests {
         assert_eq!(table("plugin"), 1);
         assert_eq!(table("notification_log"), 1);
         assert_eq!(table("plugin_data"), 1);
+        let node_columns = columns_of(&conn, "node").unwrap();
+        for retired in ["price", "currency", "billing_cycle", "expires_at"] {
+            assert!(!node_columns.contains(retired), "新库不该带退役列 {retired}");
+        }
         drop(conn);
 
         assert!(TABLES.contains(&"plugin"));
@@ -2538,11 +2570,12 @@ mod tests {
         assert!(TABLES.contains(&"plugin_data"));
     }
 
-    /// A database left at v3 by the previous build: opening it must stamp v5,
-    /// add the three new tables, and keep the rows it already held. Opening
-    /// the result again must not redo anything that cannot be redone.
+    /// A database left at v3 by the previous build: opening it must stamp the
+    /// current version, add the three new tables, and keep the rows it already
+    /// held. Opening the result again must not redo anything that cannot be
+    /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v5_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v6_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -2563,7 +2596,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = conn
                 .query_row(
@@ -2577,12 +2610,70 @@ mod tests {
         drop(conn);
         assert_eq!(db.nodes().unwrap().len(), 1, "the node the v3 hub had survives");
 
-        // Reopening a v5 database is a no-op: the migration chain stops before
-        // v5 and the stamp is already in place.
+        // Reopening is a no-op: the migration chain stops before the stamp.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         drop(again);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The retired financial columns are dropped in two stages (KTD10): a
+    /// pre-v6 database that still carries them waits until the finance plugin
+    /// has imported its nodes into `plugin_data`, so an upgrade that swaps the
+    /// binary before installing the plugin keeps the columns rather than
+    /// dropping them out from under data the plugin has not read yet.
+    #[test]
+    fn retired_node_columns_drop_only_after_the_finance_plugin_imports() {
+        let file = std::env::temp_dir().join(format!("monitor-v5gate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A pre-v6 hub: current schema with the four columns bolted back on and
+        // no plugin data of any kind.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        for column in [
+            "price REAL NOT NULL DEFAULT 0",
+            "currency TEXT NOT NULL DEFAULT 'USD'",
+            "billing_cycle TEXT NOT NULL DEFAULT 'monthly'",
+            "expires_at TEXT",
+        ] {
+            old.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []).unwrap();
+        }
+        old.execute_batch(
+            "INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1); PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(old);
+
+        // No import yet: the columns stay and the version does not advance.
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("price"), "导入完成前列还在");
+        db.plugin_data_put("com.example.other", "unrelated", "x").unwrap();
+        drop(db);
+
+        // A plugin_data row that is not a node import does not open the gate.
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("price"), "非 node: 记录不开闸");
+        drop(db);
+
+        // The finance plugin imports: the next open drops the columns and lands
+        // on the current version, with the node row intact.
+        let db = Db::open(path).unwrap();
+        db.plugin_data_put("io.github.monitor.finance-stats", "node:1", "{\"price\":0}").unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        let columns = columns_of(&db.conn(), "node").unwrap();
+        for retired in ["price", "currency", "billing_cycle", "expires_at"] {
+            assert!(!columns.contains(retired), "导入完成后 {retired} 应已删除");
+        }
+        assert_eq!(db.nodes().unwrap().len(), 1, "删列保住 node 行");
+        drop(db);
         let _ = std::fs::remove_file(&file);
     }
 
@@ -2609,10 +2700,10 @@ mod tests {
         drop(old);
 
         // The candidate carries no foreign tables or rows, only the shape; it
-        // must pass every gate and come out with the v5 tables created.
+        // must pass every gate and come out with the newer tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = checked
                 .query_row(
