@@ -1,0 +1,15 @@
+# finance-stats 的 manifest。字段表见仓库 README 的「插件开发」章节。
+#
+# 声明 tick（每小时刷新汇率并扫描到期）、page（面板统计页）、cleanup（统一的
+# 插件数据清理入口）——因此允许空的 subscribes：本插件不发事件之外不订阅任何
+# 宿主事件（它发出的是 plugin_expiry_soon，由 tg-notify 订阅）。
+plugin_id = "io.github.monitor.finance-stats"
+name = "财务统计"
+version = "0.1.0"
+abi_version = 2
+subscribes = []
+tick = true
+cleanup = true
+
+[page]
+title = "财务统计"
