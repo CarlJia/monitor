@@ -528,6 +528,20 @@ const PING_ROWS: &str = "SELECT ts/?3, task_id, latency FROM ping_record
            AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
      ORDER BY ts";
 
+/// The whole-fleet counterpart of [`PING_ROWS`]: same rows for every node in
+/// one scan, ordered by `(node_id, ts)` so the fold can hold one node's bucket
+/// at a time. The batch quality endpoint needs every node's series, and N
+/// per-node scans would each hold the write connection the agents report
+/// through; one ordered scan pays that cost once.
+///
+/// The `ping_node` subquery stays correlated on the outer row's `node_id`, so a
+/// probe assigned to node A contributes nothing to node B — the same
+/// assignment filter the per-node query applies, expressed for all nodes.
+const PING_ROWS_ALL: &str = "SELECT node_id, ts/?2, task_id, latency FROM ping_record
+     WHERE ts>=?1
+           AND task_id IN (SELECT task_id FROM ping_node WHERE node_id = ping_record.node_id)
+     ORDER BY node_id, ts";
+
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -1288,6 +1302,65 @@ impl Db {
         Ok((out, serde_json::Value::Object(loss)))
     }
 
+    /// Fleet-wide counterpart of [`Self::ping_records`]: one ordered scan yields
+    /// every node's buckets and window-wide loss, keyed by node id, so the batch
+    /// quality endpoint does not run an N-per-node scan that would hold the write
+    /// connection once per node.
+    ///
+    /// The fold mirrors the per-node one bucket for bucket; only the boundaries
+    /// differ (a node change also closes the trailing bucket). The first row
+    /// carries `node = i64::MIN`, so the first transition never flushes a
+    /// half-built node.
+    pub fn ping_records_all(
+        &self,
+        since: i64,
+        step: i64,
+    ) -> Result<HashMap<i64, (Vec<serde_json::Value>, serde_json::Value)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(PING_ROWS_ALL)?;
+        let mut rows = stmt.query(params![since, step])?;
+
+        let mut out: HashMap<i64, (Vec<serde_json::Value>, serde_json::Value)> = HashMap::new();
+        // Reset each time the scan moves to a new node.
+        let mut node = i64::MIN;
+        let mut bucket = 0i64;
+        let mut buckets: Vec<serde_json::Value> = Vec::new();
+        let mut open: Vec<(i64, Vec<i64>, i64)> = Vec::new();
+        let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
+
+        while let Some(row) = rows.next()? {
+            let (n, b, task, latency) =
+                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?);
+            if n != node {
+                finish_node(&mut out, node, &mut buckets, &mut open, bucket, step, &mut totals);
+                node = n;
+                bucket = b;
+            } else if b != bucket {
+                close_bucket(&mut buckets, &mut open, bucket * step);
+                bucket = b;
+            }
+            let seen = totals.entry(task).or_insert((0, 0));
+            seen.1 += 1;
+            let probe = match open.iter().position(|(id, ..)| *id == task) {
+                Some(at) => &mut open[at],
+                None => {
+                    open.push((task, Vec::new(), 0));
+                    open.last_mut().expect("just pushed")
+                }
+            };
+            // A timeout is stored as -1: excluded from the median and counted
+            // instead.
+            if latency < 0 {
+                probe.2 += 1;
+                seen.0 += 1;
+            } else {
+                probe.1.push(latency);
+            }
+        }
+        finish_node(&mut out, node, &mut buckets, &mut open, bucket, step, &mut totals);
+        Ok(out)
+    }
+
     // ---- the database file itself ----
 
     /// The file this connection is open on, empty for `:memory:`.
@@ -1597,6 +1670,39 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>,
         }
         out.push(row);
     }
+}
+
+/// Closes a node's trailing bucket and folds its window-wide loss, then stores
+/// the pair under `node`. The per-node counterpart of this is the tail of
+/// [`Db::ping_records`]; the fleet-wide scan calls it once per node since a node
+/// boundary also ends the last bucket.
+///
+/// The sentinel `node == i64::MIN` (no rows seen yet) inserts nothing, so the
+/// first transition is a no-op rather than a bogus entry.
+#[allow(clippy::too_many_arguments)]
+fn finish_node(
+    out: &mut HashMap<i64, (Vec<serde_json::Value>, serde_json::Value)>,
+    node: i64,
+    buckets: &mut Vec<serde_json::Value>,
+    open: &mut Vec<(i64, Vec<i64>, i64)>,
+    bucket: i64,
+    step: i64,
+    totals: &mut HashMap<i64, (i64, i64)>,
+) {
+    if node == i64::MIN {
+        return;
+    }
+    close_bucket(buckets, open, bucket * step);
+    // Unrounded, matching `ping_records`: rounding here would turn 0.14% into the
+    // 0% that denotes no loss at all.
+    let loss: serde_json::Map<String, serde_json::Value> = totals
+        .drain()
+        .filter(|(_, (lost, _))| *lost > 0)
+        .map(|(task, (lost, samples))| {
+            (task.to_string(), serde_json::json!(100.0 * lost as f64 / samples as f64))
+        })
+        .collect();
+    out.insert(node, (std::mem::take(buckets), serde_json::Value::Object(loss)));
 }
 
 fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
@@ -2130,6 +2236,67 @@ mod tests {
         db.delete_ping_task(task).unwrap();
         db.insert_ping(mine, task, 2, 42).unwrap();
         assert_eq!(rows().unwrap(), 0, "a late result for a deleted probe is dropped");
+    }
+
+    /// The fleet-wide scan must agree with the per-node query bucket for bucket,
+    /// and must not let one node's probe leak into another's series -- the
+    /// assignment filter is correlated on the outer row's `node_id`.
+    #[test]
+    fn the_fleet_scan_matches_the_per_node_query_and_keeps_nodes_apart() {
+        let db = db();
+        let a = node(&db, 1);
+        let b = node(&db, 1);
+        let shared = db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "shared".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![a, b],
+            })
+            .unwrap();
+        let only_a = db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "a-only".into(),
+                target: "8.8.8.8:443".into(),
+                interval: 60,
+                nodes: vec![a],
+            })
+            .unwrap();
+
+        db.insert_ping(a, shared, 60, 40).unwrap();
+        db.insert_ping(a, shared, 61, -1).unwrap(); // a timeout in the same bucket
+        db.insert_ping(a, only_a, 60, 80).unwrap();
+        db.insert_ping(b, shared, 60, 300).unwrap();
+
+        let all = db.ping_records_all(0, 60).unwrap();
+        assert_eq!(all.len(), 2, "both nodes with history appear, keyed by id");
+
+        let (a_rows, a_loss) = &all[&a];
+        let (b_rows, b_loss) = &all[&b];
+        assert_eq!(a_rows.len(), 2, "A carries both its probes' rows");
+        assert_eq!(b_rows.len(), 1, "B carries only the shared probe");
+
+        let latency = |rows: &[serde_json::Value], task: i64| -> Option<i64> {
+            rows.iter().find(|r| r["task_id"] == task).and_then(|r| r["latency"].as_i64())
+        };
+        assert_eq!(latency(a_rows, shared), Some(40), "A's median is its answer, not the timeout");
+        assert_eq!(latency(a_rows, only_a), Some(80), "A's own-only probe is present");
+        assert_eq!(latency(b_rows, shared), Some(300), "B's series is not A's");
+        assert_eq!(latency(b_rows, only_a), None, "A's private probe never leaks into B");
+
+        // Window loss: A lost one of two under `shared`; B lost nothing. Keys are
+        // the probe id as a string, matching the JSON the endpoint emits.
+        assert_eq!(a_loss[&shared.to_string()].as_f64(), Some(50.0), "one lost of two is 50%");
+        assert_eq!(b_loss.as_object().map(|m| m.len()), Some(0), "B lost nothing");
+
+        // The per-node query agrees, so the batch is not a second opinion.
+        let (a_alone, _) = db.ping_records(a, 0, 60).unwrap();
+        assert_eq!(a_alone, *a_rows, "the fleet scan matches the per-node query");
+
+        // An empty window is an empty map, not a panic.
+        assert!(db.ping_records_all(i64::MAX - 1, 60).unwrap().is_empty(), "a window with no rows is empty");
     }
 
     /// The strings in a `hello` come from an unvouched machine, and six of them go
