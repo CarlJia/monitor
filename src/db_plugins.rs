@@ -179,10 +179,10 @@ impl Db {
         Ok(())
     }
 
-    /// 删除插件的行与它的全部 kv 行,一条事务里两条 DELETE。此前是两次
-    /// 独立调用:行删成功、kv 清理失败时调用方拿到 500,而重试在 api 的
-    /// plugin_or_404 门上变成 404,kv 孤儿从此永久留在 setting 表里。行删
-    /// 失败(行已不在)整体回滚并报错,与 [`Db::delete_plugin`] 一致。
+    /// 删除插件的行、它的全部 kv 行与 plugin_data 行,一条事务里三条 DELETE。
+    /// 此前是两次独立调用:行删成功、kv 清理失败时调用方拿到 500,而重试在
+    /// api 的 plugin_or_404 门上变成 404,kv 孤儿从此永久留在 setting 表里。
+    /// 行删失败(行已不在)整体回滚并报错,与 [`Db::delete_plugin`] 一致。
     /// kv 的模式与转义理由见 [`Db::plugin_kv`]。
     pub fn delete_plugin_with_kv(&self, id: i64, plugin_id: &str) -> Result<()> {
         let mut conn = self.conn();
@@ -195,6 +195,7 @@ impl Db {
             "DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'",
             [format!("plugin.{}:%", like_escaped(plugin_id))],
         )?;
+        tx.execute("DELETE FROM plugin_data WHERE plugin_id=?1", [plugin_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -226,6 +227,94 @@ impl Db {
     pub fn delete_plugin_kv(&self, plugin_id: &str) -> Result<usize> {
         let pattern = format!("plugin.{}:%", like_escaped(plugin_id));
         let gone = self.conn().execute("DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'", [pattern])?;
+        Ok(gone)
+    }
+
+    // ---- plugin_data(U2/KTD3)----
+    //
+    // 通用插件数据存储:插件对自己命名空间的记录集有完整 CRUD。所有方法按
+    // (plugin_id, record_key) 精确寻址,插件 A 无法触及插件 B 的行(R2)。
+    // 记录值上限与单插件总配额在宿主函数层检查(host.rs),这里只做数据访问。
+
+    /// 插入或覆盖一行记录(upsert)。返回是否新建(而非覆盖)。
+    pub fn plugin_data_put(&self, plugin_id: &str, key: &str, data: &str) -> Result<bool> {
+        let existed = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                params![plugin_id, key],
+                |r| r.get::<_, i64>(0),
+            )?
+            > 0;
+        self.conn().execute(
+            "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
+            params![plugin_id, key, data, Utc::now().timestamp()],
+        )?;
+        Ok(!existed)
+    }
+
+    /// 读一行记录,不存在返回 None。
+    pub fn plugin_data_get(&self, plugin_id: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT data FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                params![plugin_id, key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// 删除一行记录。返回是否确实删了一行。
+    pub fn plugin_data_delete(&self, plugin_id: &str, key: &str) -> Result<bool> {
+        let gone = self
+            .conn()
+            .execute("DELETE FROM plugin_data WHERE plugin_id=?1 AND record_key=?2", params![plugin_id, key])?;
+        Ok(gone > 0)
+    }
+
+    /// 一个插件按前缀匹配的全部记录,按 key 排序。空前缀列出全部。
+    pub fn plugin_data_list(&self, plugin_id: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let pattern = format!("{}%", like_escaped(prefix));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT record_key, data FROM plugin_data
+             WHERE plugin_id=?1 AND record_key LIKE ?2 ESCAPE '\\' ORDER BY record_key",
+        )?;
+        let rows = stmt.query_map(params![plugin_id, pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 一个插件的记录数与总字节数(面板空间占用展示用,R11)。
+    pub fn plugin_data_usage(&self, plugin_id: &str) -> Result<(i64, i64)> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM plugin_data WHERE plugin_id=?1",
+            params![plugin_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?)
+    }
+
+    /// 全部插件的记录数与总字节数,按 plugin_id 聚合(R11 数据页)。
+    pub fn plugin_data_usage_all(&self) -> Result<Vec<(String, i64, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT plugin_id, COUNT(*), COALESCE(SUM(LENGTH(data)),0)
+             FROM plugin_data GROUP BY plugin_id ORDER BY plugin_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 删除一个插件的全部记录(删除插件时调用),返回删掉的行数。
+    pub fn delete_plugin_data(&self, plugin_id: &str) -> Result<usize> {
+        let gone = self
+            .conn()
+            .execute("DELETE FROM plugin_data WHERE plugin_id=?1", params![plugin_id])?;
         Ok(gone)
     }
 
