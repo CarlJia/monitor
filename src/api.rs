@@ -113,10 +113,6 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "swap_total": live("swap_total", node.swap_total),
         "disk_total": live("disk_total", node.disk_total),
         "agent_version": node.agent_version,
-        "price": node.price,
-        "currency": node.currency,
-        "billing_cycle": node.billing_cycle,
-        "expires_at": node.expires_at,
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -492,12 +488,15 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> bool {
 /// accepted a whole `Node` unchecked, leaving the values the update path refuses
 /// reachable by another route, and an out-of-range reset day remained harmless
 /// only because `period_start` clamps what it reads.
-fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
+///
+/// 财务字段(`price`)由 v2 起的财务插件在 plugin_data 中持有,宿主不再校验
+/// 价格——validation 入口现在只覆盖 `reset_day` 与 traffic `limit`。
+fn node_limits(reset_day: Option<u32>, limit: Option<i64>) -> Option<&'static str> {
     if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
         return Some("reset day must be from 1 to 31");
     }
-    if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
-        return Some("price and traffic limit must be non-negative");
+    if limit.is_some_and(|v| v < 0) {
+        return Some("traffic limit must be non-negative");
     }
     None
 }
@@ -532,7 +531,7 @@ pub async fn create_node(
         return bad("name is required");
     }
     if let Some(message) =
-        node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
+        node_limits(Some(node.traffic_reset_day), Some(node.traffic_limit))
     {
         return bad(message);
     }
@@ -673,7 +672,7 @@ pub async fn update_node(
             return bad("name is required");
         }
     }
-    if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
+    if let Some(message) = node_limits(node.traffic_reset_day, node.traffic_limit) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -854,7 +853,6 @@ const READABLE_SETTINGS: &[&str] = &[
     "theme",
     "github_proxy",
     "notification.offline_threshold_reports",
-    "notification.expiry_thresholds",
 ];
 
 // ---- the database itself ----
@@ -1411,14 +1409,6 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         json!(crate::offline_threshold_reports(&app).to_string()),
     );
     out.insert(
-        "notification.expiry_thresholds".into(),
-        json!(crate::expiry_thresholds(&app)
-            .iter()
-            .map(|days| days.to_string())
-            .collect::<Vec<_>>()
-            .join(",")),
-    );
-    out.insert(
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
     );
@@ -1473,26 +1463,9 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         {
             Some("离线判定阈值必须是 1 到 100 之间的整数（连续 N 个上报周期无消息即判离线）".into())
         }
-        // 与 main.rs 的 expiry_thresholds 同一套宽松写法:`"[7,3,1]"` 与
-        // `"7,3,1"` 都收。读侧会剔除坏项并在全部失效时回退默认,这里同样挡在
-        // 写入之前,且要求至少一项有效。
-        "notification.expiry_thresholds" if !valid_expiry_thresholds(value) => {
-            Some("到期提醒阈值必须是逗号分隔的 1 到 365 之间的天数，如 7,3,1".into())
-        }
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
-}
-
-/// `notification.expiry_thresholds` 的静态校验。共享解析
-/// ([`crate::db::parse_expiry_thresholds`],与读侧 main.rs 同一份)只保留合法
-/// 项,写侧比读侧严:任何一项非法都拒绝整个值,否则 `"7,x"` 会存进去、读出来
-/// 变成 `[7]`,面板回显的不再是操作员输入的值。解析前后项数一致即每项都
-/// 合法;至少一项有效由非空保证。
-fn valid_expiry_thresholds(value: &str) -> bool {
-    let items = crate::db::parse_expiry_thresholds(value);
-    let tokens = value.trim().trim_start_matches('[').trim_end_matches(']').split(',').count();
-    !items.is_empty() && items.len() == tokens
 }
 
 pub async fn save_settings(
@@ -2119,7 +2092,6 @@ mod tests {
         let id = node(&app, "n", true);
         for bad in [
             json!({"name": "x", "traffic_reset_day": 99}),
-            json!({"name": "x", "price": -5.0}),
             json!({"name": "x", "traffic_limit": -1}),
         ] {
             let created = create_node(
@@ -2215,7 +2187,6 @@ mod tests {
         // The defaults the panel relies on by omitting them, `public` above all:
         // the alternative would publish a node that was never published.
         assert!(added.public);
-        assert_eq!(added.billing_cycle, "monthly");
         assert_eq!(added.traffic_reset_day, 1);
 
         let created = create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(added))).await;
@@ -2613,10 +2584,6 @@ mod tests {
             read["notification.offline_threshold_reports"], "3",
             "未设置的离线阈值回显生效默认值,而不是空串"
         );
-        assert_eq!(
-            read["notification.expiry_thresholds"], "7,3,1",
-            "未设置的到期阈值回显生效默认值,而不是空串"
-        );
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -2624,7 +2591,6 @@ mod tests {
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
             "notification.offline_threshold_reports": read["notification.offline_threshold_reports"],
-            "notification.expiry_thresholds": read["notification.expiry_thresholds"],
             "public_page": "on",
         });
         assert_eq!(
@@ -2653,33 +2619,24 @@ mod tests {
         assert!(!body.to_string().contains("super-secret"));
     }
 
-    /// 通知阈值两个 key(U7):读侧带出,合法值（两种 expiry 写法）落库,非法值
-    /// 400 且什么都不写。
+    /// 离线判定阈值(U7):读侧带出,合法值落库,非法值 400 且什么都不写。
+    /// 到期提醒阈值已随宿主到期检测退役迁入财务插件自己的配置。
     #[tokio::test]
     async fn notification_threshold_settings_round_trip() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
         assert!(read.get("notification.offline_threshold_reports").is_some());
-        assert!(read.get("notification.expiry_thresholds").is_some());
 
         let put = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
 
-        // 合法值:expiry 两种写法都收。
+        // 合法值。
         assert_eq!(
             put(json!({"notification.offline_threshold_reports": "5"})).await.status(),
             StatusCode::OK
         );
         assert_eq!(app.db.get("notification.offline_threshold_reports").as_deref(), Some("5"));
-        for good in ["[7,3,1]", "7, 3, 1"] {
-            assert_eq!(
-                put(json!({"notification.expiry_thresholds": good})).await.status(),
-                StatusCode::OK,
-                "{good:?}"
-            );
-        }
-        assert_eq!(app.db.get("notification.expiry_thresholds").as_deref(), Some("7, 3, 1"));
 
-        // 非法值:范围外、非数字、空串、坏项混杂。全部 400 且不落库。
+        // 非法值:范围外、非数字、空串。全部 400 且不落库。
         for junk in ["", "0", "101", "-3", "abc", "3.5"] {
             assert_eq!(
                 put(json!({"notification.offline_threshold_reports": junk})).await.status(),
@@ -2687,21 +2644,9 @@ mod tests {
                 "{junk:?}"
             );
         }
-        for junk in ["", "abc", "7,x", "0", "366", "[", "7;3", "-1,3"] {
-            assert_eq!(
-                put(json!({"notification.expiry_thresholds": junk})).await.status(),
-                StatusCode::BAD_REQUEST,
-                "{junk:?}"
-            );
-        }
         assert_eq!(
             app.db.get("notification.offline_threshold_reports").as_deref(),
             Some("5"),
-            "被拒绝的值不能覆盖已存的合法值"
-        );
-        assert_eq!(
-            app.db.get("notification.expiry_thresholds").as_deref(),
-            Some("7, 3, 1"),
             "被拒绝的值不能覆盖已存的合法值"
         );
     }

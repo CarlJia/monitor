@@ -1,7 +1,7 @@
 //! 插件与通知日志的数据访问,自 db.rs 拆出。SCHEMA、迁移与备份仍归
-//! db.rs 所有;这里只有读写 `plugin` 与 `notification_log` 两张表的方法,
-//! 以第二个 `impl Db` 块挂在同一个类型上。`PluginRow` 与
-//! `parse_expiry_thresholds` 经 db.rs 的 `pub use` 对外保持原路径可见。
+//! db.rs 所有;这里只有读写 `plugin`、`plugin_data` 与 `notification_log`
+//! 三张表的方法,以第二个 `impl Db` 块挂在同一个类型上。`PluginRow`
+//! 经 db.rs 的 `pub use` 对外保持原路径可见。
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -374,20 +374,6 @@ fn row_to_plugin(r: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRow> {
         last_error: r.get("last_error")?,
         uploaded_at: r.get("uploaded_at")?,
     })
-}
-
-/// 解析 `notification.expiry_thresholds` 的值:接受 JSON 数组字符串 `"[7,3,1]"`
-/// 与裸逗号分隔 `"7,3,1"` 两种写法,返回落在 1..=365 的合法项。空返回值表示
-/// 没有任何合法项——写侧(api 的 `valid_expiry_thresholds`)据此拒绝整个值,
-/// 读侧(main 的 `expiry_thresholds`)据此回退默认档,两侧的宽严由各自外层
-/// 决定,解析本身只有这一份。
-pub fn parse_expiry_thresholds(raw: &str) -> Vec<i64> {
-    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .filter_map(|t| t.trim().parse::<i64>().ok())
-        .filter(|&days| (1..=365).contains(&days))
-        .collect()
 }
 
 #[cfg(test)]

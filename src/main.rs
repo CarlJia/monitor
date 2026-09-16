@@ -25,7 +25,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Local, Months, NaiveDate, Utc};
+use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -594,107 +594,15 @@ fn first_run(app: &App, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Billing cycles as whole months. `once` has none, so it never rolls over.
-fn cycle_months(cycle: &str) -> Option<u32> {
-    Some(match cycle {
-        "monthly" => 1,
-        "quarterly" => 3,
-        "semiannual" => 6,
-        "yearly" => 12,
-        "biennial" => 24,
-        "triennial" => 36,
-        _ => return None,
-    })
-}
-
-/// A node still reporting past its expiry date has been renewed, so the date is
-/// rolled forward by whole cycles until it lies in the future.
-fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDate> {
-    let months = Months::new(cycle_months(cycle)?);
-    let mut next = expires;
-    while next < today {
-        next = next.checked_add_months(months)?;
-    }
-    (next != expires).then_some(next)
-}
-
-fn renew_online_nodes(app: &App) -> Result<()> {
-    // The hub's local timezone, as with the traffic boundaries: an expiry date
-    // is one a person entered, and on a UTC+8 hub `Utc` reports the previous day
-    // until 08:00 while the panel already shows it expired.
-    let today = Local::now().date_naive();
-    let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-    for node in app.db.nodes()? {
-        if !online.contains(&node.id) {
-            continue;
-        }
-        let Some(expires) = node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
-            continue;
-        };
-        let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
-        app.db.set_expiry(node.id, &next.to_string())?;
-        info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
-    }
-    Ok(())
-}
-
-/// 读 `notification.expiry_thresholds` 设置,空值(未设置、解析失败或没有
-/// 任何有效项)回退默认 `[7, 3, 1]`——与 `retention_days` 同一读取模式:坏值
-/// 静默回退,不挡住扫描本身。解析本体见 [`db::parse_expiry_thresholds`],
-/// 与写侧(api)共用。`pub(crate)` 是因为 api 的 settings 读侧要回显同一
-/// 生效值,保证 GET-PUT 往返闭合。
-pub(crate) fn expiry_thresholds(app: &App) -> Vec<i64> {
-    let raw = app.db.get("notification.expiry_thresholds").unwrap_or_default();
-    let parsed = db::parse_expiry_thresholds(&raw);
-    if parsed.is_empty() {
-        vec![7, 3, 1]
-    } else {
-        parsed
-    }
-}
-
 /// 解析 `notification.offline_threshold_reports`:连续 N 个上报周期没有
-/// 消息即判离线。默认 3,钳制在 1..=100。`pub(crate)` 的理由同
-/// [`expiry_thresholds`]。
+/// 消息即判离线。默认 3,钳制在 1..=100。`pub(crate)` 是因为 api 的
+/// settings 读侧要回显同一生效值,保证 GET-PUT 往返闭合。
 pub(crate) fn offline_threshold_reports(app: &App) -> i64 {
     app.db
         .get("notification.offline_threshold_reports")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(3)
         .clamp(1, 100)
-}
-
-/// 到期扫描(R4):剩余天数恰好落在某个阈值档上时 emit `ExpirySoon`。
-/// 去重不在这一层——emit 按「节点 x 阈值档 x 账期」的幂等键挡掉同一
-/// 账期的重复提醒(R5)。
-fn notify_expiring_nodes(app: &App) -> Result<()> {
-    let thresholds = expiry_thresholds(app);
-    // 与 renew_online_nodes 同样的本地时区:到期日是人输入的日期,面板
-    // 也按本地日期展示。
-    let today = Local::now().date_naive();
-    for node in app.db.nodes()? {
-        let Some(expires_at) = node.expires_at.as_deref() else { continue };
-        let Ok(expires) = expires_at.parse::<NaiveDate>() else {
-            warn!("node {} 的到期日 {expires_at:?} 无法解析,跳过到期提醒", node.name);
-            continue;
-        };
-        let days_left = (expires - today).num_days();
-        // 精确等值匹配,阈值之外的 5 天、2 天不提醒;已过期(<= 0)也不
-        // 提醒——那是续期逻辑或人工处理的事。
-        if days_left > 0 && thresholds.contains(&days_left) {
-            notification_bus::emit(
-                app,
-                &notification_bus::Event::ExpirySoon {
-                    node_id: node.id,
-                    name: node.name.clone(),
-                    expires_at: expires_at.to_owned(),
-                    days_left,
-                    threshold_days: days_left,
-                },
-            )?;
-        }
-    }
-    Ok(())
 }
 
 /// agent 的上报周期,离线判定的计量单位。hub 侧拿不到某个 agent 真实的
@@ -779,14 +687,10 @@ fn housekeeping_pass(app: &App, offline_scan: bool) {
     if let Err(e) = app.db.expire_sessions() {
         warn!("expiring sessions failed: {e:#}");
     }
-    if let Err(e) = renew_online_nodes(app) {
-        warn!("rolling expiry dates failed: {e:#}");
-    }
-    // 扫描在续期之后:刚续期的节点 days_left 变大,不会落回阈值档,
-    // 同一个 tick 里既续期又提醒同一节点的顺序矛盾不会出现。
-    if let Err(e) = notify_expiring_nodes(app) {
-        warn!("scanning expiry notifications failed: {e:#}");
-    }
+    // 到期日续期与到期提醒(原 renew_online_nodes/notify_expiring_nodes)已退役,
+    // 迁入财务插件的 on_tick(U6/KTD7):插件在自己的存储上滚动到期日并经
+    // emit_event 发 plugin_expiry_soon。宿主只负责按 manifest.tick 派发 tick。
+    app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_ticks(app);
     if !offline_scan {
         return;
     }
@@ -825,14 +729,8 @@ mod tests {
 
     #[test]
     fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
-        let d = |s: &str| s.parse::<NaiveDate>().unwrap();
-        // One day past a monthly expiry: the next month, clamped to its end.
-        assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
-        // Years overdue: cycles are added until the date is in the future.
-        assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
-        // Not yet due, and one-off billing: both left unchanged.
-        assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
-        assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
+        // 到期日滚动逻辑随宿主到期检测退役迁入财务插件(U6/KTD7),其单元
+        // 测试在插件的 smoke 测试里覆盖(AE4)。宿主不再持有该逻辑。
     }
 
     // ---- notification scanning (U6) ----
@@ -850,90 +748,12 @@ mod tests {
         app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_count()
     }
 
-    /// 与 bus 相同的幂等键编码,用来查 `notification_log` 里的行。
-    fn expiry_key(expires_at: &str, threshold_days: i64) -> i64 {
-        notification_bus::Event::ExpirySoon {
-            node_id: 0,
-            name: String::new(),
-            expires_at: expires_at.into(),
-            days_left: 0,
-            threshold_days,
-        }
-        .threshold_or_state_key()
-    }
-
-    /// today 加减整天的日期,测试不依赖具体某一天。
-    fn around(today: NaiveDate, days: i64) -> NaiveDate {
-        if days >= 0 {
-            today.checked_add_days(chrono::Days::new(days as u64)).unwrap()
-        } else {
-            today.checked_sub_days(chrono::Days::new((-days) as u64)).unwrap()
-        }
-    }
-
     fn state_of(app: &App, id: i64) -> Option<String> {
         app.db.current_state_event(id).unwrap().map(|(t, _)| t)
     }
 
-    #[test]
-    fn an_expiry_tier_fires_once_per_scan_cycle() {
-        let app = app("");
-        let id = add_node(&app, "edge-1");
-        let expires = around(Local::now().date_naive(), 7).to_string();
-        app.db.set_expiry(id, &expires).unwrap();
-
-        notify_expiring_nodes(&app).unwrap();
-        assert!(app.db.dispatch_already_sent(id, "expiry_soon", expiry_key(&expires, 7)).unwrap());
-        assert_eq!(dispatches(&app), 1);
-
-        // 同一天里每小时的 tick 再扫:同一账期同一档,幂等键已占用。
-        notify_expiring_nodes(&app).unwrap();
-        assert_eq!(dispatches(&app), 1, "同一账期不得重复提醒");
-    }
-
-    #[test]
-    fn tiers_off_the_list_and_past_dates_stay_silent() {
-        let app = app("");
-        let today = Local::now().date_naive();
-        // 阈值之外:5 天不在 [7, 3, 1] 里。
-        let off_tier = add_node(&app, "off-tier");
-        app.db.set_expiry(off_tier, &around(today, 5).to_string()).unwrap();
-        // 已过期:当天与昨天,那是续期逻辑或人工处理的事。
-        let due = add_node(&app, "due");
-        app.db.set_expiry(due, &today.to_string()).unwrap();
-        let past = add_node(&app, "past");
-        app.db.set_expiry(past, &around(today, -1).to_string()).unwrap();
-        // 没有到期日。
-        add_node(&app, "none");
-
-        notify_expiring_nodes(&app).unwrap();
-        assert_eq!(dispatches(&app), 0, "阈值外、已过期、无到期日都不触发");
-    }
-
-    /// 账期顺延一个周期(31 天)后,新账期的同一档位是新的幂等键:31 天
-    /// 过去、days_left 再次到 7 时还能再提醒一次。同日无法真正快进 31 天,
-    /// 所以用「新日期的档位键未被占用」表述,emit 对新键放行由 bus 自己的
-    /// 测试覆盖。
-    #[test]
-    fn a_renewed_cycle_frees_the_tier_again() {
-        let app = app("");
-        let id = add_node(&app, "edge-1");
-        let today = Local::now().date_naive();
-        let first = around(today, 7);
-        app.db.set_expiry(id, &first.to_string()).unwrap();
-        notify_expiring_nodes(&app).unwrap();
-        assert_eq!(dispatches(&app), 1);
-
-        // 续期顺延一个周期:days_left 变成 38,本轮静默。
-        let next = around(first, 31);
-        app.db.set_expiry(id, &next.to_string()).unwrap();
-        notify_expiring_nodes(&app).unwrap();
-        assert_eq!(dispatches(&app), 1, "阈值之外的天数不触发");
-        assert!(
-            !app.db.dispatch_already_sent(id, "expiry_soon", expiry_key(&next.to_string(), 7)).unwrap(),
-            "新账期的档位键必须是空的"
-        );
-    }
+    // 到期提醒测试(an_expiry_tier_fires_once_per_scan_cycle 等)随宿主到期
+    // 检测退役迁入财务插件的 smoke 测试(U6/U7)。宿主只保留离线判定测试。
 
     #[test]
     fn a_node_that_never_reported_judges_nothing() {
@@ -1018,40 +838,6 @@ mod tests {
         app.db.touch_seen(quick, now - OFFLINE_WINDOW_SECS - 1).unwrap();
         notify_offline_nodes(&app).unwrap();
         assert_eq!(state_of(&app, quick).as_deref(), Some("agent_offline"));
-
-        // 过期阈值只剩 1 天档:7 天不触发,1 天触发。
-        app.db.set("notification.expiry_thresholds", "[1]").unwrap();
-        let today = Local::now().date_naive();
-        let seven = add_node(&app, "seven");
-        app.db.set_expiry(seven, &around(today, 7).to_string()).unwrap();
-        let one = add_node(&app, "one");
-        app.db.set_expiry(one, &around(today, 1).to_string()).unwrap();
-        notify_expiring_nodes(&app).unwrap();
-        assert!(!app
-            .db
-            .dispatch_already_sent(seven, "expiry_soon", expiry_key(&around(today, 7).to_string(), 7))
-            .unwrap());
-        assert!(app
-            .db
-            .dispatch_already_sent(one, "expiry_soon", expiry_key(&around(today, 1).to_string(), 1))
-            .unwrap());
-    }
-
-    #[test]
-    fn expiry_thresholds_parse_both_formats_and_fall_back() {
-        let app = app("");
-        assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "未设置时是默认档");
-        for set in ["[7, 3, 1]", "7,3,1"] {
-            app.db.set("notification.expiry_thresholds", set).unwrap();
-            assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "{set}");
-        }
-        // 坏值与空列表整体回退;超界项被剔除,有效项保留。
-        for bad in ["", "[]", "abc", "0,400"] {
-            app.db.set("notification.expiry_thresholds", bad).unwrap();
-            assert_eq!(expiry_thresholds(&app), vec![7, 3, 1], "{bad}");
-        }
-        app.db.set("notification.expiry_thresholds", "0,5,400").unwrap();
-        assert_eq!(expiry_thresholds(&app), vec![5]);
     }
 
     #[tokio::test]

@@ -332,12 +332,15 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let event = Event::ExpirySoon {
-        node_id: 0,
-        name: "test".into(),
-        expires_at: (Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
-        days_left: 1,
-        threshold_days: 1,
+    let event = Event::Plugin {
+        name: "plugin_expiry_soon".into(),
+        payload: serde_json::json!({
+            "node_id": 0,
+            "name": "test",
+            "expires_at": (Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
+            "days_left": 1,
+            "threshold_days": 1,
+        }),
     };
     // 读锁的 guard 不是 Send,不能横跨 handler 的 await(handler 的 future 必须是
     // Send);而 dispatch_one 又只在 &self 上工作。把它整个挪进 blocking 线程,
@@ -498,7 +501,7 @@ mod tests {
     fn plugin_manifest(plugin_id: &str, abi_version: i64) -> String {
         format!(
             "plugin_id = \"{plugin_id}\"\nname = \"Test Plugin\"\nversion = \"1.0.0\"\n\
-             abi_version = {abi_version}\nsubscribes = [\"expiry_soon\"]\n"
+             abi_version = {abi_version}\nsubscribes = [\"agent_offline\", \"plugin_expiry_soon\"]\n"
         )
     }
 
@@ -692,7 +695,7 @@ mod tests {
     async fn an_uploaded_plugin_lands_disabled_in_the_table() {
         let app = plugin_app();
         let wasm = wat::parse_str(MINIMAL_WAT).unwrap();
-        let archive = plugin_archive(&plugin_manifest("com.example.mailer", 1));
+        let archive = plugin_archive(&plugin_manifest("com.example.mailer", 2));
 
         assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
         let rows = app.db.list_plugins().unwrap();
@@ -708,7 +711,7 @@ mod tests {
         // 列表把 subscribes 从 manifest 解出来,前端画徽标不必再猜。
         let listed = body_of(list_plugins(Admin, State(app.clone())).await).await;
         assert_eq!(listed[0]["plugin_id"], "com.example.mailer");
-        assert_eq!(listed[0]["subscribes"], json!(["expiry_soon"]));
+        assert_eq!(listed[0]["subscribes"], json!(["agent_offline", "plugin_expiry_soon"]));
         assert_eq!(listed[0]["status"], "disabled");
         assert!(listed[0].get("wasm_blob").is_none(), "列表不携带模块字节");
     }
@@ -728,22 +731,22 @@ mod tests {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             // 没有 plugin.toml。
             (tarball(&[("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap())]), "没有 plugin.toml"),
-            // ABI 不符。
-            (plugin_archive(&plugin_manifest("com.example.mailer", 2)), "abi_version"),
+            // ABI 不符:v1 从此不受支持(KTD1)。
+            (plugin_archive(&plugin_manifest("com.example.mailer", 1)), "abi_version"),
             // plugin_id 含 ':'(kv 命名空间的分隔符)。
-            (plugin_archive(&plugin_manifest("com.example:mailer", 1)), "':'"),
+            (plugin_archive(&plugin_manifest("com.example:mailer", 2)), "':'"),
             // 路径越出包外:`..` 与绝对路径。
             (
                 tarball_with_entry_name(
                     "../plugin.toml",
-                    plugin_manifest("com.example.mailer", 1).as_bytes(),
+                    plugin_manifest("com.example.mailer", 2).as_bytes(),
                 ),
                 "..",
             ),
             (
                 tarball_with_entry_name(
                     "/etc/plugin.toml",
-                    plugin_manifest("com.example.mailer", 1).as_bytes(),
+                    plugin_manifest("com.example.mailer", 2).as_bytes(),
                 ),
                 "绝对路径",
             ),
@@ -772,10 +775,10 @@ mod tests {
     async fn a_duplicate_plugin_id_is_refused() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.a", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await.status(),
             StatusCode::OK
         );
-        let second = upload(&app, plugin_archive(&plugin_manifest("com.example.a", 1))).await;
+        let second = upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await;
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
         assert!(
@@ -792,7 +795,7 @@ mod tests {
     async fn a_broken_wasm_lands_with_the_reason_and_cannot_be_enabled() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.broken", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.broken", 2).into_bytes()),
             ("plugin.wasm", b"\0asm\xde\xad\xbe\xef".to_vec()),
         ]);
         assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
@@ -819,7 +822,7 @@ mod tests {
     async fn a_multi_mib_legal_package_uploads_through_the_merged_router() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.big", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.big", 2).into_bytes()),
             ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
             ("assets/pad.bin", noise(3 * 1024 * 1024)),
         ]);
@@ -834,7 +837,7 @@ mod tests {
     async fn a_package_over_the_byte_cap_is_refused() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.huge", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.huge", 2).into_bytes()),
             ("plugin.wasm", noise(MAX_PLUGIN as usize + 1)), // 单 entry 仍在 16 MiB 内
         ]);
         assert!(archive.len() as u64 > MAX_PLUGIN);
@@ -857,7 +860,7 @@ mod tests {
     async fn enable_test_and_disable_walk_the_full_lifecycle() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.lifecycle", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.lifecycle", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -903,7 +906,7 @@ mod tests {
         );
 
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.gone", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.gone", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -934,7 +937,7 @@ mod tests {
     async fn plugin_kv_round_trips_and_refuses_the_same_things_the_host_does() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.kv", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.kv", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -987,7 +990,7 @@ mod tests {
         let app = plugin_app();
         for plugin_id in ["com.example", "com.example.tg-notify"] {
             assert_eq!(
-                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 1))).await.status(),
+                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 2))).await.status(),
                 StatusCode::OK
             );
         }
@@ -1037,7 +1040,7 @@ mod tests {
     async fn a_plugin_kv_row_can_be_deleted_on_its_own() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.kv-del", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.kv-del", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -1073,7 +1076,7 @@ mod tests {
         let app = plugin_app();
         for plugin_id in ["com.example.alpha", "com.example.beta"] {
             assert_eq!(
-                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 1))).await.status(),
+                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 2))).await.status(),
                 StatusCode::OK
             );
         }
@@ -1090,7 +1093,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "alpha 测试了两次:{log}");
         assert!(entries.iter().all(|e| e["plugin_id"] == "com.example.alpha"), "{log}");
         assert!(
-            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "expiry_soon"),
+            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "plugin_expiry_soon"),
             "{log}"
         );
         // 快照新 → 旧:最新一条在头部(两次测试可能落在同一秒,只比先后)。
@@ -1124,7 +1127,7 @@ mod tests {
                 "com.example.backup",
                 "Test Plugin",
                 "1.0.0",
-                &plugin_manifest("com.example.backup", 1),
+                &plugin_manifest("com.example.backup", 2),
                 &wasm,
                 "sha",
             )
@@ -1151,7 +1154,7 @@ mod tests {
                 "com.example.after",
                 "Test Plugin",
                 "1.0.0",
-                &plugin_manifest("com.example.after", 1),
+                &plugin_manifest("com.example.after", 2),
                 &wasm,
                 "sha",
             )

@@ -51,14 +51,26 @@ pub fn load(engine: &wasmtime::Engine, row: &PluginRow) -> Result<LoadedPlugin> 
     let module = wasmtime::Module::new(engine, &row.wasm_blob[..])
         .map_err(|e| anyhow::anyhow!("插件 {}({}) 的 wasm 模块编译失败: {e}", row.id, row.plugin_id))?;
     // 导出契约在加载时检查而不是调用时:一次上传、尽早暴露,调用路径上不再有
-    // "模块长得不对"这种配置型错误。
+    // "模块长得不对"这种配置型错误。v2 在 v1 的三项之外,按 manifest 声明
+    // 检查 tick/page/cleanup 对应的导出(KTD12)——声明了能力却缺导出是配置
+    // 型错误,与缺 on_event 同等对待。
     use wasmtime::ExternType;
     if !matches!(module.get_export("memory"), Some(ExternType::Memory(_))) {
         bail!("插件 {} 的模块缺少导出 `memory`", manifest.plugin_id);
     }
-    for name in ["on_event", "__alloc"] {
+    let mut required: Vec<&str> = vec!["on_event", "__alloc"];
+    if manifest.tick {
+        required.push("on_tick");
+    }
+    if manifest.page.is_some() {
+        required.extend(["render_page", "on_action"]);
+    }
+    if manifest.cleanup {
+        required.push("on_cleanup");
+    }
+    for name in required {
         if !matches!(module.get_export(name), Some(ExternType::Func(_))) {
-            bail!("插件 {} 的模块缺少导出 `{name}`", manifest.plugin_id);
+            bail!("插件 {} 的模块缺少导出 `{name}`(manifest 声明了该能力)", manifest.plugin_id);
         }
     }
     Ok(LoadedPlugin { manifest, module })
@@ -487,6 +499,79 @@ pub fn call_on_event(
     Ok(on_event.call(&mut handle.store, (ptr, payload.len() as i32))?)
 }
 
+/// 调用一个无参 `() -> i32` 导出(`on_tick`),与 [`call_on_event`] 同一套
+/// fuel/deadline 隔离。tick 不带事件载荷:插件在 on_tick 里经宿主函数
+/// (nodes_query/data_*/http_get/emit_event)自取所需(U4/KTD4)。
+pub fn call_hook(
+    engine: &wasmtime::Engine,
+    app: &Arc<App>,
+    plugin: &LoadedPlugin,
+    hook: &str,
+    fuel_limit: u64,
+    timeout_ms: u64,
+) -> Result<i32> {
+    let mut handle =
+        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
+    let func = handle
+        .instance
+        .get_typed_func::<(), i32>(&mut handle.store, hook)
+        .map_err(|_| anyhow::anyhow!("模块缺少 {hook}(load 已按 manifest 声明检查,不应到达这里)"))?;
+    Ok(func.call(&mut handle.store, ())?)
+}
+
+/// 调用一个「入参 JSON、返回 JSON」的导出(`render_page`/`on_action`/
+/// `on_cleanup`),与 [`call_on_event`] 同一套 fuel/deadline 隔离(U5/U9)。
+/// 约定:导出签名 `(ptr: i32, len: i32) -> i32`,返回值是写回 host_resp_alloc
+/// 缓冲的响应字节数(0 表示空响应,负数是插件自定义错误码)。宿主用最近一次
+/// host_resp_alloc 记下的缓冲读回响应体。
+pub fn call_json_hook(
+    engine: &wasmtime::Engine,
+    app: &Arc<App>,
+    plugin: &LoadedPlugin,
+    hook: &str,
+    input: &[u8],
+    fuel_limit: u64,
+    timeout_ms: u64,
+) -> Result<Vec<u8>> {
+    let mut handle =
+        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
+    let alloc = handle
+        .instance
+        .get_typed_func::<(i32,), i32>(&mut handle.store, "__alloc")
+        .map_err(|_| anyhow::anyhow!("模块缺少 __alloc"))?;
+    let func = handle
+        .instance
+        .get_typed_func::<(i32, i32), i32>(&mut handle.store, hook)
+        .map_err(|_| anyhow::anyhow!("模块缺少 {hook}(load 已按 manifest 声明检查)"))?;
+    let mem: Memory =
+        handle.instance.get_memory(&mut handle.store, "memory").context("模块缺少 memory")?;
+    // 入参写进插件内存:与事件载荷同一 allocator 回环。
+    let in_ptr = alloc.call(&mut handle.store, (input.len().max(1) as i32,))?;
+    if in_ptr <= 0 {
+        bail!("__alloc 返回非正指针 {in_ptr}");
+    }
+    let start = in_ptr as usize;
+    let end = start.checked_add(input.len()).context("入参地址溢出")?;
+    if end > mem.data(&handle.store).len() {
+        bail!("__alloc 指针 {in_ptr} 超出线性内存");
+    }
+    mem.data_mut(&mut handle.store)[start..end].copy_from_slice(input);
+    let n = func.call(&mut handle.store, (in_ptr, input.len() as i32))?;
+    if n < 0 {
+        bail!("{hook} 返回错误码 {n}");
+    }
+    // 响应体在插件最近一次 host_resp_alloc 记下的缓冲里。
+    let (resp_ptr, _) = { let s = handle.store.data(); (s.resp_ptr, s.resp_cap) };
+    if n == 0 || resp_ptr <= 0 {
+        return Ok(Vec::new());
+    }
+    let start = resp_ptr as usize;
+    let end = start.checked_add(n as usize).context("响应地址溢出")?;
+    let data = mem.data(&handle.store);
+    let bytes = data.get(start..end).context("响应超出线性内存")?.to_vec();
+    Ok(bytes)
+}
+
 /// 不超过 `max` 的最大字符边界偏移:截断必须落在边界上,否则切出的字节不是
 /// 合法 UTF-8。detail 的带省略号截断与 host_kv_get 的前缀截断共用(一个加
 /// 省略号一个不加,共用的是边界计算)。
@@ -600,7 +685,7 @@ mod tests {
     fn a_wrong_abi_version_fails_at_load() {
         let engine = engine();
         let mut r = row(compile(MINIMAL_WAT));
-        r.manifest_json = MANIFEST.replace("abi_version = 1", "abi_version = 3");
+        r.manifest_json = MANIFEST.replace("abi_version = 2", "abi_version = 3");
         let err = load(&engine, &r).unwrap_err();
         // `{:#}` 展开错误链:load 包了一层 "manifest 无效",原因在下面。
         let whole = format!("{err:#}");
