@@ -223,7 +223,7 @@ fn send_event(
 /// 三种事件的载荷样例与期望文案片段。
 const CASES: &[(&str, &str)] = &[
     (
-        r#"{"type":"expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}"#,
+        r#"{"type":"plugin_expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}"#,
         "⏰ 节点 edge-1 将于 2026-10-01 到期（剩 7 天）",
     ),
     (
