@@ -530,9 +530,7 @@ pub async fn create_node(
     if node.name.trim().is_empty() {
         return bad("name is required");
     }
-    if let Some(message) =
-        node_limits(Some(node.traffic_reset_day), Some(node.traffic_limit))
-    {
+    if let Some(message) = node_limits(Some(node.traffic_reset_day), Some(node.traffic_limit)) {
         return bad(message);
     }
     node.name = node.name.trim().to_owned();
@@ -2090,10 +2088,8 @@ mod tests {
     async fn both_write_paths_refuse_the_same_out_of_range_values() {
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
-        for bad in [
-            json!({"name": "x", "traffic_reset_day": 99}),
-            json!({"name": "x", "traffic_limit": -1}),
-        ] {
+        for bad in [json!({"name": "x", "traffic_reset_day": 99}), json!({"name": "x", "traffic_limit": -1})]
+        {
             let created = create_node(
                 Admin,
                 axum::extract::State(app.clone()),

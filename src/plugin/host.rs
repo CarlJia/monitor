@@ -465,7 +465,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     linker.func_wrap(
         "host",
         "http_get",
-        |mut caller: Caller<'_, PluginState>, url_ptr: i32, url_len: i32, resp_ptr: i32, resp_cap: i32| -> i32 {
+        |mut caller: Caller<'_, PluginState>,
+         url_ptr: i32,
+         url_len: i32,
+         resp_ptr: i32,
+         resp_cap: i32|
+         -> i32 {
             let Some(url) = read_text(&mut caller, url_ptr, url_len) else {
                 return ERR_BOUNDS;
             };
@@ -564,7 +569,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 })
                 .collect();
             let bytes = serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec());
-            let (ptr, n) = match resp_write_plan(out_ptr, out_cap, (caller.data().resp_ptr, caller.data().resp_cap), bytes.len()) {
+            let (ptr, n) = match resp_write_plan(
+                out_ptr,
+                out_cap,
+                (caller.data().resp_ptr, caller.data().resp_cap),
+                bytes.len(),
+            ) {
                 Some(plan) => plan,
                 None => return 0,
             };
@@ -582,7 +592,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     linker.func_wrap(
         "host",
         "emit_event",
-        |mut caller: Caller<'_, PluginState>, name_ptr: i32, name_len: i32, payload_ptr: i32, payload_len: i32| -> i32 {
+        |mut caller: Caller<'_, PluginState>,
+         name_ptr: i32,
+         name_len: i32,
+         payload_ptr: i32,
+         payload_len: i32|
+         -> i32 {
             let Some(name) = read_text(&mut caller, name_ptr, name_len) else {
                 return ERR_BOUNDS;
             };
@@ -615,7 +630,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     linker.func_wrap(
         "host",
         "data_put",
-        |mut caller: Caller<'_, PluginState>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i32 {
+        |mut caller: Caller<'_, PluginState>,
+         key_ptr: i32,
+         key_len: i32,
+         val_ptr: i32,
+         val_len: i32|
+         -> i32 {
             let Some(key) = read_text(&mut caller, key_ptr, key_len) else {
                 return ERR_BOUNDS;
             };
@@ -636,7 +656,8 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                     return ERR_DB;
                 }
             };
-            let existing = app.db.plugin_data_get(&plugin_id, &key).ok().flatten().map(|s| s.len() as i64).unwrap_or(0);
+            let existing =
+                app.db.plugin_data_get(&plugin_id, &key).ok().flatten().map(|s| s.len() as i64).unwrap_or(0);
             if used - existing + value.len() as i64 > PLUGIN_DATA_MAX {
                 warn!(plugin = %plugin_id, "data_put 超出单插件配额");
                 return ERR_QUOTA;
@@ -656,7 +677,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     linker.func_wrap(
         "host",
         "data_get",
-        |mut caller: Caller<'_, PluginState>, key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32| -> i32 {
+        |mut caller: Caller<'_, PluginState>,
+         key_ptr: i32,
+         key_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
             let Some(key) = read_text(&mut caller, key_ptr, key_len) else {
                 return ERR_BOUNDS;
             };
@@ -701,7 +727,12 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
     linker.func_wrap(
         "host",
         "data_list",
-        |mut caller: Caller<'_, PluginState>, prefix_ptr: i32, prefix_len: i32, out_ptr: i32, out_cap: i32| -> i32 {
+        |mut caller: Caller<'_, PluginState>,
+         prefix_ptr: i32,
+         prefix_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
             let Some(prefix) = read_text(&mut caller, prefix_ptr, prefix_len) else {
                 return ERR_BOUNDS;
             };
@@ -713,10 +744,8 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                     return ERR_DB;
                 }
             };
-            let arr: Vec<serde_json::Value> = rows
-                .into_iter()
-                .map(|(key, data)| serde_json::json!({ "key": key, "data": data }))
-                .collect();
+            let arr: Vec<serde_json::Value> =
+                rows.into_iter().map(|(key, data)| serde_json::json!({ "key": key, "data": data })).collect();
             let bytes = serde_json::to_vec(&arr).unwrap_or_else(|_| b"[]".to_vec());
             let last = (caller.data().resp_ptr, caller.data().resp_cap);
             let Some((ptr, n)) = resp_write_plan(out_ptr, out_cap, last, bytes.len()) else {
@@ -826,8 +855,7 @@ pub fn call_json_hook(
         .instance
         .get_typed_func::<(i32, i32), i32>(&mut handle.store, hook)
         .map_err(|_| anyhow::anyhow!("模块缺少 {hook}(load 已按 manifest 声明检查)"))?;
-    let mem: Memory =
-        handle.instance.get_memory(&mut handle.store, "memory").context("模块缺少 memory")?;
+    let mem: Memory = handle.instance.get_memory(&mut handle.store, "memory").context("模块缺少 memory")?;
     // 入参写进插件内存:与事件载荷同一 allocator 回环。
     let in_ptr = alloc.call(&mut handle.store, (input.len().max(1) as i32,))?;
     if in_ptr <= 0 {
@@ -844,7 +872,10 @@ pub fn call_json_hook(
         bail!("{hook} 返回错误码 {n}");
     }
     // 响应体在插件最近一次 host_resp_alloc 记下的缓冲里。
-    let (resp_ptr, _) = { let s = handle.store.data(); (s.resp_ptr, s.resp_cap) };
+    let (resp_ptr, _) = {
+        let s = handle.store.data();
+        (s.resp_ptr, s.resp_cap)
+    };
     if n == 0 || resp_ptr <= 0 {
         return Ok(Vec::new());
     }
@@ -984,7 +1015,12 @@ mod tests {
     }
 
     /// 同上,但指定 plugin_id——namespace 隔离的测试要两个不同身份的插件。
-    fn spawn_as(engine: &wasmtime::Engine, app: &Arc<App>, plugin_id: &str, wat_text: &str) -> InstanceHandle {
+    fn spawn_as(
+        engine: &wasmtime::Engine,
+        app: &Arc<App>,
+        plugin_id: &str,
+        wat_text: &str,
+    ) -> InstanceHandle {
         let module = wasmtime::Module::new(engine, compile(wat_text)).unwrap();
         instantiate(engine, app, plugin_id, &module, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap()
     }

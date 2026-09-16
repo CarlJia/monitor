@@ -25,18 +25,14 @@ function cell(value: unknown): string {
 
 // form 块：每行一组可编辑字段 + 单行保存。草稿按行索引存，页面刷新后
 // 由父组件 remount（通过 pageKey 触发）整体清空。
-function FormBlock({ block, busy, onSubmit, pageKey }: {
+function FormBlock({ block, busy, onSubmit }: {
   block: PluginBlock
   busy: string | null
   onSubmit: (action: string, payload: Record<string, unknown>) => Promise<void>
-  pageKey: number
 }) {
   const [drafts, setDrafts] = useState<Record<number, Record<string, string>>>({})
   const rows = (block.rows ?? []) as Record<string, unknown>[]
   const fields = block.fields ?? []
-
-  // pageKey 变（重新拉取 / action 返回新页面）就把整张草稿丢掉。
-  useEffect(() => { setDrafts({}) }, [pageKey])
 
   const draft = (i: number, f: string) => drafts[i]?.[f] ?? cell(rows[i]?.[f])
   const patch = (i: number, f: string, v: string) =>
@@ -82,10 +78,9 @@ function FormBlock({ block, busy, onSubmit, pageKey }: {
                   <TableCell key={f}>
                     <Input
                       type={type}
+                      // 值是「草稿，回落到服务端原值」；清空后 placeholder 仍
+                      // 显示原值，用户知道自己抹掉了什么。
                       value={draft(i, f)}
-                      // 不是受控才显示的初值——key 让 draft 改了之后还能回退到
-                      // 服务端值（pageKey 重新 mount）。这里 key 只用来让 input
-                      // 显示新值。
                       placeholder={initial}
                       className="min-w-32"
                       onChange={(e) => patch(i, f, e.target.value)}
@@ -121,11 +116,11 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
 
   useEffect(() => {
     let cancelled = false
-    setError(null)
     pluginPage(id)
       .then((p) => {
         if (cancelled) return
         setPage(p)
+        setError(null)
         setPageKey((n) => n + 1)
       })
       .catch((e: Error) => { if (!cancelled) { setPage(null); setError(e.message) } })
@@ -152,7 +147,7 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
       <Card className="gap-4 p-5">
         <p className="text-sm text-destructive">页面加载失败：{error}</p>
         <div>
-          <Button size="sm" onClick={() => setReload((n) => n + 1)}>
+          <Button size="sm" onClick={() => { setError(null); setReload((n) => n + 1) }}>
             <RefreshCw /> 重试
           </Button>
           <Button size="sm" variant="ghost" className="ml-2" onClick={onBack}>返回插件列表</Button>
@@ -266,7 +261,8 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
             return (
               <div key={i} className="space-y-2">
                 {block.title && <h3 className="text-sm font-medium">{block.title}</h3>}
-                <FormBlock block={block} busy={busy} onSubmit={act} pageKey={pageKey} />
+                {/* key=pageKey：新页面对象到达时重挂载，草稿自然清空。 */}
+                <FormBlock key={pageKey} block={block} busy={busy} onSubmit={act} />
               </div>
             )
           default:

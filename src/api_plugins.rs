@@ -1365,10 +1365,7 @@ title = "Finance"
             render_plugin_page(Admin, State(app.clone()), Path(id)).await.status(),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(
-            enable_plugin(Admin, State(app.clone()), Path(id)).await.status(),
-            StatusCode::OK
-        );
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         let resp = render_plugin_page(Admin, State(app.clone()), Path(id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_of(resp).await;
@@ -1386,8 +1383,12 @@ title = "Finance"
         assert_eq!(body_of(resp).await["title"], "Finance");
 
         // 未声明 page 的插件:404。
-        assert_eq!(upload(&app, plugin_archive(&plugin_manifest("com.example.nopage", 2))).await.status(), StatusCode::OK);
-        let plain = app.db.list_plugins().unwrap().iter().find(|p| p.plugin_id == "com.example.nopage").unwrap().id;
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.nopage", 2))).await.status(),
+            StatusCode::OK
+        );
+        let plain =
+            app.db.list_plugins().unwrap().iter().find(|p| p.plugin_id == "com.example.nopage").unwrap().id;
         assert_eq!(
             render_plugin_page(Admin, State(app.clone()), Path(plain)).await.status(),
             StatusCode::NOT_FOUND
@@ -1398,11 +1399,11 @@ title = "Finance"
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cleanup_404s_without_the_declaration() {
         let app = plugin_app();
-        assert_eq!(upload(&app, plugin_archive(&plugin_manifest("com.example.noclean", 2))).await.status(), StatusCode::OK);
-        let id = app.db.list_plugins().unwrap()[0].id;
         assert_eq!(
-            plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(),
-            StatusCode::NOT_FOUND
+            upload(&app, plugin_archive(&plugin_manifest("com.example.noclean", 2))).await.status(),
+            StatusCode::OK
         );
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::NOT_FOUND);
     }
 }

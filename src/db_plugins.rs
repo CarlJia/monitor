@@ -238,14 +238,11 @@ impl Db {
 
     /// 插入或覆盖一行记录(upsert)。返回是否新建(而非覆盖)。
     pub fn plugin_data_put(&self, plugin_id: &str, key: &str, data: &str) -> Result<bool> {
-        let existed = self
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
-                params![plugin_id, key],
-                |r| r.get::<_, i64>(0),
-            )?
-            > 0;
+        let existed = self.conn().query_row(
+            "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+            params![plugin_id, key],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
         self.conn().execute(
             "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
              ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
@@ -268,9 +265,10 @@ impl Db {
 
     /// 删除一行记录。返回是否确实删了一行。
     pub fn plugin_data_delete(&self, plugin_id: &str, key: &str) -> Result<bool> {
-        let gone = self
-            .conn()
-            .execute("DELETE FROM plugin_data WHERE plugin_id=?1 AND record_key=?2", params![plugin_id, key])?;
+        let gone = self.conn().execute(
+            "DELETE FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+            params![plugin_id, key],
+        )?;
         Ok(gone > 0)
     }
 
@@ -304,17 +302,14 @@ impl Db {
             "SELECT plugin_id, COUNT(*), COALESCE(SUM(LENGTH(data)),0)
              FROM plugin_data GROUP BY plugin_id ORDER BY plugin_id",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-        })?;
+        let rows =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// 删除一个插件的全部记录(删除插件时调用),返回删掉的行数。
     pub fn delete_plugin_data(&self, plugin_id: &str) -> Result<usize> {
-        let gone = self
-            .conn()
-            .execute("DELETE FROM plugin_data WHERE plugin_id=?1", params![plugin_id])?;
+        let gone = self.conn().execute("DELETE FROM plugin_data WHERE plugin_id=?1", params![plugin_id])?;
         Ok(gone)
     }
 

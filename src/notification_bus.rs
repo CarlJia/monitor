@@ -105,9 +105,7 @@ impl Event {
     pub fn name(&self) -> &str {
         match self {
             Event::AgentOffline { name, .. } | Event::AgentOnline { name, .. } => name,
-            Event::Plugin { payload, .. } => {
-                payload.get("name").and_then(|v| v.as_str()).unwrap_or_default()
-            }
+            Event::Plugin { payload, .. } => payload.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
         }
     }
 

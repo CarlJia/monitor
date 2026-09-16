@@ -92,8 +92,8 @@ impl Manifest {
         }
         for event in &m.subscribes {
             let known = KNOWN_EVENT_NAMES.contains(&event.as_str());
-            let plugin_event = event.len() > PLUGIN_EVENT_PREFIX.len()
-                && event.starts_with(PLUGIN_EVENT_PREFIX);
+            let plugin_event =
+                event.len() > PLUGIN_EVENT_PREFIX.len() && event.starts_with(PLUGIN_EVENT_PREFIX);
             if !known && !plugin_event {
                 bail!(
                     "manifest.subscribes 含未知事件 `{event}`;v2 支持的宿主事件: {},插件事件以 `{PLUGIN_EVENT_PREFIX}` 前缀声明",

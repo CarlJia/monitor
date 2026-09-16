@@ -258,8 +258,7 @@ impl Registry {
     /// 同步执行——housekeeping_pass 是同步的,tick 数量少(每插件一次无参调用),
     /// 不值得再起 fire-and-forget 任务;失败落 dispatch_log 供面板排查。
     pub fn dispatch_ticks(&self, app: &App) {
-        let plugins: Vec<LoadedPlugin> =
-            self.loaded.values().filter(|p| p.manifest.tick).cloned().collect();
+        let plugins: Vec<LoadedPlugin> = self.loaded.values().filter(|p| p.manifest.tick).cloned().collect();
         if plugins.is_empty() {
             return;
         }
@@ -358,7 +357,7 @@ async fn run_one(
     DispatchEntry {
         at: Utc::now().timestamp(),
         plugin_id,
-        event_type: event_type.into(),
+        event_type,
         elapsed_ms: started.elapsed().as_millis() as u64,
         result,
     }
@@ -598,8 +597,10 @@ mod tests {
         let (ok, detail) = app.db.notification_log_row(7, "plugin_expiry_soon", key).unwrap().unwrap();
         assert!(!ok && detail.is_empty(), "派发前 success=0");
         app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&event);
-        let (_, detail) =
-            until(|| app.db.notification_log_row(7, "plugin_expiry_soon", key).unwrap().filter(|(ok, _)| *ok)).await;
+        let (_, detail) = until(|| {
+            app.db.notification_log_row(7, "plugin_expiry_soon", key).unwrap().filter(|(ok, _)| *ok)
+        })
+        .await;
         assert_eq!(detail, "");
     }
 
