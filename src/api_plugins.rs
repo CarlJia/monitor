@@ -238,8 +238,9 @@ fn unpack_plugin(archive: &[u8]) -> Result<HashMap<String, Vec<u8>>, anyhow::Err
     Ok(files)
 }
 
-/// 面板的插件列表(R12)。manifest_json 就在行里,把 subscribes 解出来一起
-/// 返回,前端画事件徽标不必再猜。
+/// 面板的插件列表(R12)。manifest_json 就在行里,把 subscribes 与 v2 的能力
+/// 声明(page/tick/cleanup)解出来一起返回,前端画事件徽标与决定是否显示
+/// 「页面」「清理」入口不必再猜。
 pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.plugin_summaries() {
         Ok(rows) => Json(
@@ -247,8 +248,7 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                 .map(|r| {
                     // manifest 上传时已通过校验;这里容错而不是失败,一行坏
                     // manifest(手工改库)不该让整个列表 500。
-                    let subscribes =
-                        Manifest::parse(&r.manifest_json).map(|m| m.subscribes).unwrap_or_default();
+                    let m = Manifest::parse(&r.manifest_json).ok();
                     json!({
                         "id": r.id,
                         "plugin_id": r.plugin_id,
@@ -258,7 +258,10 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                         "status": r.status,
                         "last_error": r.last_error,
                         "uploaded_at": r.uploaded_at,
-                        "subscribes": subscribes,
+                        "subscribes": m.as_ref().map(|m| m.subscribes.clone()).unwrap_or_default(),
+                        "page": m.as_ref().and_then(|m| m.page.as_ref()).map(|p| p.title.clone()),
+                        "tick": m.as_ref().map(|m| m.tick).unwrap_or(false),
+                        "cleanup": m.as_ref().map(|m| m.cleanup).unwrap_or(false),
                     })
                 })
                 .collect::<Vec<_>>(),
