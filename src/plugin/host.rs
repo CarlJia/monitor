@@ -1,5 +1,6 @@
 //! 引擎与加载(R6)、宿主函数(R8)、事件派发入口。
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,9 +127,73 @@ pub(crate) struct PluginState {
 /// | -6 | data:记录或单插件配额超限(v2) |
 /// | -7 | emit_event:事件名不以 `plugin_` 开头(v2) |
 /// | -8 | data:nodes_query/emit:数据库错误(v2) |
+/// | -9 | http:目标解析到私有/保留地址,拒绝(SSRF 防线,v2) |
 const ERR_BOUNDS: i32 = -1;
 const ERR_QUOTA: i32 = -6;
 const ERR_DB: i32 = -8;
+/// 插件 http 目标落在私有/保留网段时的拒绝码。
+const ERR_SSRF: i32 = -9;
+
+/// 一个 IP 是否属于插件不该访问的网段:私有、回环、链路本地、云元数据
+/// (169.254.169.254 落在 169.254/16)、CGNAT、基准测试与各类保留段。
+///
+/// 这一层只拦**插件发起**的请求。宿主自身的 http 调用(主题下载、GitHub、
+/// 运维配置的 `github_proxy` 镜像)共用同一个 reqwest client,不加此限制——
+/// 把代理指向内网镜像是正当部署,一刀切会把它打断。插件则不同:它的 http
+/// 能力是"往公网 https 发请求",不该成为探内网、云元数据或回环服务的跳板。
+fn address_is_blocked(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            v4.is_private()        // 10/8, 172.16/12, 192.168/16
+                || v4.is_loopback()   // 127/8
+                || v4.is_link_local() // 169.254/16
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || (a == 100 && (64..128).contains(&b)) // 100.64/10 CGNAT
+                || (a == 192 && b == 0 && c == 0) // 192.0.0/24 IETF 保留
+                || (a == 198 && (b == 18 || b == 19)) // 198.18/15 基准测试
+                || a >= 240 // 240/4 保留(含 255.255.255.255)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 唯一本地
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 链路本地
+                // ::ffff:a.b.c.d 这类映射地址按内嵌的 v4 判。
+                || v6.to_ipv4_mapped().is_some_and(|v4| address_is_blocked(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// 检查一个插件 http 目标是否指向公网。`Err` 是立即返回给插件的错误码:URL
+/// 解析不出主机名 → -2(与"非 https"同类,URL 形状不对);解析到的任一地址
+/// 落在受限网段 → -9;解析本身失败 → -4(网络问题,不是策略拒绝)。
+///
+/// 先解析、再由 reqwest 自己再解析一次发送,中间留着一个 DNS rebinding 的
+/// 时间窗。这里不追求把它彻底焊死:威胁模型是"管理员安装的插件",而真正
+/// 的隔离来自 wasm 沙箱的其余边界;要焊死需要自定义 reqwest 的 Resolve 实现,
+/// 代价与收益不成比例。
+async fn http_target_is_allowed(url: &str) -> Result<(), i32> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| -2)?;
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        return Err(-2);
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if address_is_blocked(ip) { Err(ERR_SSRF) } else { Ok(()) };
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolved = tokio::net::lookup_host((host, port)).await.map_err(|_| -4)?;
+    for addr in resolved {
+        if address_is_blocked(addr.ip()) {
+            return Err(ERR_SSRF);
+        }
+    }
+    Ok(())
+}
 
 /// 单条 plugin_data 记录的上限:256 KiB(KTD3)。财务记录是百台机器量的
 /// JSON,远低于此;上限防的是插件把它当大对象存储用。
@@ -411,6 +476,11 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_post 不在异步运行时上下文中");
                 return -4;
             };
+            // SSRF 防线(v2):目标解析到私有/保留网段就拒绝,不发请求。
+            if let Err(code) = handle.block_on(http_target_is_allowed(&url)) {
+                warn!(plugin = %plugin_id, host = %host, "host_http_post 拒绝私有/保留地址");
+                return code;
+            }
             let request = app
                 .http
                 .post(&url)
@@ -496,6 +566,11 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
                 warn!(plugin = %plugin_id, "host_http_get 不在异步运行时上下文中");
                 return -4;
             };
+            // SSRF 防线(v2):目标解析到私有/保留网段就拒绝,不发请求。
+            if let Err(code) = handle.block_on(http_target_is_allowed(&url)) {
+                warn!(plugin = %plugin_id, host = %host, "host_http_get 拒绝私有/保留地址");
+                return code;
+            }
             let request = app.http.get(&url).timeout(HTTP_TIMEOUT);
             let outcome = handle.block_on(async {
                 let mut resp = request.send().await?;
@@ -1202,6 +1277,98 @@ mod tests {
     (call $get (i32.const 1024) (i32.const 25) (i32.const 8192) (i32.const 256))))"#;
         let mut h = spawn(&engine, &app, wat);
         assert_eq!(drive(&mut h), -2);
+    }
+
+    // ---- SSRF 防线(v2) ----
+
+    /// 网段判定表:私有、回环、链路本地、云元数据、CGNAT、保留段都算受限;
+    /// 真实公网地址不误伤。
+    #[test]
+    fn address_is_blocked_classifies_private_and_reserved_ranges() {
+        for blocked in [
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1", // 私有
+            "127.0.0.1",
+            "127.9.9.9", // 回环
+            "169.254.169.254",
+            "169.254.0.1", // 链路本地 + 云元数据
+            "0.0.0.0",
+            "255.255.255.255", // 未指定 / 广播
+            "100.64.0.1",
+            "100.127.255.255", // CGNAT
+            "192.0.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "224.0.0.1", // 保留 / 基准 / 组播
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "ff02::1", // v6 各类
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1", // v4 映射
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(address_is_blocked(ip), "{blocked} 应被判为受限");
+        }
+        for allowed in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "100.63.255.255", "2606:4700::1111"] {
+            let ip: IpAddr = allowed.parse().unwrap();
+            assert!(!address_is_blocked(ip), "{allowed} 是公网地址,不该被拦");
+        }
+    }
+
+    /// 策略层:字面 IP 与「主机名解析到私网」都拒。localhost 走 /etc/hosts,
+    /// 不依赖外部 DNS。
+    #[tokio::test]
+    async fn http_target_is_allowed_refuses_private_hosts() {
+        for url in [
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.1.2.3/x",
+            "https://192.168.1.1/x",
+            "https://[::1]/x",
+            "https://localhost/x",
+        ] {
+            assert_eq!(http_target_is_allowed(url).await, Err(ERR_SSRF), "{url}");
+        }
+        // 没有主机名的 URL 先一步按 -2 拒掉。scheme 校验不在这里:调用方
+        // (http_get/http_post)已在进入前拦掉非 https,这里只看目标地址。
+        // 注意 `https:///nohost` 会被 URL 解析器折叠成主机 `nohost`(要走
+        // DNS),所以用 `https://` 这个必然缺主机名的形状。
+        assert_eq!(http_target_is_allowed("https://").await, Err(-2));
+    }
+
+    /// 端到端:插件的 http_get 打到私网地址,宿主函数返回 -9 而不是发请求。
+    /// 走真实的 spawn_blocking + block_on 路径,与生产里的调用方式一致。
+    #[test]
+    fn http_get_refuses_private_targets_end_to_end() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let engine = engine();
+        let app = app();
+        let url = "https://169.254.169.254/latest/meta-data";
+        let wat = format!(
+            r#"
+(module
+  (import "host" "http_get" (func $get (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 1024) "{url}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (call $get (i32.const 1024) (i32.const {len}) (i32.const 8192) (i32.const 256))))"#,
+            len = url.len()
+        );
+        let code = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut h = spawn(&engine, &app, &wat);
+                drive(&mut h)
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(code, ERR_SSRF, "云元数据地址必须被拒");
     }
 
     /// 通过 on_event 驱动:kv_set 写入再 kv_get 读出到固定地址,返回读到的字节数。
