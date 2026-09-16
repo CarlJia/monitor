@@ -442,7 +442,7 @@ impl Db {
 /// 转义一个要拼进 LIKE 模式的字符串:`%` 与 `_` 是通配符,`\` 是转义符本身。
 /// 配合 `ESCAPE '\'` 使用。plugin_id 允许 `_`(如 `com.example_tg`),不转义时
 /// `plugin.<id>:%` 会匹配到别的插件(`com.exampleXtg`)的 kv 行。
-fn like_escaped(s: &str) -> String {
+pub(crate) fn like_escaped(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 

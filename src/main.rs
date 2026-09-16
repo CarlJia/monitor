@@ -433,6 +433,9 @@ async fn main() -> Result<()> {
         .route("/api/plugins/{id}/test", post(api_plugins::test_plugin))
         .route("/api/plugins/{id}/logs", get(api_plugins::plugin_dispatch_log))
         .route("/api/plugins/{id}/kv", get(api_plugins::list_plugin_kv))
+        .route("/api/plugins/{id}/page", get(api_plugins::render_plugin_page))
+        .route("/api/plugins/{id}/action", post(api_plugins::plugin_page_action))
+        .route("/api/plugins/{id}/cleanup", post(api_plugins::plugin_cleanup))
         .route(
             "/api/plugins/{id}/kv/{key}",
             put(api_plugins::set_plugin_kv).delete(api_plugins::delete_plugin_kv_route),

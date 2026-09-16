@@ -1325,6 +1325,36 @@ impl Db {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             rows.insert(table.to_owned(), serde_json::json!(n));
         }
+        // 插件空间占用(R11/KTD11):按插件汇总 plugin_data 的字节/行数,再加上
+        // 该插件的 kv 行(setting 表的 `plugin.<id>:%`)字节。宿主只展示,
+        // 清理交给插件自己的 cleanup 入口。查询直接走当前 conn——`plugin_data_usage`
+        // 会再取同一把 Mutex,在持锁期间调用会死锁。
+        let mut plugins = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT plugin_id, name FROM plugin ORDER BY plugin_id")?;
+            let listed = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (plugin_id, name) in listed {
+                let (data_rows, data_bytes) = conn.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM plugin_data WHERE plugin_id=?1",
+                    params![plugin_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )?;
+                let kv_bytes: i64 = conn.query_row(
+                    "SELECT COALESCE(SUM(LENGTH(key)+LENGTH(value)),0) FROM setting WHERE key LIKE ?1 ESCAPE '\\'",
+                    params![format!("plugin.{}:%", crate::db_plugins::like_escaped(&plugin_id))],
+                    |r| r.get(0),
+                )?;
+                plugins.push(serde_json::json!({
+                    "plugin_id": plugin_id,
+                    "name": name,
+                    "data_rows": data_rows,
+                    "data_bytes": data_bytes,
+                    "kv_bytes": kv_bytes,
+                }));
+            }
+        }
         Ok(serde_json::json!({
             "path": file,
             "size": bytes_of(&file),
@@ -1333,6 +1363,7 @@ impl Db {
             "oldest": oldest,
             "retention": retention,
             "rows": rows,
+            "plugins": plugins,
         }))
     }
 
@@ -1843,6 +1874,34 @@ mod tests {
         assert!(on_disk(&scratch.0) < fat);
         assert_eq!(db.stats().unwrap()["rows"]["metric"], 0);
         assert_eq!(db.nodes().unwrap().len(), 1, "vacuum keeps the rows that are left");
+    }
+
+    /// 插件空间占用(R11/KTD11):按插件汇总 plugin_data 的字节/行数,并计入
+    /// 该插件 kv 行的字节。
+    #[test]
+    fn stats_reports_per_plugin_usage() {
+        let db = db();
+        let row = db.create_plugin("com.example.big", "Big", "1", "{}", b"m", "sha").unwrap();
+        assert!(row.id > 0);
+        db.plugin_data_put("com.example.big", "node:1", &"x".repeat(100)).unwrap();
+        db.plugin_data_put("com.example.big", "node:2", &"y".repeat(50)).unwrap();
+        db.set("plugin.com.example.big:token", "secret").unwrap();
+
+        let stats = db.stats().unwrap();
+        let plugins = stats["plugins"].as_array().unwrap();
+        let entry = plugins.iter().find(|p| p["plugin_id"] == "com.example.big").unwrap();
+        assert_eq!(entry["data_rows"], 2);
+        assert_eq!(entry["data_bytes"], 150);
+        assert_eq!(
+            entry["kv_bytes"],
+            "plugin.com.example.big:token".len() + "secret".len(),
+            "kv 行按完整 key（含命名空间前缀）+value 计字节"
+        );
+
+        // 删除插件后占用随之消失。
+        db.delete_plugin_with_kv(row.id, "com.example.big").unwrap();
+        let after = db.stats().unwrap();
+        assert!(after["plugins"].as_array().unwrap().is_empty(), "删掉的插件不再出现在占用里");
     }
 
     fn node(db: &Db, reset_day: u32) -> i64 {

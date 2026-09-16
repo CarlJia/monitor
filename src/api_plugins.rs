@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tracing::warn;
 
 use crate::api::{bad, fail, Admin};
 use crate::db::PluginRow;
@@ -56,6 +57,11 @@ fn plugin_or_404(app: &App, id: i64) -> Result<String, Response> {
         Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
         Err(e) => Err(fail(e)),
     }
+}
+
+/// 一个插件不满足某能力声明时的 404(未声明 page/cleanup 的路由)。
+fn not_found(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
 }
 
 /// Installs an uploaded plugin package (R11): a `multipart/form-data` request
@@ -387,6 +393,126 @@ pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): 
         .collect();
     Json(entries).into_response()
 }
+
+/// 一个声明了 page 的启用插件渲染它的面板页面(U5/KTD5)。宿主调插件的
+/// `render_page` 导出,把返回的 JSON UI 描述原样转给前端;插件侧失败
+/// (超时/trap/非 2xx)返回 502 由前端显示错误卡片。
+pub async fn render_plugin_page(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let declared = app
+        .plugins
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .manifest_of(id)
+        .map(|m| m.page.is_some())
+        .unwrap_or(false);
+    if !declared {
+        return not_found("该插件没有声明页面");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "render_page", b"{}").await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("插件页面描述不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "render_page 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件页面渲染失败"}))).into_response()
+        }
+    }
+}
+
+/// 把一次页面交互交给插件处理(U5):body 是 `{action, ...}` 的 JSON,宿主调
+/// 插件的 `on_action`,返回插件给出的响应(新页面描述或成功提示)。
+pub async fn plugin_page_action(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let declared = app
+        .plugins
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .manifest_of(id)
+        .map(|m| m.page.is_some())
+        .unwrap_or(false);
+    if !declared {
+        return not_found("该插件没有声明页面");
+    }
+    if body.len() > ACTION_BODY_MAX {
+        return bad("action 请求体超过上限");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "on_action", &body).await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("插件 action 响应不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "on_action 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件处理失败"}))).into_response()
+        }
+    }
+}
+
+/// 插件自己的数据清理入口(U9/KTD11):宿主只转发调用并回传结果,不碰插件
+/// 数据语义。只有声明 cleanup 的插件可用,否则 404。
+pub async fn plugin_cleanup(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let declared = app
+        .plugins
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .manifest_of(id)
+        .map(|m| m.cleanup)
+        .unwrap_or(false);
+    if !declared {
+        return not_found("该插件没有声明清理能力");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "on_cleanup", b"{}").await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({"freed_bytes": 0, "pruned": 0})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("清理响应不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "on_cleanup 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "插件清理失败"}))).into_response()
+        }
+    }
+}
+
+/// 调一个插件的 JSON 入/出导出。`Registry::call_json` 走的是与派发同一套
+/// fuel/超时隔离;读锁的 guard 不是 Send,整个调用挪进 blocking 线程
+/// (与 test_plugin 同一手法)。
+async fn call_plugin_json(app: Shared, id: i64, hook: &str, input: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+    let hook = hook.to_owned();
+    let input = input.to_vec();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+        handle.block_on(async { registry.call_json(id, &hook, &input) })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?
+}
+
+/// 页面 action 请求体的上限,与该路由所在的 64 KiB 层一致。
+const ACTION_BODY_MAX: usize = 64 * 1024;
 
 /// kv 的 key 校验,set 与 delete 共用:set 侧挡住不能落库的形状,delete
 /// 侧对同样的形状按 400 拒绝而不是当成不存在的行吞掉——它们只能是打错的
@@ -1182,5 +1308,98 @@ mod tests {
             app.db.enabled_plugins().unwrap().into_iter().map(|r| r.plugin_id).collect();
         assert_eq!(enabled, vec!["com.example.backup".to_owned()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- 页面协议(U5) ----
+
+    /// 声明 page 的插件:render_page 与 on_action 各自经 host_resp_alloc
+    /// 拿缓冲、写入一段 JSON、返回长度。
+    const PAGE_WAT: &str = r#"
+(module
+  (import "host" "resp_alloc" (func $alloc (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{\"title\":\"Finance\"}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0))
+  (func (export "on_action") (param i32 i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (call $alloc (i32.const 64)))
+    (memory.copy (local.get $ptr) (i32.const 1024) (i32.const 19))
+    (i32.const 19))
+  (func (export "render_page") (param i32 i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (call $alloc (i32.const 64)))
+    (memory.copy (local.get $ptr) (i32.const 1024) (i32.const 19))
+    (i32.const 19)))"#;
+
+    const PAGE_MANIFEST: &str = r#"
+plugin_id = "com.example.paged"
+name = "Paged"
+version = "1.0.0"
+abi_version = 2
+subscribes = []
+
+[page]
+title = "Finance"
+"#;
+
+    fn page_archive() -> Vec<u8> {
+        tarball(&[
+            ("plugin.toml", PAGE_MANIFEST.as_bytes().to_vec()),
+            ("plugin.wasm", wat::parse_str(PAGE_WAT).unwrap()),
+        ])
+    }
+
+    /// 声明 page 的插件:上传、启用后 GET page 返回插件渲染的 JSON 描述;
+    /// 未声明 page 的插件 404。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_plugin_renders_and_others_404() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, page_archive()).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        // 未启用:render_page 未加载 → 404(页面能力依赖已加载的插件)。
+        assert_eq!(
+            render_plugin_page(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            enable_plugin(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::OK
+        );
+        let resp = render_plugin_page(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["title"], "Finance", "插件渲染的页面描述透传给前端");
+
+        // action 回环:把 body 交给 on_action,返回它写的 JSON。
+        let resp = plugin_page_action(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            axum::body::Bytes::from_static(b"{\"action\":\"x\"}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await["title"], "Finance");
+
+        // 未声明 page 的插件:404。
+        assert_eq!(upload(&app, plugin_archive(&plugin_manifest("com.example.nopage", 2))).await.status(), StatusCode::OK);
+        let plain = app.db.list_plugins().unwrap().iter().find(|p| p.plugin_id == "com.example.nopage").unwrap().id;
+        assert_eq!(
+            render_plugin_page(Admin, State(app.clone()), Path(plain)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// 未声明 cleanup 的插件,清理端点 404(KTD11)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_404s_without_the_declaration() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, plugin_archive(&plugin_manifest("com.example.noclean", 2))).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(
+            plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
