@@ -23,13 +23,13 @@ pub(crate) const MINIMAL_WAT: &str = r#"
     (local.get $ptr))
   (func (export "on_event") (param i32 i32) (result i32) (i32.const 0)))"#;
 
-/// 通过 manifest 校验的标准测试 manifest。
+/// 通过 manifest 校验的标准测试 manifest(v2):订阅一个宿主事件与一个插件事件。
 pub(crate) const MANIFEST: &str = r#"
 plugin_id = "com.example.test"
 name = "Test Plugin"
 version = "1.0.0"
-abi_version = 1
-subscribes = ["expiry_soon", "agent_offline"]
+abi_version = 2
+subscribes = ["agent_offline", "plugin_expiry_soon"]
 "#;
 
 pub(crate) fn app() -> Arc<App> {
@@ -57,12 +57,15 @@ pub(crate) fn engine() -> wasmtime::Engine {
 }
 
 pub(crate) fn expiry_event() -> Event {
-    Event::ExpirySoon {
-        node_id: 7,
-        name: "edge-1".into(),
-        expires_at: "2026-10-01".into(),
-        days_left: 7,
-        threshold_days: 7,
+    Event::Plugin {
+        name: "plugin_expiry_soon".into(),
+        payload: serde_json::json!({
+            "node_id": 7,
+            "name": "edge-1",
+            "expires_at": "2026-10-01",
+            "days_left": 7,
+            "threshold_days": 7,
+        }),
     }
 }
 
@@ -74,7 +77,7 @@ pub(crate) fn compile(wat_text: &str) -> Vec<u8> {
 pub(crate) fn manifest_text(plugin_id: &str, subscribes: &[&str]) -> String {
     let list = subscribes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
     format!(
-        "plugin_id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"1.0.0\"\nabi_version = 1\nsubscribes = [{list}]"
+        "plugin_id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"1.0.0\"\nabi_version = 2\nsubscribes = [{list}]"
     )
 }
 

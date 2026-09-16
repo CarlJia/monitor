@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tracing::warn;
 
 use crate::api::{bad, fail, Admin};
 use crate::db::PluginRow;
@@ -56,6 +57,30 @@ fn plugin_or_404(app: &App, id: i64) -> Result<String, Response> {
         Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
         Err(e) => Err(fail(e)),
     }
+}
+
+/// 一个插件不满足某能力声明时的 404(未声明 page/cleanup 的路由)。纯文本
+/// 响应体,与 `bad`/`fail` 同一形状——面板只有一条错误路径(`res.text()`),
+/// 返回 JSON 会让 toast 里出现 `{"error":"..."}` 的原文。
+fn not_found(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, message.to_owned()).into_response()
+}
+
+/// 已加载插件的 manifest。未加载返回 400,与 `test_plugin` 对同一状况的回答
+/// 一致——「插件没启用」和「插件没声明这项能力」在面板上都表现为"点了没反应",
+/// 但恢复动作完全不同(去启用 vs 去改 manifest),不能混成同一个 404。
+///
+/// `manifest_of` 只看内存里已加载(启用)的插件,所以先判加载状态再判能力声明。
+///
+/// `#[allow(result_large_err)]` 与 [`plugin_or_404`] 同一理由:Err 装的是现成
+/// 的 Response,调用侧直接 return,装箱省下的那点栈不值得多一次解引用。
+#[allow(clippy::result_large_err)]
+fn loaded_manifest(app: &App, id: i64) -> Result<Manifest, Response> {
+    let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+    if !registry.is_loaded(id) {
+        return Err(bad("插件未启用或加载失败；先启用它再重试"));
+    }
+    registry.manifest_of(id).ok_or_else(|| bad("插件未启用或加载失败；先启用它再重试"))
 }
 
 /// Installs an uploaded plugin package (R11): a `multipart/form-data` request
@@ -232,8 +257,9 @@ fn unpack_plugin(archive: &[u8]) -> Result<HashMap<String, Vec<u8>>, anyhow::Err
     Ok(files)
 }
 
-/// 面板的插件列表(R12)。manifest_json 就在行里,把 subscribes 解出来一起
-/// 返回,前端画事件徽标不必再猜。
+/// 面板的插件列表(R12)。manifest_json 就在行里,把 subscribes 与 v2 的能力
+/// 声明(page/tick/cleanup)解出来一起返回,前端画事件徽标与决定是否显示
+/// 「页面」「清理」入口不必再猜。
 pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.plugin_summaries() {
         Ok(rows) => Json(
@@ -241,8 +267,7 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                 .map(|r| {
                     // manifest 上传时已通过校验;这里容错而不是失败,一行坏
                     // manifest(手工改库)不该让整个列表 500。
-                    let subscribes =
-                        Manifest::parse(&r.manifest_json).map(|m| m.subscribes).unwrap_or_default();
+                    let m = Manifest::parse(&r.manifest_json).ok();
                     json!({
                         "id": r.id,
                         "plugin_id": r.plugin_id,
@@ -252,7 +277,10 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                         "status": r.status,
                         "last_error": r.last_error,
                         "uploaded_at": r.uploaded_at,
-                        "subscribes": subscribes,
+                        "subscribes": m.as_ref().map(|m| m.subscribes.clone()).unwrap_or_default(),
+                        "page": m.as_ref().and_then(|m| m.page.as_ref()).map(|p| p.title.clone()),
+                        "tick": m.as_ref().map(|m| m.tick).unwrap_or(false),
+                        "cleanup": m.as_ref().map(|m| m.cleanup).unwrap_or(false),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -332,25 +360,24 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let event = Event::ExpirySoon {
-        node_id: 0,
-        name: "test".into(),
-        expires_at: (Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
-        days_left: 1,
-        threshold_days: 1,
+    let event = Event::Plugin {
+        name: "plugin_expiry_soon".into(),
+        payload: serde_json::json!({
+            "node_id": 0,
+            "name": "test",
+            "expires_at": (Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
+            "days_left": 1,
+            "threshold_days": 1,
+        }),
     };
-    // 读锁的 guard 不是 Send,不能横跨 handler 的 await(handler 的 future 必须是
-    // Send);而 dispatch_one 又只在 &self 上工作。把它整个挪进 blocking 线程,
-    // 用预先取好的 runtime handle 驱动——guard 只活在那条同步闭包里,内部
-    // run_one 的 spawn 与超时照常落在 runtime 上。
+    // `dispatch_one` 自己只在取插件快照时借一次读锁,执行期间不持锁,所以
+    // 这里不必再套一层 guard。wasm 是 CPU 活,仍挪进 blocking 线程,用预先
+    // 取好的 runtime handle 驱动——run_one 的 spawn 与超时照常落在 runtime 上。
     let outcome = {
         let app = app.clone();
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let registry = app.plugins.read().unwrap_or_else(|e| e.into_inner());
-            handle.block_on(registry.dispatch_one(id, &event))
-        })
-        .await
+        tokio::task::spawn_blocking(move || handle.block_on(plugin::Registry::dispatch_one(&app, id, &event)))
+            .await
     };
     match outcome {
         Ok(Ok(entry)) => Json(json!({
@@ -384,6 +411,115 @@ pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): 
         .collect();
     Json(entries).into_response()
 }
+
+/// 一个声明了 page 的启用插件渲染它的面板页面(U5/KTD5)。宿主调插件的
+/// `render_page` 导出,把返回的 JSON UI 描述原样转给前端;插件侧失败
+/// (超时/trap/非 2xx)返回 502 由前端显示错误卡片。
+pub async fn render_plugin_page(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if manifest.page.is_none() {
+        return not_found("该插件没有声明页面");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "render_page", b"{}").await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("插件页面描述不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "render_page 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, "插件页面渲染失败").into_response()
+        }
+    }
+}
+
+/// 把一次页面交互交给插件处理(U5):body 是 `{action, ...}` 的 JSON,宿主调
+/// 插件的 `on_action`,返回插件给出的响应(新页面描述或成功提示)。
+pub async fn plugin_page_action(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if manifest.page.is_none() {
+        return not_found("该插件没有声明页面");
+    }
+    if body.len() > ACTION_BODY_MAX {
+        return bad("action 请求体超过上限");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "on_action", &body).await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("插件 action 响应不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "on_action 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, "插件处理失败").into_response()
+        }
+    }
+}
+
+/// 插件自己的数据清理入口(U9/KTD11):宿主只转发调用并回传结果,不碰插件
+/// 数据语义。只有声明 cleanup 的插件可用,否则 404。
+pub async fn plugin_cleanup(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let manifest = match loaded_manifest(&app, id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    if !manifest.cleanup {
+        return not_found("该插件没有声明清理能力");
+    }
+    let outcome = call_plugin_json(app.clone(), id, "on_cleanup", b"{}").await;
+    match outcome {
+        Ok(bytes) if bytes.is_empty() => Json(json!({"freed_bytes": 0, "pruned": 0})).into_response(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => fail(anyhow::anyhow!("清理响应不是合法 JSON: {e}")),
+        },
+        Err(e) => {
+            warn!(plugin = %plugin_id, "on_cleanup 失败: {e:#}");
+            (StatusCode::BAD_GATEWAY, "插件清理失败").into_response()
+        }
+    }
+}
+
+/// 调一个插件的 JSON 入/出导出。`Registry::call_json` 走的是与派发同一套
+/// fuel/超时隔离,并且自己只在取插件快照时借一次读锁——插件执行期间不持锁,
+/// 插件在 `on_action` 里发事件不会重入这把锁。wasm 是 CPU 活,仍挪进 blocking
+/// 线程;这里不再套外层 `block_on`,嵌套 `block_on` 会让宿主里的同名调用
+/// panic。
+async fn call_plugin_json(app: Shared, id: i64, hook: &str, input: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+    let hook = hook.to_owned();
+    let input = input.to_vec();
+    tokio::task::spawn_blocking(move || plugin::Registry::call_json(&app, id, &hook, &input))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+}
+
+/// 页面 action 请求体的上限,与该路由所在的 64 KiB 层一致。
+const ACTION_BODY_MAX: usize = 64 * 1024;
 
 /// kv 的 key 校验,set 与 delete 共用:set 侧挡住不能落库的形状,delete
 /// 侧对同样的形状按 400 拒绝而不是当成不存在的行吞掉——它们只能是打错的
@@ -498,7 +634,7 @@ mod tests {
     fn plugin_manifest(plugin_id: &str, abi_version: i64) -> String {
         format!(
             "plugin_id = \"{plugin_id}\"\nname = \"Test Plugin\"\nversion = \"1.0.0\"\n\
-             abi_version = {abi_version}\nsubscribes = [\"expiry_soon\"]\n"
+             abi_version = {abi_version}\nsubscribes = [\"agent_offline\", \"plugin_expiry_soon\"]\n"
         )
     }
 
@@ -692,7 +828,7 @@ mod tests {
     async fn an_uploaded_plugin_lands_disabled_in_the_table() {
         let app = plugin_app();
         let wasm = wat::parse_str(MINIMAL_WAT).unwrap();
-        let archive = plugin_archive(&plugin_manifest("com.example.mailer", 1));
+        let archive = plugin_archive(&plugin_manifest("com.example.mailer", 2));
 
         assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
         let rows = app.db.list_plugins().unwrap();
@@ -708,7 +844,7 @@ mod tests {
         // 列表把 subscribes 从 manifest 解出来,前端画徽标不必再猜。
         let listed = body_of(list_plugins(Admin, State(app.clone())).await).await;
         assert_eq!(listed[0]["plugin_id"], "com.example.mailer");
-        assert_eq!(listed[0]["subscribes"], json!(["expiry_soon"]));
+        assert_eq!(listed[0]["subscribes"], json!(["agent_offline", "plugin_expiry_soon"]));
         assert_eq!(listed[0]["status"], "disabled");
         assert!(listed[0].get("wasm_blob").is_none(), "列表不携带模块字节");
     }
@@ -728,22 +864,22 @@ mod tests {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             // 没有 plugin.toml。
             (tarball(&[("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap())]), "没有 plugin.toml"),
-            // ABI 不符。
-            (plugin_archive(&plugin_manifest("com.example.mailer", 2)), "abi_version"),
+            // ABI 不符:v1 从此不受支持(KTD1)。
+            (plugin_archive(&plugin_manifest("com.example.mailer", 1)), "abi_version"),
             // plugin_id 含 ':'(kv 命名空间的分隔符)。
-            (plugin_archive(&plugin_manifest("com.example:mailer", 1)), "':'"),
+            (plugin_archive(&plugin_manifest("com.example:mailer", 2)), "':'"),
             // 路径越出包外:`..` 与绝对路径。
             (
                 tarball_with_entry_name(
                     "../plugin.toml",
-                    plugin_manifest("com.example.mailer", 1).as_bytes(),
+                    plugin_manifest("com.example.mailer", 2).as_bytes(),
                 ),
                 "..",
             ),
             (
                 tarball_with_entry_name(
                     "/etc/plugin.toml",
-                    plugin_manifest("com.example.mailer", 1).as_bytes(),
+                    plugin_manifest("com.example.mailer", 2).as_bytes(),
                 ),
                 "绝对路径",
             ),
@@ -772,10 +908,10 @@ mod tests {
     async fn a_duplicate_plugin_id_is_refused() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.a", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await.status(),
             StatusCode::OK
         );
-        let second = upload(&app, plugin_archive(&plugin_manifest("com.example.a", 1))).await;
+        let second = upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await;
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
         assert!(
@@ -792,7 +928,7 @@ mod tests {
     async fn a_broken_wasm_lands_with_the_reason_and_cannot_be_enabled() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.broken", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.broken", 2).into_bytes()),
             ("plugin.wasm", b"\0asm\xde\xad\xbe\xef".to_vec()),
         ]);
         assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
@@ -819,7 +955,7 @@ mod tests {
     async fn a_multi_mib_legal_package_uploads_through_the_merged_router() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.big", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.big", 2).into_bytes()),
             ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
             ("assets/pad.bin", noise(3 * 1024 * 1024)),
         ]);
@@ -834,7 +970,7 @@ mod tests {
     async fn a_package_over_the_byte_cap_is_refused() {
         let app = plugin_app();
         let archive = tarball(&[
-            ("plugin.toml", plugin_manifest("com.example.huge", 1).into_bytes()),
+            ("plugin.toml", plugin_manifest("com.example.huge", 2).into_bytes()),
             ("plugin.wasm", noise(MAX_PLUGIN as usize + 1)), // 单 entry 仍在 16 MiB 内
         ]);
         assert!(archive.len() as u64 > MAX_PLUGIN);
@@ -857,7 +993,7 @@ mod tests {
     async fn enable_test_and_disable_walk_the_full_lifecycle() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.lifecycle", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.lifecycle", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -903,7 +1039,7 @@ mod tests {
         );
 
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.gone", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.gone", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -934,7 +1070,7 @@ mod tests {
     async fn plugin_kv_round_trips_and_refuses_the_same_things_the_host_does() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.kv", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.kv", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -987,7 +1123,7 @@ mod tests {
         let app = plugin_app();
         for plugin_id in ["com.example", "com.example.tg-notify"] {
             assert_eq!(
-                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 1))).await.status(),
+                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 2))).await.status(),
                 StatusCode::OK
             );
         }
@@ -1037,7 +1173,7 @@ mod tests {
     async fn a_plugin_kv_row_can_be_deleted_on_its_own() {
         let app = plugin_app();
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.kv-del", 1))).await.status(),
+            upload(&app, plugin_archive(&plugin_manifest("com.example.kv-del", 2))).await.status(),
             StatusCode::OK
         );
         let id = app.db.list_plugins().unwrap()[0].id;
@@ -1073,7 +1209,7 @@ mod tests {
         let app = plugin_app();
         for plugin_id in ["com.example.alpha", "com.example.beta"] {
             assert_eq!(
-                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 1))).await.status(),
+                upload(&app, plugin_archive(&plugin_manifest(plugin_id, 2))).await.status(),
                 StatusCode::OK
             );
         }
@@ -1090,7 +1226,7 @@ mod tests {
         assert_eq!(entries.len(), 2, "alpha 测试了两次:{log}");
         assert!(entries.iter().all(|e| e["plugin_id"] == "com.example.alpha"), "{log}");
         assert!(
-            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "expiry_soon"),
+            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "plugin_expiry_soon"),
             "{log}"
         );
         // 快照新 → 旧:最新一条在头部(两次测试可能落在同一秒,只比先后)。
@@ -1124,7 +1260,7 @@ mod tests {
                 "com.example.backup",
                 "Test Plugin",
                 "1.0.0",
-                &plugin_manifest("com.example.backup", 1),
+                &plugin_manifest("com.example.backup", 2),
                 &wasm,
                 "sha",
             )
@@ -1151,7 +1287,7 @@ mod tests {
                 "com.example.after",
                 "Test Plugin",
                 "1.0.0",
-                &plugin_manifest("com.example.after", 1),
+                &plugin_manifest("com.example.after", 2),
                 &wasm,
                 "sha",
             )
@@ -1179,5 +1315,108 @@ mod tests {
             app.db.enabled_plugins().unwrap().into_iter().map(|r| r.plugin_id).collect();
         assert_eq!(enabled, vec!["com.example.backup".to_owned()]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- 页面协议(U5) ----
+
+    /// 声明 page 的插件:render_page 与 on_action 各自经 host_resp_alloc
+    /// 拿缓冲、写入一段 JSON、返回长度。
+    const PAGE_WAT: &str = r#"
+(module
+  (import "host" "resp_alloc" (func $alloc (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{\"title\":\"Finance\"}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0))
+  (func (export "on_action") (param i32 i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (call $alloc (i32.const 64)))
+    (memory.copy (local.get $ptr) (i32.const 1024) (i32.const 19))
+    (i32.const 19))
+  (func (export "render_page") (param i32 i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (call $alloc (i32.const 64)))
+    (memory.copy (local.get $ptr) (i32.const 1024) (i32.const 19))
+    (i32.const 19)))"#;
+
+    const PAGE_MANIFEST: &str = r#"
+plugin_id = "com.example.paged"
+name = "Paged"
+version = "1.0.0"
+abi_version = 2
+subscribes = []
+
+[page]
+title = "Finance"
+"#;
+
+    fn page_archive() -> Vec<u8> {
+        tarball(&[
+            ("plugin.toml", PAGE_MANIFEST.as_bytes().to_vec()),
+            ("plugin.wasm", wat::parse_str(PAGE_WAT).unwrap()),
+        ])
+    }
+
+    /// 声明 page 的插件:上传、启用后 GET page 返回插件渲染的 JSON 描述;
+    /// 未声明 page 的插件 404。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_plugin_renders_and_others_404() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, page_archive()).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        // 未启用:报 400「插件未启用」而不是 404「没声明页面」——面板按存储的
+        // manifest 显示「页面」按钮,运维该去启用插件,而不是去改 manifest。
+        assert_eq!(
+            render_plugin_page(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        let resp = render_plugin_page(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_of(resp).await;
+        assert_eq!(body["title"], "Finance", "插件渲染的页面描述透传给前端");
+
+        // action 回环:把 body 交给 on_action,返回它写的 JSON。
+        let resp = plugin_page_action(
+            Admin,
+            State(app.clone()),
+            Path(id),
+            axum::body::Bytes::from_static(b"{\"action\":\"x\"}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_of(resp).await["title"], "Finance");
+
+        // 未声明 page 的插件:启用后仍是 404(声明缺失),与「未启用」的 400 区分。
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.nopage", 2))).await.status(),
+            StatusCode::OK
+        );
+        let plain =
+            app.db.list_plugins().unwrap().iter().find(|p| p.plugin_id == "com.example.nopage").unwrap().id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(plain)).await.status(), StatusCode::OK);
+        assert_eq!(
+            render_plugin_page(Admin, State(app.clone()), Path(plain)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// 未声明 cleanup 的插件,清理端点 404(KTD11)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_404s_without_the_declaration() {
+        let app = plugin_app();
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.noclean", 2))).await.status(),
+            StatusCode::OK
+        );
+        let id = app.db.list_plugins().unwrap()[0].id;
+        // 未启用 → 400「未启用」;启用后没声明 cleanup → 404「没声明清理能力」。
+        // 两者是不同的恢复动作,不能混成一个码。
+        assert_eq!(
+            plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        assert_eq!(plugin_cleanup(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { Eye, EyeOff, KeyRound, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
+import { Eye, EyeOff, KeyRound, LayoutDashboard, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -11,7 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
-  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, listPluginKv, listPlugins, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
+  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
   type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 
@@ -20,9 +20,10 @@ import { ConfirmDialog } from "./ConfirmDialog"
 // ---- 插件（U7）：上传、列表、启停删、测试、日志与 kv ----
 
 // 事件类型的徽标配色：与状态页的状态色同义——离线红、上线绿、到期橙。
-// key 是 ABI 的事件名，label 是日志筛选复选框上的人话。
+// key 是 ABI 的事件名，label 是日志筛选复选框上的人话。v2 起宿主自身的到期
+// 检测退役，到期提醒由财务插件经 emit_event 发出，事件名带 plugin_ 前缀。
 const EVENT_BADGES: Record<string, { label: string; className: string }> = {
-  expiry_soon: { label: "到期提醒", className: "bg-orange-500/15 text-orange-700 dark:text-orange-400" },
+  plugin_expiry_soon: { label: "到期提醒", className: "bg-orange-500/15 text-orange-700 dark:text-orange-400" },
   agent_offline: { label: "离线告警", className: "bg-red-500/15 text-red-700 dark:text-red-400" },
   agent_online: { label: "上线恢复", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
 }
@@ -266,8 +267,8 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
               <span className="tnum min-w-40 text-muted-foreground">
                 {new Date(entry.at * 1000).toLocaleString()}
               </span>
-              <Badge className={`font-normal ${EVENT_BADGES[entry.event_type]?.className ?? ""}`}>
-                {entry.event_type}
+              <Badge className={`font-normal ${EVENT_BADGES[entry.event_type]?.className ?? ""}`} title={entry.event_type}>
+                {EVENT_BADGES[entry.event_type]?.label ?? entry.event_type}
               </Badge>
               <span className="tnum text-xs text-muted-foreground">{entry.elapsed_ms} ms</span>
               <span className="flex-1" />
@@ -286,11 +287,12 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   )
 }
 
-export function Plugins() {
+export function Plugins({ go }: { go: (to: string) => void }) {
   const [plugins, setPlugins] = useState<Plugin[] | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
   const [testing, setTesting] = useState<number | null>(null)
+  const [cleaning, setCleaning] = useState<number | null>(null)
   const [deleting, setDeleting] = useState<Plugin | null>(null)
   const [removing, setRemoving] = useState(false)
   const [kvFor, setKvFor] = useState<Plugin | null>(null)
@@ -357,6 +359,21 @@ export function Plugins() {
     }
   }
 
+  // 统一清理入口（U9/KTD11）：宿主只转发调用，清理逻辑在插件自己手里。
+  async function clean(plugin: Plugin) {
+    setCleaning(plugin.id)
+    try {
+      const r = await pluginCleanup(plugin.id)
+      toast.success(`${plugin.name} 清理完成`, {
+        description: `回收 ${r.freed_bytes.toLocaleString()} 字节 · 清理 ${r.pruned} 条`,
+      })
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setCleaning(null)
+    }
+  }
+
   async function remove() {
     if (!deleting) return
     setRemoving(true)
@@ -388,7 +405,7 @@ export function Plugins() {
           <Input
             ref={fileInput}
             type="file"
-            accept=".tar.gz,.tgz"
+            accept=".gz,.tgz,application/gzip"
             className="w-auto max-w-sm"
             disabled={uploading}
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
@@ -428,22 +445,41 @@ export function Plugins() {
                   <div className="flex flex-wrap gap-1">
                     {p.subscribes.map((event) => (
                       <Badge key={event} className={`font-normal ${EVENT_BADGES[event]?.className ?? ""}`}>
-                        {event}
+                        {EVENT_BADGES[event]?.label ?? event}
                       </Badge>
                     ))}
                     {p.subscribes.length === 0 && <span className="text-sm text-muted-foreground">—</span>}
                   </div>
                 </TableCell>
-                <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="sm" disabled={testing === p.id} onClick={() => test(p)}>
-                    {testing === p.id ? "测试中…" : "测试"}
-                  </Button>
-                  <Button variant="ghost" size="sm" onClick={() => setKvFor(p)} title="编辑渠道配置">
-                    <KeyRound className="size-4" /> 配置
-                  </Button>
-                  <Button variant="ghost" size="icon" onClick={() => setDeleting(p)} title="删除插件" aria-label="删除插件">
-                    <Trash2 className="text-destructive" />
-                  </Button>
+                <TableCell className="whitespace-nowrap">
+                  <div className="flex items-center justify-end gap-1">
+                    {p.page && (
+                      <Button variant="ghost" size="sm" onClick={() => go(`/admin/plugins/${p.id}`)} title="打开插件页面">
+                        <LayoutDashboard className="size-4" /> 页面
+                      </Button>
+                    )}
+                    <Button variant="ghost" size="sm" disabled={testing === p.id} onClick={() => test(p)}>
+                      {testing === p.id ? "测试中…" : "测试"}
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => setKvFor(p)} title="编辑渠道配置">
+                      <KeyRound className="size-4" /> 配置
+                    </Button>
+                    {p.cleanup && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={cleaning === p.id}
+                        onClick={() => clean(p)}
+                        title="清理该插件的过期数据"
+                      >
+                        <RefreshCw className={cleaning === p.id ? "size-4 animate-spin" : "size-4"} />
+                        {cleaning === p.id ? "清理中…" : "清理"}
+                      </Button>
+                    )}
+                    <Button variant="ghost" size="icon-sm" onClick={() => setDeleting(p)} title="删除插件" aria-label="删除插件">
+                      <Trash2 className="text-destructive" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}

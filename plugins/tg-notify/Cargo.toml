@@ -6,10 +6,10 @@
 
 [package]
 name = "tg-notify"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Telegram 通知示例插件（monitor-hub wasm 插件 ABI v1）"
+description = "Telegram 通知示例插件（monitor-hub wasm 插件 ABI v2）"
 publish = false
 
 [lib]

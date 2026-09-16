@@ -1,0 +1,39 @@
+# finance-stats —— monitor-hub 的财务统计插件（wasm 插件 ABI v2）。
+#
+# 独立 crate：仓库根的 Cargo.toml 是 monitor-hub 的 package，没有 [workspace]，
+# 因此本目录天然不在 hub 的编译范围里，`cargo build` / `cargo test` 互不影响。
+# 目标只有 wasm32-unknown-unknown，产物是 cdylib（一个 .wasm 文件）。
+
+[package]
+name = "finance-stats"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "财务统计插件（monitor-hub wasm 插件 ABI v2）"
+publish = false
+
+[lib]
+# cdylib：cargo build 产出 target/<triple>/release/finance_stats.wasm。
+crate-type = ["cdylib"]
+name = "finance_stats"
+
+[dependencies]
+# 事件 / 页面描述 / 插件数据的 JSON 都用 serde。wasm32-unknown-unknown 上
+# std 可用（只是没有网络/时间等系统调用，那些全经宿主函数），照常工作。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 到期日的整周期滚动（把过期日按 billing_cycle 推到未来）用 chrono 的
+# NaiveDate / Months。时间来源是 host_now()，chrono 只做日期算术，不碰系统时钟。
+chrono = { version = "0.4", default-features = false, features = ["alloc", "std"] }
+
+[dev-dependencies]
+# 冒烟测试（tests/smoke.rs）用 wasmtime 复刻宿主函数面，把编译出的真实 wasm
+# 加载起来驱动。features 与 hub（src/plugin/host.rs）保持同一最小集合。
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+
+[profile.release]
+# 面向体积优化：wasm 越小，上传与加载越快。
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

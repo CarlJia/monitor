@@ -1,7 +1,7 @@
 //! 插件与通知日志的数据访问,自 db.rs 拆出。SCHEMA、迁移与备份仍归
-//! db.rs 所有;这里只有读写 `plugin` 与 `notification_log` 两张表的方法,
-//! 以第二个 `impl Db` 块挂在同一个类型上。`PluginRow` 与
-//! `parse_expiry_thresholds` 经 db.rs 的 `pub use` 对外保持原路径可见。
+//! db.rs 所有;这里只有读写 `plugin`、`plugin_data` 与 `notification_log`
+//! 三张表的方法,以第二个 `impl Db` 块挂在同一个类型上。`PluginRow`
+//! 经 db.rs 的 `pub use` 对外保持原路径可见。
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -179,10 +179,10 @@ impl Db {
         Ok(())
     }
 
-    /// 删除插件的行与它的全部 kv 行,一条事务里两条 DELETE。此前是两次
-    /// 独立调用:行删成功、kv 清理失败时调用方拿到 500,而重试在 api 的
-    /// plugin_or_404 门上变成 404,kv 孤儿从此永久留在 setting 表里。行删
-    /// 失败(行已不在)整体回滚并报错,与 [`Db::delete_plugin`] 一致。
+    /// 删除插件的行、它的全部 kv 行与 plugin_data 行,一条事务里三条 DELETE。
+    /// 此前是两次独立调用:行删成功、kv 清理失败时调用方拿到 500,而重试在
+    /// api 的 plugin_or_404 门上变成 404,kv 孤儿从此永久留在 setting 表里。
+    /// 行删失败(行已不在)整体回滚并报错,与 [`Db::delete_plugin`] 一致。
     /// kv 的模式与转义理由见 [`Db::plugin_kv`]。
     pub fn delete_plugin_with_kv(&self, id: i64, plugin_id: &str) -> Result<()> {
         let mut conn = self.conn();
@@ -195,6 +195,7 @@ impl Db {
             "DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'",
             [format!("plugin.{}:%", like_escaped(plugin_id))],
         )?;
+        tx.execute("DELETE FROM plugin_data WHERE plugin_id=?1", [plugin_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -227,6 +228,134 @@ impl Db {
         let pattern = format!("plugin.{}:%", like_escaped(plugin_id));
         let gone = self.conn().execute("DELETE FROM setting WHERE key LIKE ?1 ESCAPE '\\'", [pattern])?;
         Ok(gone)
+    }
+
+    // ---- plugin_data(U2/KTD3)----
+    //
+    // 通用插件数据存储:插件对自己命名空间的记录集有完整 CRUD。所有方法按
+    // (plugin_id, record_key) 精确寻址,插件 A 无法触及插件 B 的行(R2)。
+    // 记录值上限与单插件总配额在宿主函数层检查(host.rs),这里只做数据访问。
+
+    /// 插入或覆盖一行记录(upsert)。返回是否新建(而非覆盖)。
+    pub fn plugin_data_put(&self, plugin_id: &str, key: &str, data: &str) -> Result<bool> {
+        let existed = self.conn().query_row(
+            "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+            params![plugin_id, key],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        self.conn().execute(
+            "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
+            params![plugin_id, key, data, Utc::now().timestamp()],
+        )?;
+        Ok(!existed)
+    }
+
+    /// 读一行记录,不存在返回 None。
+    pub fn plugin_data_get(&self, plugin_id: &str, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT data FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                params![plugin_id, key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// 删除一行记录。返回是否确实删了一行。
+    pub fn plugin_data_delete(&self, plugin_id: &str, key: &str) -> Result<bool> {
+        let gone = self.conn().execute(
+            "DELETE FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+            params![plugin_id, key],
+        )?;
+        Ok(gone > 0)
+    }
+
+    /// 一个插件按前缀匹配的全部记录,按 key 排序。空前缀列出全部。
+    pub fn plugin_data_list(&self, plugin_id: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let pattern = format!("{}%", like_escaped(prefix));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT record_key, data FROM plugin_data
+             WHERE plugin_id=?1 AND record_key LIKE ?2 ESCAPE '\\' ORDER BY record_key",
+        )?;
+        let rows = stmt.query_map(params![plugin_id, pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 一个插件的记录数与总**字节**数(面板空间占用展示用,R11)。
+    ///
+    /// `LENGTH(CAST(data AS BLOB))` 而不是 `LENGTH(data)`:`length()` 对 TEXT
+    /// 返回**字符**数,与 Rust 侧按字节的 `str::len()` 混算会让 CJK 内容少算
+    /// 约 3 倍,配额与占用展示一起失真。
+    pub fn plugin_data_usage(&self, plugin_id: &str) -> Result<(i64, i64)> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
+            params![plugin_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?)
+    }
+
+    /// 写一行并**在同一条事务里**强制单插件总字节配额。检查与写入分开做时,
+    /// 同一插件的两次并发写会各自读到同一份旧用量、各自判定通过,合起来越过
+    /// 上限——而配额正是用来限制磁盘占用的。`BEGIN IMMEDIATE` 立刻取写锁,
+    /// 两个并发写不会都通过检查。
+    ///
+    /// 返回 `Ok(None)` 表示超配额且未写入;`Ok(Some(created))` 表示已写入
+    /// (`created` 为 true 时是新建而非覆盖)。
+    pub fn plugin_data_put_within_quota(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        data: &str,
+        max_bytes: i64,
+    ) -> Result<Option<bool>> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let attempted = (|| -> Result<Option<bool>> {
+            let used: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
+                params![plugin_id],
+                |r| r.get(0),
+            )?;
+            let existing: i64 = conn
+                .query_row(
+                    "SELECT LENGTH(CAST(data AS BLOB)) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                    params![plugin_id, key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            // 覆盖写要先扣掉被替换的旧值,否则反复覆盖同一行会把用量算高。
+            if used - existing + data.len() as i64 > max_bytes {
+                return Ok(None);
+            }
+            let existed = existing > 0
+                || conn.query_row(
+                    "SELECT COUNT(*) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                    params![plugin_id, key],
+                    |r| r.get::<_, i64>(0),
+                )? > 0;
+            conn.execute(
+                "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
+                params![plugin_id, key, data, Utc::now().timestamp()],
+            )?;
+            Ok(Some(!existed))
+        })();
+        match attempted {
+            Ok(v) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// 删除一行 setting。面板删除插件的单个 kv 行用;键名是调用方拼好的
@@ -353,7 +482,7 @@ impl Db {
 /// 转义一个要拼进 LIKE 模式的字符串:`%` 与 `_` 是通配符,`\` 是转义符本身。
 /// 配合 `ESCAPE '\'` 使用。plugin_id 允许 `_`(如 `com.example_tg`),不转义时
 /// `plugin.<id>:%` 会匹配到别的插件(`com.exampleXtg`)的 kv 行。
-fn like_escaped(s: &str) -> String {
+pub(crate) fn like_escaped(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
@@ -374,20 +503,6 @@ fn row_to_plugin(r: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRow> {
         last_error: r.get("last_error")?,
         uploaded_at: r.get("uploaded_at")?,
     })
-}
-
-/// 解析 `notification.expiry_thresholds` 的值:接受 JSON 数组字符串 `"[7,3,1]"`
-/// 与裸逗号分隔 `"7,3,1"` 两种写法,返回落在 1..=365 的合法项。空返回值表示
-/// 没有任何合法项——写侧(api 的 `valid_expiry_thresholds`)据此拒绝整个值,
-/// 读侧(main 的 `expiry_thresholds`)据此回退默认档,两侧的宽严由各自外层
-/// 决定,解析本身只有这一份。
-pub fn parse_expiry_thresholds(raw: &str) -> Vec<i64> {
-    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .filter_map(|t| t.trim().parse::<i64>().ok())
-        .filter(|&days| (1..=365).contains(&days))
-        .collect()
 }
 
 #[cfg(test)]

@@ -39,10 +39,6 @@ export type Node = {
   swap_total: number
   disk_total: number
   agent_version: string
-  price: number
-  currency: string
-  billing_cycle: string
-  expires_at: string | null
   traffic_limit: number
   traffic_mode: string
   traffic_reset_day: number
@@ -134,6 +130,12 @@ export type Plugin = {
   last_error: string | null
   uploaded_at: number
   subscribes: string[]
+  /** v2：插件声明的面板页面标题；未声明为 null。 */
+  page: string | null
+  /** v2：声明了每小时 tick。 */
+  tick: boolean
+  /** v2：声明了统一的清理入口。 */
+  cleanup: boolean
 }
 
 /** 派发日志的一条（R16）：内存环形缓冲的快照，重启后为空。 */
@@ -206,6 +208,50 @@ export const deletePluginKv = (id: number, key: string) =>
 
 /** 列出一个插件的全部 kv 行（R13）。 */
 export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)
+
+/** 插件面板页面的 JSON UI 描述（U5/KTD5）。前端按词汇表渲染。 */
+export type PluginBlock = {
+  type: string
+  title?: string
+  text?: string
+  kind?: string
+  label?: string
+  name?: string
+  value?: string
+  action?: string
+  options?: string[]
+  items?: { label: string; value: string }[]
+  columns?: string[]
+  /**
+   * 行的两种形态：table 块是单元格数组，form 块是字段对象。前端用首行形态
+   * 区分：数组→表格，对象→表单。
+   */
+  rows?: unknown[][] | Record<string, unknown>[]
+  /** form 块的字段名；编辑后按字段名与 block.action 提交。 */
+  fields?: string[]
+}
+
+export type PluginPage = { title?: string; blocks?: PluginBlock[] }
+
+/** /db 响应的插件空间汇总（U9/KTD11）。宿主只展示，清理由插件自己决定。 */
+export type PluginUsage = {
+  plugin_id: string
+  name: string
+  data_rows: number
+  data_bytes: number
+  kv_bytes: number
+}
+
+/** 取一个声明了 page 的插件的页面描述（U5）。 */
+export const pluginPage = (id: number) => api<PluginPage>(`/plugins/${id}/page`)
+
+/** 把一次页面交互交给插件处理（U5）。 */
+export const pluginAction = (id: number, body: unknown) =>
+  api<PluginPage>(`/plugins/${id}/action`, { method: "POST", body: JSON.stringify(body) })
+
+/** 调一个声明了 cleanup 的插件的清理入口（U9/KTD11）。 */
+export const pluginCleanup = (id: number) =>
+  api<{ freed_bytes: number; pruned: number }>(`/plugins/${id}/cleanup`, { method: "POST" })
 
 /**
  * 4 MiB: the only size a reverse proxy must pass, whatever the file behind it

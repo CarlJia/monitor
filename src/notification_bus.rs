@@ -9,65 +9,110 @@
 
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate, Utc};
-use serde::Serialize;
 
 use crate::App;
 
-/// The three event types v1 ships with. Field set is what a plugin needs to
+/// The event types the bus carries. Field set is what a plugin needs to
 /// render a notification a human can act on.
 ///
 /// Serialized with a `type` tag, so the payload handed to a plugin's
 /// `on_event` reads `{"type":"agent_offline","node_id":1,...}` -- a shape
 /// stable across plugin versions, since a WASM guest deserializes by field
 /// name and tolerates additions.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+///
+/// v2: plugins emit their own events through the `emit_event` host function
+/// as [`Event::Plugin`]; the name must start with `plugin_` (enforced host-side,
+/// KTD6). `plugin_expiry_soon` replaces the retired host-side `expiry_soon`
+/// and carries the same payload fields (`node_id`, `name`, `expires_at`,
+/// `days_left`, `threshold_days`).
+#[derive(Debug, Clone)]
 pub enum Event {
     AgentOffline { node_id: i64, name: String, observed_at: i64, last_seen_at: i64 },
     AgentOnline { node_id: i64, name: String, observed_at: i64 },
-    ExpirySoon { node_id: i64, name: String, expires_at: String, days_left: i64, threshold_days: i64 },
+    Plugin { name: String, payload: serde_json::Value },
+}
+
+/// 手工实现 Serialize(而非 derive 的内部标签枚举):宿主事件的 `type` 是
+/// 变体名,插件事件的 `type` 是插件自报的事件名——内部标签枚举的 tag 值
+/// 无法由数据驱动,所以 `Plugin` 变体在这里把 `name` 摊到 `type`、payload
+/// 摊到顶层,插件收到的形状与宿主事件一致:
+/// `{"type":"plugin_expiry_soon","node_id":7,...}`。
+impl serde::Serialize for Event {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Event::AgentOffline { node_id, name, observed_at, last_seen_at } => {
+                let mut m = s.serialize_map(Some(5))?;
+                m.serialize_entry("type", Self::AGENT_OFFLINE)?;
+                m.serialize_entry("node_id", node_id)?;
+                m.serialize_entry("name", name)?;
+                m.serialize_entry("observed_at", observed_at)?;
+                m.serialize_entry("last_seen_at", last_seen_at)?;
+                m.end()
+            }
+            Event::AgentOnline { node_id, name, observed_at } => {
+                let mut m = s.serialize_map(Some(4))?;
+                m.serialize_entry("type", Self::AGENT_ONLINE)?;
+                m.serialize_entry("node_id", node_id)?;
+                m.serialize_entry("name", name)?;
+                m.serialize_entry("observed_at", observed_at)?;
+                m.end()
+            }
+            Event::Plugin { name, payload } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("type", name)?;
+                if let serde_json::Value::Object(obj) = payload {
+                    for (k, v) in obj {
+                        // payload 里若带 `type`,事件名优先——插件不能靠它改写路由词。
+                        if k != "type" {
+                            m.serialize_entry(k, v)?;
+                        }
+                    }
+                }
+                m.end()
+            }
+        }
+    }
 }
 
 impl Event {
     /// 事件词表的单一来源:db 的状态行比较、manifest 校验与扫描循环都引用
-    /// 这组名字,散写字面量会让两处悄悄漂移。
+    /// 这组名字,散写字面量会让两处悄悄漂移。插件事件(`plugin_` 前缀)不在
+    /// 词表内——它们由各插件运行时发出,宿主无法预知全集。
     pub const AGENT_OFFLINE: &'static str = "agent_offline";
     pub const AGENT_ONLINE: &'static str = "agent_online";
-    pub const EXPIRY_SOON: &'static str = "expiry_soon";
-    /// v1 支持的全部事件名,manifest 的 `subscribes` 逐项对照。
-    pub const KNOWN: [&'static str; 3] = [Self::AGENT_OFFLINE, Self::AGENT_ONLINE, Self::EXPIRY_SOON];
+    /// v2 支持的全部宿主自身事件名,manifest 的 `subscribes` 逐项对照。
+    pub const KNOWN: [&'static str; 2] = [Self::AGENT_OFFLINE, Self::AGENT_ONLINE];
 
     /// The discriminator stored in `notification_log.event_type` and carried in
     /// the JSON `type` tag. A lifetime `&'static str` rather than a String:
     /// it is compared against database rows on every emission.
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &str {
         match self {
             Event::AgentOffline { .. } => Self::AGENT_OFFLINE,
             Event::AgentOnline { .. } => Self::AGENT_ONLINE,
-            Event::ExpirySoon { .. } => Self::EXPIRY_SOON,
+            Event::Plugin { name, .. } => name,
         }
     }
 
     pub fn node_id(&self) -> i64 {
         match self {
-            Event::AgentOffline { node_id, .. }
-            | Event::AgentOnline { node_id, .. }
-            | Event::ExpirySoon { node_id, .. } => *node_id,
+            Event::AgentOffline { node_id, .. } | Event::AgentOnline { node_id, .. } => *node_id,
+            Event::Plugin { payload, .. } => payload.get("node_id").and_then(|v| v.as_i64()).unwrap_or(0),
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Event::AgentOffline { name, .. }
-            | Event::AgentOnline { name, .. }
-            | Event::ExpirySoon { name, .. } => name,
+            Event::AgentOffline { name, .. } | Event::AgentOnline { name, .. } => name,
+            Event::Plugin { payload, .. } => payload.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
         }
     }
 
     /// The idempotency key stored in `notification_log.threshold_or_state_key`.
     ///
     /// State events return 0: they hold one mutable row per node, and the
-    /// row's identity is the node alone. `ExpirySoon` encodes
+    /// row's identity is the node alone. `ExpirySoon` used to encode
     /// `threshold_days * 1_000_000 + expires_at 的自公历纪元起的天数`
     /// (`NaiveDate::num_days_from_ce`): the tier keeps the thresholds from
     /// colliding with one another, and the expiry date makes the key specific
@@ -76,14 +121,37 @@ impl Event {
     /// the encoding needs no timezone choice -- it only has to differ per
     /// date, never be a wall-clock figure. An unparseable date contributes 0,
     /// which still keeps tiers distinct rather than collapsing them.
+    ///
+    /// v2: [`Event::Plugin`] reuses the same encoding for expiry-shaped
+    /// payloads (`threshold_days` + `expires_at`, both read from the payload).
+    /// A payload without those fields mixes in the event name's hash so two
+    /// plugin events with different names don't collide on the same row
+    /// (both fallback values would otherwise be 0 and the dedup would suppress
+    /// them as the same alert).
     pub fn threshold_or_state_key(&self) -> i64 {
         match self {
             Event::AgentOffline { .. } | Event::AgentOnline { .. } => 0,
-            Event::ExpirySoon { threshold_days, expires_at, .. } => {
-                let day = NaiveDate::parse_from_str(expires_at, "%Y-%m-%d")
+            Event::Plugin { payload, .. } => {
+                let threshold = payload.get("threshold_days").and_then(|v| v.as_i64()).unwrap_or(0);
+                let day = payload
+                    .get("expires_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
                     .map(|d| d.num_days_from_ce() as i64)
                     .unwrap_or(0);
-                threshold_days * 1_000_000 + day
+                let base = threshold * 1_000_000 + day;
+                if base == 0 {
+                    // 没有 `threshold_days`、也没有 `expires_at` 的插件事件:键会
+                    // 退化成一个常量,同一 (节点, 事件名) 的第二次发射被永久去重
+                    // ——但两次的 payload 可能完全不同。用 payload 的内容哈希补
+                    // 足身份:内容相同的重复仍按同一条处理,内容不同的各自派发。
+                    //
+                    // FNV-1a 而不是 `DefaultHasher`:后者算法未指定,跨 Rust 版本
+                    // 会变,而这个值要持久化进 notification_log,变了就会重发。
+                    fnv1a(payload.to_string().as_bytes()) as i64
+                } else {
+                    base
+                }
             }
         }
     }
@@ -94,6 +162,18 @@ impl Event {
     pub fn is_state_event(&self) -> bool {
         matches!(self, Event::AgentOffline { .. } | Event::AgentOnline { .. })
     }
+}
+
+/// FNV-1a(64 位)。用于给没有 `threshold_days`/`expires_at` 的插件事件算一个
+/// 稳定的内容键——`DefaultHasher` 的算法未指定,跨 Rust 版本会变,而这个值要
+/// 持久化进 `notification_log`,变了会把已抑制的告警重新发一遍。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Emits an event: deduplicate, record, then hand to the plugin registry.
@@ -139,12 +219,15 @@ mod tests {
     }
 
     fn expiry(node_id: i64, expires_at: &str, days_left: i64, threshold_days: i64) -> Event {
-        Event::ExpirySoon {
-            node_id,
-            name: "edge-1".into(),
-            expires_at: expires_at.into(),
-            days_left,
-            threshold_days,
+        Event::Plugin {
+            name: "plugin_expiry_soon".into(),
+            payload: serde_json::json!({
+                "node_id": node_id,
+                "name": "edge-1",
+                "expires_at": expires_at,
+                "days_left": days_left,
+                "threshold_days": threshold_days,
+            }),
         }
     }
 
@@ -163,7 +246,7 @@ mod tests {
         let key = event.threshold_or_state_key();
         emit(&app, &event).unwrap();
         emit(&app, &event).unwrap();
-        assert!(recorded(&app, 7, "expiry_soon", key), "the first emission records");
+        assert!(recorded(&app, 7, "plugin_expiry_soon", key), "the first emission records");
         assert_eq!(app.plugins.read().unwrap().dispatch_count(), 1, "the duplicate must not re-dispatch");
     }
 
@@ -178,7 +261,7 @@ mod tests {
         // The date rolled forward by a renewal: a new billing cycle's key.
         let renewed = expiry(7, "2026-11-01", 30, 7);
         emit(&app, &renewed).unwrap();
-        assert!(recorded(&app, 7, "expiry_soon", renewed.threshold_or_state_key()));
+        assert!(recorded(&app, 7, "plugin_expiry_soon", renewed.threshold_or_state_key()));
         assert_eq!(app.plugins.read().unwrap().dispatch_count(), 2);
     }
 
@@ -236,16 +319,26 @@ mod tests {
     /// shape is a breaking plugin change.
     #[test]
     fn the_json_payload_carries_a_type_tag() {
-        let event = Event::ExpirySoon {
-            node_id: 7,
-            name: "edge-1".into(),
-            expires_at: "2026-10-01".into(),
-            days_left: 7,
-            threshold_days: 7,
+        let event = Event::Plugin {
+            name: "plugin_expiry_soon".into(),
+            payload: serde_json::json!({
+                "node_id": 7,
+                "name": "edge-1",
+                "expires_at": "2026-10-01",
+                "days_left": 7,
+                "threshold_days": 7,
+            }),
         };
         assert_eq!(
-            serde_json::to_string(&event).unwrap(),
-            r#"{"type":"expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}"#
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "type": "plugin_expiry_soon",
+                "node_id": 7,
+                "name": "edge-1",
+                "expires_at": "2026-10-01",
+                "days_left": 7,
+                "threshold_days": 7,
+            })
         );
         let event =
             Event::AgentOffline { node_id: 5, name: "edge-1".into(), observed_at: 100, last_seen_at: 90 };

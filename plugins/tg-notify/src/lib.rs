@@ -1,19 +1,21 @@
-//! tg-notify —— Telegram 通知示例插件（R17），monitor-hub wasm 插件 ABI v1 的
-//! 参考实现。ABI 的权威定义见仓库 `src/plugin.rs` 顶部的模块文档。
+//! tg-notify —— Telegram 通知示例插件，monitor-hub wasm 插件 ABI v2 的
+//! 参考实现。ABI 的权威定义见仓库 `src/plugin/` 顶部的模块文档。
 //!
 //! 一个插件要做的全部事情：
 //!
-//! 1. 从 `"host"` 模块导入 6 个宿主函数（log / now / kv_get / kv_set /
-//!    resp_alloc / http_post）；
-//! 2. 导出 `memory`、`__alloc`、`on_event`；
+//! 1. 从 `"host"` 模块导入宿主函数（log / now / kv_get / kv_set /
+//!    resp_alloc / http_post；v2 另有 http_get / nodes_query /
+//!    emit_event / data_put / data_get / data_delete / data_list）；
+//! 2. 导出 `memory`、`__alloc`、`on_event`（声明 tick/page/cleanup 时另有
+//!    对应导出——本插件都不声明）；
 //! 3. 在 `on_event(ptr, len)` 里解析事件 JSON，读自己的 kv 配置，发一次
 //!    https POST，返回 0 表示成功。
 //!
-//! 本插件订阅 v1 的全部三种事件，把通知渲染成中文文案发到 Telegram 的
-//! `sendMessage`。渠道配置（bot_token / chat_id）由面板的 kv 编辑器写入，
-//! 运行时经 `host_kv_get` 读取——插件的 kv 命名空间是
-//! `plugin.<plugin_id>:<key>`，`<plugin_id>` 取自 plugin.toml，key 里只要写
-//! `bot_token` / `chat_id`。
+//! 本插件订阅宿主的离线/在线事件与财务插件发出的 `plugin_expiry_soon`，
+//! 把通知渲染成中文文案发到 Telegram 的 `sendMessage`。渠道配置（bot_token
+//! / chat_id）由面板的 kv 编辑器写入，运行时经 `host_kv_get` 读取——插件的
+//! kv 命名空间是 `plugin.<plugin_id>:<key>`，`<plugin_id>` 取自 plugin.toml，
+//! key 里只要写 `bot_token` / `chat_id`。
 //!
 //! # on_event 的返回码
 //!
@@ -48,8 +50,14 @@ extern "C" {
     /// -5 非 2xx）。
     #[link_name = "http_post"]
     fn host_http_post(
-        method_ptr: i32, method_len: i32, url_ptr: i32, url_len: i32, body_ptr: i32,
-        body_len: i32, resp_ptr: i32, resp_cap: i32,
+        method_ptr: i32,
+        method_len: i32,
+        url_ptr: i32,
+        url_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+        resp_ptr: i32,
+        resp_cap: i32,
     ) -> i32;
     /// 读 kv：返回写入 out 的字节数，0 = 无值，-1 = 越界/非法 UTF-8。
     #[link_name = "kv_get"]
@@ -118,14 +126,17 @@ fn read_payload(ptr: i32, len: i32) -> Option<&'static [u8]> {
 // 事件载荷
 // ---------------------------------------------------------------------------
 
-/// v1 的事件词表，与 hub 的 `notification_bus::Event` 字段一致（按字段名反序列
-/// 化，新增字段被自动忽略，旧插件不会因为词表扩展而坏掉）。字段集故意照抄
-/// 全量——一个插件只读自己要用的字段，其余允许闲置。
+/// v2 的事件词表，与 hub 的 `notification_bus::Event` 序列化形状一致（按字段名
+/// 反序列化，新增字段被自动忽略，旧插件不会因为词表扩展而坏掉）。v2 起宿主
+/// 自身的到期检测退役，到期通知改由财务插件经 `emit_event` 发出，事件名带
+/// `plugin_` 前缀——这里用 `rename` 把它映到带标签的变体上。
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 enum Event {
-    ExpirySoon {
+    /// 财务插件发出的到期提醒（原宿主的 expiry_soon，字段未变）。
+    #[serde(rename = "plugin_expiry_soon")]
+    PluginExpirySoon {
         node_id: i64,
         name: String,
         expires_at: String,
@@ -148,7 +159,7 @@ enum Event {
 /// 按事件类型渲染中文通知文案。
 fn render(event: &Event) -> String {
     match event {
-        Event::ExpirySoon { name, expires_at, days_left, .. } => {
+        Event::PluginExpirySoon { name, expires_at, days_left, .. } => {
             format!("⏰ 节点 {name} 将于 {expires_at} 到期（剩 {days_left} 天）")
         }
         Event::AgentOffline { name, last_seen_at, .. } => {
@@ -232,12 +243,12 @@ pub extern "C" fn on_event(ptr: i32, len: i32) -> i32 {
     const RESP_CAP: i32 = 4096;
     let resp_ptr = __alloc(RESP_CAP);
 
-    // 4) 发送。返回负数是宿主错误码：10 - code 落在 11..=15，与其它错误码错开。
+    // 4) 发送。返回负数是宿主错误码：10 - code 落在 11..=19，与其它错误码错开。
     let n = unsafe {
         host_http_post(method_ptr, method_len, url_ptr, url_len, body_ptr, body_len, resp_ptr, RESP_CAP)
     };
     if n < 0 {
-        log(3, &format!("tg-notify: sendMessage 失败，宿主错误码 {n}（-1 越界 -2 非 https -3 非 POST -4 网络 -5 非 2xx）"));
+        log(3, &format!("tg-notify: sendMessage 失败，宿主错误码 {n}（-1 越界 -2 非 https -3 非 POST -4 网络 -5 非 2xx -9 私有地址被拒）"));
         return 10 - n;
     }
     0

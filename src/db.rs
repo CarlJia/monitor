@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub use crate::db_plugins::{parse_expiry_thresholds, PluginRow};
+pub use crate::db_plugins::PluginRow;
 
 pub struct Db(Mutex<Connection>);
 
@@ -48,10 +48,6 @@ CREATE TABLE IF NOT EXISTS node (
   token         TEXT    NOT NULL UNIQUE,
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
-  price         REAL    NOT NULL DEFAULT 0,
-  currency      TEXT    NOT NULL DEFAULT 'USD',
-  billing_cycle TEXT    NOT NULL DEFAULT 'monthly',
-  expires_at    TEXT,
   remark        TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
@@ -154,12 +150,36 @@ CREATE TABLE IF NOT EXISTS notification_log (
   detail TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (node_id, event_type, threshold_or_state_key)
 );
+
+-- 通用插件数据存储(U2/KTD3):插件对自己命名空间的记录集有完整 CRUD。
+-- 不复用 setting 的 KV(值上限 8 KiB、无结构):插件数据是记录集,`data`
+-- 存 JSON。物理隔离在 (plugin_id, record_key) 主键上——宿主函数按调用方
+-- plugin_id 寻址,一个插件够不到另一个的行(R2)。
+CREATE TABLE IF NOT EXISTS plugin_data (
+  plugin_id  TEXT    NOT NULL,
+  record_key TEXT    NOT NULL,
+  data       TEXT    NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (plugin_id, record_key)
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
+
+/// 两段式删列迁移(GATED_VERSION)未完成时停留的版本号。写成一个**绝对**的
+/// 常量而不是 `SCHEMA_VERSION - 1`:后者会随下一次升版一起漂走,把「v6 迁移
+/// 没跑过」的库盖成一个它其实没到过的版本。
+const GATED_VERSION: i64 = 5;
+
+/// node 表退役的四列(U7)。删列迁移的清单与完成判据都引用它,不散写。
+const RETIRED_NODE_COLUMNS: [&str; 4] = ["price", "currency", "billing_cycle", "expires_at"];
+
+/// 财务插件的 plugin_id。删列闸门只认它写下的 `node:` 记录——闸门读的是该
+/// 插件的私有 key 布局,不能因为别的插件恰好用了同一前缀就打开。
+const FINANCE_PLUGIN_ID: &str = "io.github.monitor.finance-stats";
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -291,6 +311,72 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v5(U2/KTD3)新增 `plugin_data` 表:通用插件数据存储。与 v4 同一模式——
+/// `Db::open` 的 SCHEMA 批已建好,备份候选走裸连接迁移故这里显式建。DDL 必须
+/// 与 SCHEMA 的一致,漂移由 `check_backup` 的列比对捕获。
+fn migrate_to_5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_data (
+           plugin_id  TEXT    NOT NULL,
+           record_key TEXT    NOT NULL,
+           data       TEXT    NOT NULL DEFAULT '',
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (plugin_id, record_key)
+         );",
+    )?;
+    Ok(())
+}
+
+/// v6(U7/KTD10)删掉 node 表退役的财务四列。这四列自 ABI v2 起没有任何代码
+/// 读写——财务数据归财务插件的 `plugin_data`,唯一真源换了地方。
+///
+/// 删除是不可逆的,所以按 KTD10 两段式执行:只有当财务插件已经把节点导进
+/// 自己的存储之后才动手。导入未完成时保留列并返回 `false`,让 `migrate` 把
+/// 版本停在 [`GATED_VERSION`],下一次启动再试——「先换二进制、暂不装插件」
+/// 的部署因此只是列闲置,启用插件后的下一次启动自动完成删除。
+///
+/// 返回是否真的完成了删列(据此决定能否推进到 v6)。
+fn migrate_to_6(conn: &Connection) -> Result<bool> {
+    // 一个清单同时当「完成判据」与「待删清单」:两处各写一份会漂移——此前
+    // 只看 `price` 的判据,在「price 删掉了、其余还在」的半删状态下会误判成
+    // 已完成,剩下三列就永远留着。
+    let present = columns_of(conn, "node")?;
+    let retired: Vec<&str> = RETIRED_NODE_COLUMNS.iter().copied().filter(|c| present.contains(*c)).collect();
+    if retired.is_empty() {
+        return Ok(true); // 已经删过,或本就是一个不含这些列的新库。
+    }
+    // 闸门按 plugin_id 限定:它读的是某个插件的私有 key 布局,别的插件恰好
+    // 用了 `node:` 前缀不该有资格触发这次不可逆操作。
+    let imported: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM plugin_data WHERE plugin_id = ?1 AND record_key LIKE 'node:%'",
+        [FINANCE_PLUGIN_ID],
+        |r| r.get(0),
+    )?;
+    if imported == 0 {
+        return Ok(false); // 财务插件还没导入,保留列,下次启动再试。
+    }
+    // 旧值不会被迁移(插件读不到这四列),删除即永久丢失。删之前记一行,让
+    // 运维在日志里看到这次动了多少行非默认值,而不是无声无息。
+    let carried: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node
+          WHERE price <> 0 OR currency <> 'USD' OR billing_cycle <> 'monthly' OR expires_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if carried > 0 {
+        info!("schema v6: 删除 node 表退役财务列,{carried} 行带非默认值——不会被迁移,需在财务统计页面重录");
+    }
+    // 四条 ALTER 收在一个事务里:中途失败(磁盘满、SQLITE_BUSY)若留下半删
+    // 状态,下一次会被上面那个判据误当成已完成。SQLite 的 schema 变更可事务,
+    // 与 migrate_to_1 的整表重建同一手法。
+    conn.execute_batch("BEGIN")?;
+    for column in retired {
+        conn.execute_batch(&format!("ALTER TABLE node DROP COLUMN {column}"))?;
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(true)
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -310,12 +396,19 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 4 {
         migrate_to_4(conn)?;
     }
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    if from < 5 {
+        migrate_to_5(conn)?;
+    }
+    // v6 是条件迁移:财务列要等财务插件导入完才删。未完成时停在 GATED_VERSION
+    // ——若照样 stamp 成 6,这一步就永远不会重跑,列再也删不掉。
+    let at_six = if from < 6 { migrate_to_6(conn)? } else { true };
+    let stamped = if at_six { SCHEMA_VERSION } else { GATED_VERSION };
+    conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 10] = [
+const TABLES: [&str; 11] = [
     "setting",
     "node",
     "traffic",
@@ -326,9 +419,15 @@ const TABLES: [&str; 10] = [
     "session",
     "plugin",
     "notification_log",
+    "plugin_data",
 ];
 
 /// One node's stored configuration and last known facts.
+///
+/// v2 起财务字段(`price`/`currency`/`billing_cycle`/`expires_at`)从宿主
+/// 退役,迁入财务插件的 `plugin_data` 命名空间。旧库里的这四列由
+/// `migrate_to_6` 在财务插件导入完成后删除;插件读不到旧值,只按 node_id
+/// 建自己的空白记录,价格等需在插件页面重新录入。
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Node {
     #[serde(default)]
@@ -338,14 +437,6 @@ pub struct Node {
     pub public: bool,
     #[serde(default)]
     pub sort: i64,
-    #[serde(default)]
-    pub price: f64,
-    #[serde(default = "usd")]
-    pub currency: String,
-    #[serde(default = "monthly")]
-    pub billing_cycle: String,
-    #[serde(default)]
-    pub expires_at: Option<String>,
     #[serde(default)]
     pub remark: String,
     /// Monthly allowance in bytes; 0 means unmetered.
@@ -404,25 +495,16 @@ fn yes() -> bool {
     true
 }
 
-/// Omitted settings stay unchanged. An explicit null clears the expiry date.
+/// Omitted settings stay unchanged。
 #[derive(Deserialize, Default)]
 pub struct NodePatch {
     pub name: Option<String>,
     pub sort: Option<i64>,
     pub public: Option<bool>,
-    pub price: Option<f64>,
-    pub currency: Option<String>,
-    pub billing_cycle: Option<String>,
-    #[serde(default, deserialize_with = "expiry_patch")]
-    pub expires_at: Option<Option<String>>,
     pub remark: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
-}
-
-fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize, Default)]
@@ -431,12 +513,6 @@ pub struct TrafficPatch {
     pub total_tx: Option<i64>,
     pub month_rx: Option<i64>,
     pub month_tx: Option<i64>,
-}
-fn usd() -> String {
-    "USD".into()
-}
-fn monthly() -> String {
-    "monthly".into()
 }
 fn sum() -> String {
     "sum".into()
@@ -550,10 +626,18 @@ impl Db {
         let fresh = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get::<_, i64>(0))?
             == 0;
+        // 比本二进制新的库在动手之前就拒掉:老代码不认识新 schema,继续跑会在
+        // 未知的表结构上读写,还会把 user_version 盖回自己认识的数字。与
+        // `check_backup` 对上传文件的那道守卫同一句话、同一个理由。
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !fresh && version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "the database is from a newer hub (schema {version}, this one reads {SCHEMA_VERSION}); upgrade first"
+            );
+        }
         conn.execute_batch(SCHEMA)?;
         restrict(path);
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate(&conn, if fresh { SCHEMA_VERSION } else { version })?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -607,17 +691,13 @@ impl Db {
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO node (name, token, sort, public, remark, traffic_limit,
+                               traffic_mode, traffic_reset_day, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8)",
             params![
                 n.name,
                 token,
                 n.public,
-                n.price,
-                n.currency,
-                n.billing_cycle,
-                n.expires_at,
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
@@ -647,34 +727,21 @@ impl Db {
     pub fn update_node(&self, id: i64, n: &NodePatch) -> Result<()> {
         self.conn().execute(
             "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
-                             price=COALESCE(?5,price), currency=COALESCE(?6,currency),
-                             billing_cycle=COALESCE(?7,billing_cycle),
-                             expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
-                             remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
-                             traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
+                             remark=COALESCE(?5,remark), traffic_limit=COALESCE(?6,traffic_limit),
+                             traffic_mode=COALESCE(?7,traffic_mode),
+                             traffic_reset_day=COALESCE(?8,traffic_reset_day)
              WHERE id=?1",
             params![
                 id,
                 n.name,
                 n.sort,
                 n.public,
-                n.price,
-                n.currency,
-                n.billing_cycle,
-                n.expires_at.is_some(),
-                n.expires_at.as_ref().and_then(|v| v.as_deref()),
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day
             ],
         )?;
-        Ok(())
-    }
-
-    pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
-        self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
         Ok(())
     }
 
@@ -1402,6 +1469,36 @@ impl Db {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
             rows.insert(table.to_owned(), serde_json::json!(n));
         }
+        // 插件空间占用(R11/KTD11):按插件汇总 plugin_data 的字节/行数,再加上
+        // 该插件的 kv 行(setting 表的 `plugin.<id>:%`)字节。宿主只展示,
+        // 清理交给插件自己的 cleanup 入口。查询直接走当前 conn——`plugin_data_usage`
+        // 会再取同一把 Mutex,在持锁期间调用会死锁。
+        let mut plugins = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT plugin_id, name FROM plugin ORDER BY plugin_id")?;
+            let listed = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (plugin_id, name) in listed {
+                let (data_rows, data_bytes) = conn.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
+                    params![plugin_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                )?;
+                let kv_bytes: i64 = conn.query_row(
+                    "SELECT COALESCE(SUM(LENGTH(key)+LENGTH(value)),0) FROM setting WHERE key LIKE ?1 ESCAPE '\\'",
+                    params![format!("plugin.{}:%", crate::db_plugins::like_escaped(&plugin_id))],
+                    |r| r.get(0),
+                )?;
+                plugins.push(serde_json::json!({
+                    "plugin_id": plugin_id,
+                    "name": name,
+                    "data_rows": data_rows,
+                    "data_bytes": data_bytes,
+                    "kv_bytes": kv_bytes,
+                }));
+            }
+        }
         Ok(serde_json::json!({
             "path": file,
             "size": bytes_of(&file),
@@ -1410,6 +1507,7 @@ impl Db {
             "oldest": oldest,
             "retention": retention,
             "rows": rows,
+            "plugins": plugins,
         }))
     }
 
@@ -1713,10 +1811,6 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         name: s("name"),
         public: r.get::<_, bool>("public").unwrap_or(true),
         sort: n("sort"),
-        price: r.get::<_, f64>("price").unwrap_or(0.0),
-        currency: s("currency"),
-        billing_cycle: s("billing_cycle"),
-        expires_at: r.get::<_, Option<String>>("expires_at").unwrap_or(None),
         remark: s("remark"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
@@ -1957,6 +2051,34 @@ mod tests {
         assert!(on_disk(&scratch.0) < fat);
         assert_eq!(db.stats().unwrap()["rows"]["metric"], 0);
         assert_eq!(db.nodes().unwrap().len(), 1, "vacuum keeps the rows that are left");
+    }
+
+    /// 插件空间占用(R11/KTD11):按插件汇总 plugin_data 的字节/行数,并计入
+    /// 该插件 kv 行的字节。
+    #[test]
+    fn stats_reports_per_plugin_usage() {
+        let db = db();
+        let row = db.create_plugin("com.example.big", "Big", "1", "{}", b"m", "sha").unwrap();
+        assert!(row.id > 0);
+        db.plugin_data_put("com.example.big", "node:1", &"x".repeat(100)).unwrap();
+        db.plugin_data_put("com.example.big", "node:2", &"y".repeat(50)).unwrap();
+        db.set("plugin.com.example.big:token", "secret").unwrap();
+
+        let stats = db.stats().unwrap();
+        let plugins = stats["plugins"].as_array().unwrap();
+        let entry = plugins.iter().find(|p| p["plugin_id"] == "com.example.big").unwrap();
+        assert_eq!(entry["data_rows"], 2);
+        assert_eq!(entry["data_bytes"], 150);
+        assert_eq!(
+            entry["kv_bytes"],
+            "plugin.com.example.big:token".len() + "secret".len(),
+            "kv 行按完整 key（含命名空间前缀）+value 计字节"
+        );
+
+        // 删除插件后占用随之消失。
+        db.delete_plugin_with_kv(row.id, "com.example.big").unwrap();
+        let after = db.stats().unwrap();
+        assert!(after["plugins"].as_array().unwrap().is_empty(), "删掉的插件不再出现在占用里");
     }
 
     fn node(db: &Db, reset_day: u32) -> i64 {
@@ -2349,20 +2471,15 @@ mod tests {
         let db = db();
         let id = node(&db, 1);
         let patch = |v| serde_json::from_value::<NodePatch>(v).unwrap();
-        db.update_node(
-            id,
-            &patch(serde_json::json!({"public":false,"remark":"private","expires_at":"2030-01-01"})),
-        )
-        .unwrap();
-        db.update_node(id, &patch(serde_json::json!({"price":20}))).unwrap();
+        // v2 起 financial 字段(`price`/`expires_at` 等)由财务插件持有(NodePatch
+        // 不再接受)。这里只覆盖宿主域的字段。注释:在曾经的 v1 测试中,这两次
+        // update_node 调用原本写 `{"price":20}` 与 `{"price":0,"expires_at":null}`,
+        // 触发 NodePatch 中现已删除的字段——U7 之后它们不再属于宿主 API。
+        db.update_node(id, &patch(serde_json::json!({"public":false,"remark":"private"}))).unwrap();
         let n = db.node(id).unwrap().unwrap();
         assert!(!n.public);
         assert_eq!(n.remark, "private");
-        assert_eq!(n.expires_at.as_deref(), Some("2030-01-01"));
-        db.update_node(id, &patch(serde_json::json!({"price":0,"expires_at":null}))).unwrap();
-        let n = db.node(id).unwrap().unwrap();
-        assert_eq!(n.price, 0.0);
-        assert_eq!(n.expires_at, None);
+        db.update_node(id, &patch(serde_json::json!({"public":true}))).unwrap();
 
         db.accumulate(id, "boot", Some((0, 0))).unwrap();
         db.accumulate(id, "boot", Some((120_000, 10_000))).unwrap();
@@ -2636,13 +2753,15 @@ mod tests {
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
     }
 
-    /// A fresh database carries the two tables this build expects, and the
-    /// backup gates rely on `TABLES` naming every one of them.
+    /// A fresh database carries the tables this build expects, and the
+    /// backup gates rely on `TABLES` naming every one of them. A fresh file
+    /// also never grows the retired financial columns: `SCHEMA` no longer
+    /// declares them.
     #[test]
-    fn a_fresh_database_is_on_schema_v4_with_the_new_tables() {
+    fn a_fresh_database_is_on_schema_v6_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         let table = |name: &str| {
             conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
                 r.get::<_, i64>(0)
@@ -2651,28 +2770,36 @@ mod tests {
         };
         assert_eq!(table("plugin"), 1);
         assert_eq!(table("notification_log"), 1);
+        assert_eq!(table("plugin_data"), 1);
+        let node_columns = columns_of(&conn, "node").unwrap();
+        for retired in ["price", "currency", "billing_cycle", "expires_at"] {
+            assert!(!node_columns.contains(retired), "新库不该带退役列 {retired}");
+        }
         drop(conn);
 
         assert!(TABLES.contains(&"plugin"));
         assert!(TABLES.contains(&"notification_log"));
+        assert!(TABLES.contains(&"plugin_data"));
     }
 
-    /// A database left at v3 by the previous build: opening it must stamp v4,
-    /// add both tables, and keep the rows it already held. Opening the result
-    /// again must not redo anything that cannot be redone.
+    /// A database left at v3 by the previous build: opening it must stamp the
+    /// current version, add the three new tables, and keep the rows it already
+    /// held. Opening the result again must not redo anything that cannot be
+    /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v4_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v6_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
 
-        // A hub at v3: this build's schema minus the two v4 tables, carrying a
-        // node that must survive the upgrade.
+        // A hub at v3: this build's schema minus the v4+v5 tables, carrying
+        // a node that must survive the upgrade.
         let old = Connection::open(path).unwrap();
         old.execute_batch(SCHEMA).unwrap();
         old.execute_batch(
             "DROP TABLE plugin;
              DROP TABLE notification_log;
+             DROP TABLE plugin_data;
              INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);
              PRAGMA user_version = 3;",
         )
@@ -2681,8 +2808,8 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
-        for table in ["plugin", "notification_log"] {
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -2695,40 +2822,138 @@ mod tests {
         drop(conn);
         assert_eq!(db.nodes().unwrap().len(), 1, "the node the v3 hub had survives");
 
-        // Reopening a v4 database is a no-op: the migration chain stops before
-        // v4 and the stamp is already in place.
+        // Reopening is a no-op: the migration chain stops before the stamp.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
         drop(again);
         let _ = std::fs::remove_file(&file);
     }
 
-    /// A backup taken by a v3 hub carries neither new table, and restore is
-    /// the one path that migrates a file `Db::open` never sees: `check_backup`
-    /// opens the upload on a bare connection. The migration must create the
-    /// v4 tables there, or every backup older than this build is refused.
+    /// A database stamped newer than this binary is refused before anything
+    /// touches it: an older hub would read and write tables it does not know,
+    /// and would stamp its own version over the newer one.
+    #[test]
+    fn opening_a_newer_database_is_refused() {
+        let file = std::env::temp_dir().join(format!("monitor-newer-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+        let newer = Connection::open(path).unwrap();
+        newer.execute_batch(SCHEMA).unwrap();
+        newer.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1)).unwrap();
+        drop(newer);
+
+        let err = match Db::open(path) {
+            Ok(_) => panic!("比本二进制新的库应当被拒"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("newer hub"), "应给出可操作的提示,实际:{err}");
+        // 文件停在原版本,没有被降级盖上本二进制的版本号。
+        let probe = Connection::open(path).unwrap();
+        let v: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "被拒的库不该被改写 user_version");
+        drop(probe);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The retired financial columns are dropped in two stages (KTD10): a
+    /// pre-v6 database that still carries them waits until the finance plugin
+    /// has imported its nodes into `plugin_data`, so an upgrade that swaps the
+    /// binary before installing the plugin keeps the columns rather than
+    /// dropping them out from under data the plugin has not read yet.
+    #[test]
+    fn retired_node_columns_drop_only_after_the_finance_plugin_imports() {
+        let file = std::env::temp_dir().join(format!("monitor-v5gate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        // A pre-v6 hub: current schema with the four columns bolted back on and
+        // no plugin data of any kind.
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        for column in [
+            "price REAL NOT NULL DEFAULT 0",
+            "currency TEXT NOT NULL DEFAULT 'USD'",
+            "billing_cycle TEXT NOT NULL DEFAULT 'monthly'",
+            "expires_at TEXT",
+        ] {
+            old.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []).unwrap();
+        }
+        old.execute_batch(
+            "INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1); PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(old);
+
+        // No import yet: the columns stay and the version does not advance.
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("price"), "导入完成前列还在");
+        db.plugin_data_put("com.example.other", "unrelated", "x").unwrap();
+        drop(db);
+
+        // A plugin_data row that is not a node import does not open the gate.
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("price"), "非 node: 记录不开闸");
+        // 别的插件用了同一个 `node:` 前缀也算不开闸:闸门读的是财务插件的私有
+        // key 布局,不能由第三方插件替它触发这次不可逆删列。
+        db.plugin_data_put("com.example.other", "node:1", "{}").unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert!(
+            columns_of(&db.conn(), "node").unwrap().contains("price"),
+            "别的插件的 node: 记录不开闸——闸门按 plugin_id 限定"
+        );
+        drop(db);
+
+        // The finance plugin imports: the next open drops the columns and lands
+        // on the current version, with the node row intact.
+        let db = Db::open(path).unwrap();
+        db.plugin_data_put("io.github.monitor.finance-stats", "node:1", "{\"price\":0}").unwrap();
+        drop(db);
+
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        let columns = columns_of(&db.conn(), "node").unwrap();
+        for retired in ["price", "currency", "billing_cycle", "expires_at"] {
+            assert!(!columns.contains(retired), "导入完成后 {retired} 应已删除");
+        }
+        assert_eq!(db.nodes().unwrap().len(), 1, "删列保住 node 行");
+        drop(db);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A backup taken by a v3 hub carries none of the newer tables, and restore
+    /// is the one path that migrates a file `Db::open` never sees:
+    /// `check_backup` opens the upload on a bare connection. The migration
+    /// must create the v4+v5 tables there, or every backup older than this
+    /// build is refused.
     #[test]
     fn a_v3_backup_survives_check_backup() {
         let scratch = Scratch::new();
         let live = Db::open(&scratch.0).unwrap();
         node(&live, 1);
 
-        // The upload: this build's schema minus the two v4 tables, stamped as
+        // The upload: this build's schema minus the v4+v5 tables, stamped as
         // a v3 hub would have left it.
         let old_path = format!("{}.copy", scratch.0);
         let old = Connection::open(&old_path).unwrap();
         old.execute_batch(SCHEMA).unwrap();
-        old.execute_batch("DROP TABLE plugin; DROP TABLE notification_log; PRAGMA user_version = 3;")
-            .unwrap();
+        old.execute_batch(
+            "DROP TABLE plugin; DROP TABLE notification_log; DROP TABLE plugin_data; PRAGMA user_version = 3;",
+        )
+        .unwrap();
         drop(old);
 
         // The candidate carries no foreign tables or rows, only the shape; it
-        // must pass every gate and come out with the v4 tables created.
+        // must pass every gate and come out with the newer tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
-        for table in ["plugin", "notification_log"] {
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = checked
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
