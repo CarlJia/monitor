@@ -413,23 +413,27 @@ fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
 
 /// 汇总：返回 (年化总成本, 剩余总价值) 在目标币种下的值；任一节点缺汇率
 /// 则该项跳过。fx 为 None 时返回 None（汇率不可用）。
-fn totals(fx: Option<&Fx>, today: NaiveDate) -> Option<(f64, f64)> {
+fn totals(fx: Option<&Fx>, today: NaiveDate) -> Option<((f64, f64), Vec<String>)> {
     let fx = fx?;
     let mut annual = 0.0;
     let mut remaining = 0.0;
+    // 任一节点缺汇率则该项跳过；列出被跳过的币种让面板提示用户。
+    let mut missing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (_, n) in all_nodes() {
         if let Some(c) = annual_cost(&n) {
-            if let Some(v) = convert(fx, c, &n.currency) {
-                annual += v;
+            match convert(fx, c, &n.currency) {
+                Some(v) => annual += v,
+                None => { missing.insert(n.currency.clone()); }
             }
         }
         if let Some(r) = remaining_value(&n, today) {
-            if let Some(v) = convert(fx, r, &n.currency) {
-                remaining += v;
+            match convert(fx, r, &n.currency) {
+                Some(v) => remaining += v,
+                None => { missing.insert(n.currency.clone()); }
             }
         }
     }
-    Some((annual, remaining))
+    Some(((annual, remaining), missing.into_iter().collect()))
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +539,7 @@ fn build_page() -> Value {
     // 汇总统计。
     let currency_label = target.clone();
     match totals(fx.as_ref(), today) {
-        Some((annual, remaining)) => {
+        Some(((annual, remaining), missing)) => {
             blocks.push(json!({
                 "type": "stat",
                 "items": [
@@ -543,6 +547,16 @@ fn build_page() -> Value {
                     {"label": format!("剩余总价值（{currency_label}）"), "value": format!("{remaining:.2}")},
                 ],
             }));
+            if !missing.is_empty() {
+                blocks.push(json!({
+                    "type": "notice",
+                    "kind": "warning",
+                    "text": format!(
+                        "部分节点币种未在 Frankfurter 汇率表中（{}），未计入汇总",
+                        missing.join("、")
+                    ),
+                }));
+            }
         }
         None => {}
     }

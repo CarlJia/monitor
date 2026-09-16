@@ -126,12 +126,14 @@ impl Event {
     ///
     /// v2: [`Event::Plugin`] reuses the same encoding for expiry-shaped
     /// payloads (`threshold_days` + `expires_at`, both read from the payload).
-    /// A payload without those fields falls back to 0 -- still a valid key,
-    /// one row per node per event name.
+    /// A payload without those fields mixes in the event name's hash so two
+    /// plugin events with different names don't collide on the same row
+    /// (both fallback values would otherwise be 0 and the dedup would suppress
+    /// them as the same alert).
     pub fn threshold_or_state_key(&self) -> i64 {
         match self {
             Event::AgentOffline { .. } | Event::AgentOnline { .. } => 0,
-            Event::Plugin { payload, .. } => {
+            Event::Plugin { name, payload } => {
                 let threshold = payload.get("threshold_days").and_then(|v| v.as_i64()).unwrap_or(0);
                 let day = payload
                     .get("expires_at")
@@ -139,7 +141,15 @@ impl Event {
                     .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
                     .map(|d| d.num_days_from_ce() as i64)
                     .unwrap_or(0);
-                threshold * 1_000_000 + day
+                let base = threshold * 1_000_000 + day;
+                if base == 0 {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    name.hash(&mut h);
+                    h.finish() as i64
+                } else {
+                    base
+                }
             }
         }
     }
