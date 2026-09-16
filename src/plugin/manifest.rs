@@ -1,9 +1,13 @@
 //! Manifest(R7)。
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::notification_bus::Event;
+
+use super::host::KV_KEY_MAX;
 
 /// 宿主与插件之间的 ABI 版本。宿主大版本升级时递增;不匹配的插件在加载时被拒。
 /// v2 起 ABI 只保留单一版本,不做 v1 兼容。
@@ -23,6 +27,25 @@ pub const PLUGIN_EVENT_PREFIX: &str = "plugin_";
 #[derive(Debug, Clone, Deserialize)]
 pub struct PageDecl {
     pub title: String,
+}
+
+/// manifest 的 `[[config]]` 声明:面板「配置」对话框要展示的一个 kv 字段。
+///
+/// 这是**面板的展示与预检依据,不是宿主对插件的契约**——真实派发从不检查它:
+/// 后台事件旁边没有操作员,一个 400 也无处可给。所以 `required` 的含义只是
+/// 「点『测试』前应该有值」;条件性才需要的字段(比如只有某种事件才用得上)留
+/// `required = false`,让操作员自己判断。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigDecl {
+    /// kv 的 key,即 `plugin.<plugin_id>:<key>` 的右半边。
+    pub key: String,
+    /// 面板上显示的人话名字;缺省就只显示 key。
+    pub label: Option<String>,
+    /// 「测试」前是否必须有值。
+    #[serde(default)]
+    pub required: bool,
+    /// 一句话说明该怎么填,面板显示在输入框下面。
+    pub hint: Option<String>,
 }
 
 /// plugin.toml。字段与校验规则见 [`Manifest::parse`]。
@@ -53,6 +76,10 @@ pub struct Manifest {
     /// 包内 wasm 入口文件名。上传 API(U5)按它从包里取模块;运行期不再使用。
     #[serde(default = "default_wasm_entry")]
     pub wasm_entry: String,
+    /// 面板「配置」对话框要展示的 kv 字段。见 [`ConfigDecl`]:只是面板的展示与
+    /// 测试前预检,不构成工作面、也不参与真实派发。
+    #[serde(default)]
+    pub config: Vec<ConfigDecl>,
 }
 
 fn default_wasm_entry() -> String {
@@ -87,8 +114,32 @@ impl Manifest {
                 bail!("manifest.page.title 不能为空");
             }
         }
+        // `[[config]]` 的 key 就是 kv 的 key,但宿主侧比面板的 kv 编辑器更严:
+        // 额外拒绝首尾空白。面板写入的是原样 key,带空白的那一行与声明永远对不上,
+        // 与其让「声明了却配不上」变成一个谜,不如在这里就挡住。
+        let mut seen_keys = HashSet::new();
+        for decl in &m.config {
+            if decl.key.trim().is_empty() {
+                bail!("manifest.config.key 不能为空");
+            }
+            if decl.key != decl.key.trim() {
+                bail!("manifest.config.key `{}` 首尾不能有空白:面板写入的是原样 key", decl.key);
+            }
+            if decl.key.contains(':') {
+                bail!("manifest.config.key 不能包含 ':'(它是 kv 命名空间的分隔符)");
+            }
+            if decl.key.len() > KV_KEY_MAX {
+                bail!("manifest.config.key `{}` 超过 {KV_KEY_MAX} 字节的上限", decl.key);
+            }
+            // 重复会让面板为同一行 kv 渲染两个输入框。
+            if !seen_keys.insert(decl.key.as_str()) {
+                bail!("manifest.config 里 key `{}` 重复", decl.key);
+            }
+        }
         if m.subscribes.is_empty() && !m.tick && m.page.is_none() && !m.cleanup {
-            bail!("manifest.subscribes 至少要订阅一个事件;不订阅事件的插件要声明 tick、page 或 cleanup 之一");
+            bail!(
+                "manifest.subscribes 至少要订阅一个事件;不订阅事件的插件要声明 tick、page 或 cleanup 之一(声明 [[config]] 不算工作面)"
+            );
         }
         for event in &m.subscribes {
             let known = KNOWN_EVENT_NAMES.contains(&event.as_str());
@@ -146,6 +197,42 @@ mod tests {
         assert!(err.contains("不兼容 v1"), "实际: {err}");
     }
 
+    /// `[[config]]` 的解析与校验:label/hint 可缺省、required 缺省为 false;
+    /// 不能落库的 key 形状(空、首尾空白、含 ':'、超长、重复)逐条挡住——这些
+    /// key 直接就是 kv 的 key,形状规则与面板的 kv 编辑器是同一套。
+    #[test]
+    fn config_declarations_are_parsed_and_validated() {
+        let with = |block: &str| format!("{MANIFEST}\n{block}");
+        let m = Manifest::parse(&with(
+            "[[config]]\nkey = \"bot_token\"\nlabel = \"Bot Token\"\nrequired = true\nhint = \"向 @BotFather 申请\"\n",
+        ))
+        .unwrap();
+        assert_eq!(m.config.len(), 1);
+        assert_eq!(m.config[0].key, "bot_token");
+        assert_eq!(m.config[0].label.as_deref(), Some("Bot Token"));
+        assert!(m.config[0].required);
+        assert_eq!(m.config[0].hint.as_deref(), Some("向 @BotFather 申请"));
+        // 只有 key 是必需的:label/hint 缺省为 None,required 缺省为 false。
+        let m = Manifest::parse(&with("[[config]]\nkey = \"chat_id\"\n")).unwrap();
+        assert_eq!(m.config[0].label, None);
+        assert_eq!(m.config[0].hint, None);
+        assert!(!m.config[0].required);
+        // 没有 [[config]] 的 manifest 得到空表(老插件不受影响)。
+        assert!(Manifest::parse(MANIFEST).unwrap().config.is_empty());
+
+        let over_long = format!("[[config]]\nkey = \"{}\"\n", "k".repeat(KV_KEY_MAX + 1));
+        for (block, needle) in [
+            ("[[config]]\nkey = \"\"\n", "不能为空"),
+            ("[[config]]\nkey = \" bot\"\n", "空白"),
+            ("[[config]]\nkey = \"a:b\"\n", "':'"),
+            (over_long.as_str(), "上限"),
+            ("[[config]]\nkey = \"t\"\n[[config]]\nkey = \"t\"\n", "重复"),
+        ] {
+            let err = Manifest::parse(&with(block)).unwrap_err().to_string();
+            assert!(err.contains(needle), "`{block}` 应报 `{needle}`,实际: {err}");
+        }
+    }
+
     #[test]
     fn plugin_event_names_are_accepted_by_prefix() {
         let m = Manifest::parse(&format!("{MANIFEST}\ntick = true\n")).unwrap();
@@ -168,6 +255,11 @@ mod tests {
         }
         let bare = "plugin_id = \"com.example.test\"\nname = \"t\"\nversion = \"1\"\nabi_version = 2\nsubscribes = []";
         let err = Manifest::parse(bare).unwrap_err().to_string();
+        assert!(err.contains("至少"), "实际: {err}");
+        // 声明 [[config]] 不算工作面:它只是面板的展示与预检,没有任何人调用这个
+        // 插件。锁住这条,免得日后有人"顺手"把它算进去。
+        let config_only = format!("{bare}\n[[config]]\nkey = \"bot_token\"\nrequired = true\n");
+        let err = Manifest::parse(&config_only).unwrap_err().to_string();
         assert!(err.contains("至少"), "实际: {err}");
     }
 

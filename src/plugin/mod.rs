@@ -34,12 +34,17 @@
 //! 资源模型(A8):引擎进程唯一(见 [`host::new_engine`]),`LoadedPlugin` 只缓存 manifest
 //! 与 `Module`(均 Send+Sync);实例与 Store 每次调用重建——fuel 记在 Store 上,
 //! 复用会让首次耗尽 fuel 的插件永久死亡,也无法并发调用。
+//!
+//! 每次调用另建一个日志汇集点(`host::PluginLog`),和 Store 一起生、一起灭,
+//! 但由调用方另持一份 `Arc`:插件经 `host.log` 打的话要跟着派发结果回面板,
+//! 而 Store 在返回时已经没了;超时被放弃的那个任务更是只剩调用方手里这一份
+//! 才读得到「放弃前它说了什么」。
 
 mod host;
 mod manifest;
 mod registry;
 
-pub use host::{load, new_engine, KV_VALUE_MAX};
+pub use host::{load, new_engine, KV_KEY_MAX, KV_VALUE_MAX};
 pub use manifest::Manifest;
 pub use registry::Registry;
 

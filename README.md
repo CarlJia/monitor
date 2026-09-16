@@ -60,6 +60,12 @@ subscribes = ["agent_offline", "agent_online", "plugin_expiry_soon"]
 [page]                                # 可选：声明面板里的自定义页面
 title = "财务统计"                    # page.title 在面板导航上显示
 [cleanup]                             # 可选：声明 on_cleanup，由面板「清理」按钮调用
+
+[[config]]                            # 可选、可重复：面板「配置」对话框要展示的 kv 字段
+key = "bot_token"                     # kv 的 key，必须与插件里 host_kv_get 读的名字逐字一致
+label = "Telegram Bot Token"          # 显示用的人话名字；可省，省了只显示 key
+required = true                       # 点「测试」前必须有值；可省，缺省 false
+hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 ```
 
 | 字段 | 校验规则 |
@@ -72,9 +78,11 @@ title = "财务统计"                    # page.title 在面板导航上显示
 | `[tick]` | 存在则每小时调度一次 `on_tick` |
 | `[page]` | 存在则面板里出现「页面」入口；`title` 必填 |
 | `[cleanup]` | 存在则面板里出现「清理」按钮，调 `on_cleanup` |
+| `[[config]]` | 可选、可重复。key 非空、不含 `:`、不超 128 字节、不重复（形状与面板的 kv 编辑器同一套）；`required` 的含义只是「点『测试』前应该有值」，**宿主在真实派发里从不检查它**——后台事件旁边没有操作员，一个 400 也无处可给 |
 
 `subscribes` / `[tick]` / `[page]` / `[cleanup]` 至少要有一个——纯插件
-不会有任何触达。等价于 v1 的「必须订阅到期/掉线/上线」三条之一。
+不会有任何触达。等价于 v1 的「必须订阅到期/掉线/上线」三条之一；只声明
+`[[config]]` 不算工作面（它只是面板的展示与预检）。
 
 ### ABI v2 契约
 
@@ -108,7 +116,7 @@ title = "财务统计"                    # page.title 在面板导航上显示
 
 | 函数 | 签名 | 返回值 / 说明 |
 |---|---|---|
-| `host_log` | `(level: i32, ptr, len)` | 无；level 0=debug 1=info 2=warn 3=error |
+| `host_log` | `(level: i32, ptr, len)` | 无；level 0=debug 1=info 2=warn 3=error。文本除进 hub 日志外，还按有界缓冲捕获，随该次派发的 `detail` 出现在面板「派发日志」与「测试」结果里（见「资源限制」） |
 | `host_now` | `() -> i64` | 当前 Unix 秒 |
 | `host_resp_alloc` | `(cap: i32) -> i32` | 宿主回调 `__alloc` 拿响应缓冲；之后 `host_http_post` / `host_http_get` 也可显式传 `resp_ptr > 0` 覆盖 |
 | `host_http_post` | `(method_ptr, method_len, url_ptr, url_len, body_ptr, body_len, resp_ptr, resp_cap) -> i32` | 写 `Content-Type: application/json` 的 POST；错误码见下表 |
@@ -210,6 +218,7 @@ title = "财务统计"                    # page.title 在面板导航上显示
 | plugin_data 行 | 256 KiB | `host_data_put` 单行上限；超出返回 -6 |
 | plugin_data 总占用 | 16 MiB / 插件 | 超额返回 -6 |
 | http 响应 | resp 缓冲容量（自选） | 插件自己决定缓冲大小（如 4 KiB），超出部分截断 |
+| 插件日志 detail | 16 行 / 每行 200 字节 / 合计 500 字节 | 一次调用里插件经 `host_log` 打的话，取**最新**，超出的更早行丢弃并在开头标注 |
 | 上传包 | 8 MiB | tar.gz 整包 |
 
 ### 上传与生命周期
@@ -220,15 +229,21 @@ title = "财务统计"                    # page.title 在面板导航上显示
    写进插件状态供面板查看；上传后默认**不启用**；
 3. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因）；
 4. 测试：`POST /api/plugins/{id}/test` 构造一条合成的 `plugin_expiry_soon`
-   事件，走与真实派发完全相同的执行路径；
+   事件，走与真实派发完全相同的执行路径。派发前先按 manifest 的 `[[config]]`
+   预检必填项，缺项（行不存在或值为空）直接 400 点名缺哪一项，而不是让插件
+   回来一个 `other:2` 让操作员猜；
 5. 页面：`GET /api/plugins/{id}/page` 调 `render_page` 拿 JSON 描述；
    面板里的交互走 `POST /api/plugins/{id}/action` 调 `on_action`；
 6. 清理：`POST /api/plugins/{id}/cleanup` 调 `on_cleanup`——清理逻辑
    完全在插件手里，宿主只转发调用与回收统计；
 7. 日志：`GET /api/plugins/{id}/logs` 返回最近 100 条派发结果（进程内环形
-   缓冲，重启后为空；长期审计在 notification_log）。
+   缓冲，重启后为空；长期审计在 notification_log）。每条另带 `detail`：插件
+   自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
+   在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
+   审计表，不混插件自由文本）。
 
-渠道配置（bot token 等）不建议打进 wasm——写在面板的插件 KV 编辑器里
+渠道配置（bot token 等）不建议打进 wasm——在 manifest 里用 `[[config]]` 声明
+字段（面板据此渲染标签、必填标记与提示），值写在面板的插件 KV 编辑器里
 （`PUT /api/plugins/{id}/kv/{key}`），插件运行时用 `host_kv_get` 读取。
 插件自有数据请走 `host_data_*`——这两套互不相通。
 

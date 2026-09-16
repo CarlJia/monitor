@@ -63,3 +63,23 @@ export function monthUsage(node: { month_rx: number; month_tx: number; traffic_m
       return node.month_rx + node.month_tx
   }
 }
+
+/**
+ * 「测试」toast 的描述文案：插件自己打的日志优先（它就是失败原因），宿主侧的
+ * 错误码与耗时随后。detail 是多行文本（宿主只留最新几行），取**最后一行**——
+ * 失败原因通常就在插件最后打的那条。没有 detail 时输出与从前逐字相同。
+ */
+export function dispatchResultText(
+  entry: { result: string; elapsed_ms: number; detail: string | null },
+  max = 120,
+): string {
+  const line =
+    entry.detail
+      ?.split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() ?? null
+  // 按码点截断：插件文案常以 emoji 开头，slice 会把代理对切成半个字符。
+  const reason = line && line.length > max ? `${[...line].slice(0, max).join("")}…` : line
+  return [reason, `result: ${entry.result}`, `耗时 ${entry.elapsed_ms} ms`].filter(Boolean).join(" · ")
+}

@@ -17,7 +17,8 @@ use crate::notification_bus::Event;
 use crate::App;
 
 use super::host::{
-    call_hook, call_json_hook, call_on_event, load, truncate, LoadedPlugin, DEFAULT_FUEL_LIMIT,
+    call_hook, call_json_hook, call_on_event, load, new_log_sink, render_log, truncate, LoadedPlugin,
+    DEFAULT_FUEL_LIMIT,
 };
 
 /// dispatch_log 的容量(KTD12)。环形:push_back 满了 pop_front,最近 1000 次
@@ -48,6 +49,11 @@ const DETAIL_MAX: usize = 500;
 /// | `timeout` | 超过 `plugin.timeout_ms` 的墙钟预算 |
 /// | `fuel_exhausted` | trap 且错误链含 fuel(死循环被 KTD6 截断) |
 /// | `host_error:<原因>` | 其余 trap / 实例化失败 / 任务崩溃 |
+///
+/// `result` 是宿主侧的**封闭词表**,`other:2` 这种对操作者毫无信息量——错误码的
+/// 含义是插件私有的。所以另有 [`DispatchEntry::detail`]:插件自己经 `host.log`
+/// 打的话,失败原因通常就在里面。它只进内存里的派发日志,**不进
+/// notification_log**——那张表是宿主的审计,不该混进插件写什么就是什么的自由文本。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchEntry {
     /// Unix 秒。
@@ -57,6 +63,9 @@ pub struct DispatchEntry {
     pub event_type: String,
     pub elapsed_ms: u64,
     pub result: String,
+    /// 本次调用里插件自己打的日志(最新几行,有界),没打就是 `None`。
+    /// 见 [`super::host::PluginLog`]。
+    pub detail: Option<String>,
 }
 
 /// 插件注册表。`App.plugins` 持有它,它以 `Weak` 回指 `App`:强引用会组成
@@ -225,6 +234,8 @@ impl Registry {
                         event_type: event.type_name().into(),
                         elapsed_ms: 0,
                         result: format!("host_error:{join}"),
+                        // 任务本身崩了,run_one 连 entry 都没产出,sink 也留不下来。
+                        detail: None,
                     }),
                 }
             }
@@ -284,7 +295,9 @@ impl Registry {
         for plugin in plugins {
             let plugin_id = plugin.manifest.plugin_id.clone();
             let started = std::time::Instant::now();
-            let result = match call_hook(&engine, &app_arc, &plugin, "on_tick", fuel, timeout_ms) {
+            // 每轮一个 sink:跨轮共用会把上一个插件的日志混进这一轮的 detail。
+            let logs = new_log_sink();
+            let result = match call_hook(&engine, &app_arc, &plugin, "on_tick", fuel, timeout_ms, &logs) {
                 Ok(0) => RESULT_SUCCESS.to_owned(),
                 Ok(code) => format!("other:{code}"),
                 Err(e) => {
@@ -305,6 +318,7 @@ impl Registry {
                     event_type: "tick".into(),
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     result,
+                    detail: render_log(&logs, DETAIL_MAX),
                 },
             );
         }
@@ -356,9 +370,14 @@ async fn run_one(
     let started = std::time::Instant::now();
     let plugin_id = plugin.manifest.plugin_id.clone();
     let event_type = event.type_name().to_owned();
+    // sink 建在 spawn **之前**,并由调用方留一份:超时那条分支会放弃后台任务,
+    // `call_on_event` 的返回值从此不可达,而那个任务仍在跑、仍握着它的 Arc 克隆。
+    // 只有这里这份句柄能看到"被放弃前插件打了什么"。
+    let logs = new_log_sink();
+    let task_logs = Arc::clone(&logs);
     let task = tokio::spawn(async move {
         tokio::task::block_in_place(move || {
-            call_on_event(&engine, &app, &plugin, &event, fuel_limit, timeout_ms)
+            call_on_event(&engine, &app, &plugin, &event, fuel_limit, timeout_ms, &task_logs)
         })
     });
     let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
@@ -382,6 +401,7 @@ async fn run_one(
         event_type,
         elapsed_ms: started.elapsed().as_millis() as u64,
         result,
+        detail: render_log(&logs, DETAIL_MAX),
     }
 }
 
@@ -583,6 +603,36 @@ mod tests {
         assert!(entries[0].elapsed_ms >= 50, "超时前的墙钟至少走满预算:{entries:?}");
     }
 
+    /// 超时路径也要带回插件自己说的话。把 sink 做成 `Arc` 并由调用方预持,首要
+    /// 理由就是这条:被放弃的任务其返回值再也拿不到,只有调用方手里那一份读得到
+    /// 「放弃前它说了什么」。这条路径原先只被断言过 result=="timeout"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_dispatch_still_carries_what_the_plugin_logged() {
+        let msg = "still alive";
+        let wat = format!(
+            r#"
+(module
+  (import "host" "log" (func $log (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{msg}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (call $log (i32.const 2) (i32.const 1024) (i32.const {}))
+    (loop (br 0))
+    (i32.const 0)))"#,
+            msg.len()
+        );
+        let app = runtime_app();
+        let id = install(&app, "com.test.stuck-logger", &["plugin_expiry_soon"], compile(&wat));
+        // 与 a_stuck_plugin_is_cut_off_by_the_timeout 同一组参数:fuel 大到 50ms
+        // 烧不完,超时先生效。
+        app.db.set("plugin.fuel_limit", "400000000").unwrap();
+        app.db.set("plugin.timeout_ms", "50").unwrap();
+        let entry = Registry::dispatch_one(&app, id, &expiry_event()).await.unwrap();
+        assert_eq!(entry.result, "timeout");
+        assert_eq!(entry.detail.as_deref(), Some(msg), "超时前打的那句话要带出来");
+    }
+
     /// 环形淘汰(KTD12)用 dispatch_one 驱动:fire-and-forget 的 dispatch 没有
     /// "全部完成"的等待点,而 dispatch_one 逐次等待,1001 次后确定性断言。
     /// 两条路径写的是同一个 push_entry。
@@ -649,6 +699,7 @@ mod tests {
         assert_eq!(entry.result, "success");
         assert_eq!(entry.event_type, "plugin_expiry_soon");
         assert_eq!(entry.plugin_id, "com.test.a");
+        assert_eq!(entry.detail, None, "MINIMAL_WAT 不打日志,detail 就该是 None");
         let snap = snapshot(&app);
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].plugin_id, entry.plugin_id);
@@ -657,5 +708,31 @@ mod tests {
         // 未加载的行号:明确的 Err 而不是静默成功。
         let err = Registry::dispatch_one(&app, id + 1, &expiry_event()).await;
         assert!(err.is_err());
+    }
+
+    /// 插件返回非 0 时,它自己打的日志要跟着 entry 出来:`other:2` 对操作者毫无
+    /// 信息量,原因只可能在这条 detail 里(tg-notify 缺 bot_token 就是这个形状)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_dispatch_carries_the_plugins_own_log_lines() {
+        let msg = "kv 里没有 bot_token";
+        let wat = format!(
+            r#"
+(module
+  (import "host" "log" (func $log (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{msg}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (call $log (i32.const 2) (i32.const 1024) (i32.const {}))
+    (i32.const 2)))"#,
+            msg.len()
+        );
+        let app = runtime_app();
+        let id = install(&app, "com.test.loggy", &["plugin_expiry_soon"], compile(&wat));
+        let entry = Registry::dispatch_one(&app, id, &expiry_event()).await.unwrap();
+        assert_eq!(entry.result, "other:2", "宿主侧词表不变,错误码照旧");
+        assert_eq!(entry.detail.as_deref(), Some(msg), "插件自己的话要带出来");
+        // 只进内存派发日志:notification_log 是宿主的审计表,不混插件自由文本。
+        assert_eq!(snapshot(&app)[0].detail.as_deref(), Some(msg), "派发日志同样带着 detail");
     }
 }

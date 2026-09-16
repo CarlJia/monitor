@@ -12,8 +12,9 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
   deletePlugin, deletePluginKv, disablePlugin, enablePlugin, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
-  type Plugin, type PluginLogEntry,
+  type Plugin, type PluginConfigDecl, type PluginLogEntry,
 } from "@/lib/api"
+import { dispatchResultText } from "@/lib/format"
 
 import { ConfirmDialog } from "./ConfirmDialog"
 
@@ -46,7 +47,8 @@ function PluginStatus({ plugin }: { plugin: Plugin }) {
 
 // kv 行的可编辑状态：original 为 null 的是新行（未保存过，本地移除即可）；
 // 已有行点删除时从 rows 摘除并记入 deleted，保存时统一调后端的 DELETE 路由。
-type KvRow = { key: string; value: string; original: string | null }
+// decl 是 manifest 声明过这一项时的展示信息：key 由插件定死，不能改名。
+type KvRow = { key: string; value: string; original: string | null; decl?: PluginConfigDecl }
 
 // 渠道配置里常见的凭据字段：默认掩码，眼睛按钮切换可见。
 const SECRET_KEY = /token|secret|password/i
@@ -60,9 +62,24 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
 
   useEffect(() => {
     listPluginKv(plugin.id)
-      .then((pairs) => setRows(pairs.map(({ key, value }) => ({ key, value, original: value }))))
+      .then((pairs) => {
+        const stored = new Map(pairs.map(({ key, value }) => [key, value]))
+        // 声明过的字段按 manifest 顺序排在最前（带标签、必填标记与提示），没声明
+        // 的存量行跟在后面：操作者照声明填，不必猜 key 名，也不会被存量键淹没。
+        const declared: KvRow[] = plugin.config.map((decl) => {
+          const value = stored.get(decl.key)
+          return { key: decl.key, value: value ?? "", original: value ?? null, decl }
+        })
+        const declaredKeys = new Set(plugin.config.map((d) => d.key))
+        const rest: KvRow[] = pairs
+          .filter(({ key }) => !declaredKeys.has(key))
+          .map(({ key, value }) => ({ key, value, original: value }))
+        setRows([...declared, ...rest])
+      })
       .catch((e: Error) => { setRows([]); toast.error(e.message) })
-  }, [plugin.id])
+    // config 也进依赖：它是行顺序与标签的来源。对话框打开期间列表不会重载
+    // （启停/上传/删除都在对话框之外），所以不会把未保存的编辑冲掉。
+  }, [plugin.id, plugin.config])
 
   const patch = (i: number, next: Partial<KvRow>) =>
     setRows((old) => old?.map((row, j) => (j === i ? { ...row, ...next } : row)) ?? old)
@@ -73,8 +90,11 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
     const writes: [string, string][] = []
     for (const row of rows) {
       if (row.original === null) {
-        // 没填完的新行不保存，而不是挡住整个表单。
-        if (row.key.trim()) writes.push([row.key.trim(), row.value])
+        // 没填完的新行不保存，而不是挡住整个表单。声明过的字段本来就带着一行空壳，
+        // 没填就更不该为它落一条空 kv 行——插件读到的仍是「没配」，而列表里会多出
+        // 一行操作员从没创建、也解释不了来源的记录。
+        const untouchedDecl = row.decl !== undefined && row.value === ""
+        if (row.key.trim() && !untouchedDecl) writes.push([row.key.trim(), row.value])
       } else if (row.value !== row.original) {
         writes.push([row.key, row.value])
       }
@@ -108,63 +128,76 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
           <DialogTitle>{plugin.name} 的渠道配置</DialogTitle>
           <DialogDescription className="leading-relaxed">
             插件运行时通过 host_kv_get 读这些值（命名空间 <code>plugin.{plugin.plugin_id}:</code>）。
-            key 非空、不含 ':'、128 字节内；value 8 KiB 内。删除一个已有的 key 会连同值一起从后端移除。
+            排在前面的是插件在 plugin.toml 里声明的字段；key 非空、不含 ':'、128 字节内；value 8 KiB 内。
+            删除一个已有的 key 会连同值一起从后端移除。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
           {rows.map((row, i) => {
+            const decl = row.decl
             const secret = SECRET_KEY.test(row.key)
             const reveal = shown[row.key] ?? false
+            const missing = decl?.required && !row.value.trim()
             return (
-              <div key={i} className="flex items-center gap-2">
-                {/* 已存的 key 不可改名：改名在后端等于新增一个 key，旧值留在原地。 */}
-                {row.original === null ? (
-                  <Input
-                    className="w-44 shrink-0"
-                    placeholder="key，如 webhook_url"
-                    value={row.key}
-                    onChange={(e) => patch(i, { key: e.target.value })}
-                  />
-                ) : (
-                  <code className="w-44 shrink-0 truncate rounded bg-muted px-2 py-2 text-xs" title={row.key}>
-                    {row.key}
-                  </code>
+              <div key={i} className="space-y-1">
+                {decl && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="font-medium">{decl.label ?? decl.key}</span>
+                    {decl.required && <span className="text-destructive">必填</span>}
+                    {missing && <span className="text-muted-foreground">还没填，「测试」会被拦下</span>}
+                  </div>
                 )}
-                <Input
-                  type={secret && !reveal ? "password" : "text"}
-                  className="min-w-0 flex-1"
-                  placeholder="value"
-                  value={row.value}
-                  autoComplete="off"
-                  onChange={(e) => patch(i, { value: e.target.value })}
-                />
-                {secret && (
+                <div className="flex items-center gap-2">
+                  {/* 已存或声明过的 key 不可改名：改名在后端等于新增一个 key，旧值留在原地。 */}
+                  {row.original === null && !decl ? (
+                    <Input
+                      className="w-44 shrink-0"
+                      placeholder="key，如 webhook_url"
+                      value={row.key}
+                      onChange={(e) => patch(i, { key: e.target.value })}
+                    />
+                  ) : (
+                    <code className="w-44 shrink-0 truncate rounded bg-muted px-2 py-2 text-xs" title={row.key}>
+                      {row.key}
+                    </code>
+                  )}
+                  <Input
+                    type={secret && !reveal ? "password" : "text"}
+                    className="min-w-0 flex-1"
+                    placeholder="value"
+                    value={row.value}
+                    autoComplete="off"
+                    onChange={(e) => patch(i, { value: e.target.value })}
+                  />
+                  {secret && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title={reveal ? "隐藏" : "显示"}
+                      aria-label={reveal ? "隐藏值" : "显示值"}
+                      onClick={() => setShown((s) => ({ ...s, [row.key]: !reveal }))}
+                    >
+                      {reveal ? <EyeOff /> : <Eye />}
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="icon"
-                    title={reveal ? "隐藏" : "显示"}
-                    aria-label={reveal ? "隐藏值" : "显示值"}
-                    onClick={() => setShown((s) => ({ ...s, [row.key]: !reveal }))}
+                    title={row.original === null ? "移除" : "删除"}
+                    aria-label={row.original === null ? "移除" : "删除"}
+                    onClick={() =>
+                      row.original === null
+                        ? setRows((old) => old?.filter((_, j) => j !== i) ?? old)
+                        : setRows((old) => {
+                            setDeleted((d) => [...d, row.key])
+                            return old?.filter((_, j) => j !== i) ?? old
+                          })
+                    }
                   >
-                    {reveal ? <EyeOff /> : <Eye />}
+                    <Trash2 className="text-destructive" />
                   </Button>
-                )}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  title={row.original === null ? "移除" : "删除"}
-                  aria-label={row.original === null ? "移除" : "删除"}
-                  onClick={() =>
-                    row.original === null
-                      ? setRows((old) => old?.filter((_, j) => j !== i) ?? old)
-                      : setRows((old) => {
-                          setDeleted((d) => [...d, row.key])
-                          return old?.filter((_, j) => j !== i) ?? old
-                        })
-                  }
-                >
-                  <Trash2 className="text-destructive" />
-                </Button>
+                </div>
+                {decl?.hint && <p className="text-xs text-muted-foreground">{decl.hint}</p>}
               </div>
             )
           })}
@@ -279,6 +312,16 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
               >
                 {entry.result}
               </Badge>
+              {/* 插件自己经 host.log 打的话：`other:2` 光看数字排不了障。w-full
+                  在 flex-wrap 里自成一行；高度由宿主的 500 字节上限兜底。 */}
+              {entry.detail && (
+                <div
+                  className="w-full text-xs break-words whitespace-pre-line text-muted-foreground"
+                  title={entry.detail}
+                >
+                  {entry.detail}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -345,14 +388,21 @@ export function Plugins({ go }: { go: (to: string) => void }) {
     setTesting(plugin.id)
     try {
       const r = await testPlugin(plugin.id)
-      // result 与耗时分层放：标题说结论，描述留给排查用的细节。
+      // 描述里插件自己的日志优先：`result: other:2` 对操作者毫无信息量，缺什么
+      // 配置、被 SSRF 拦了、还是 Telegram 回了非 2xx，全在那句话里。
+      const description = dispatchResultText({
+        result: r.wasm_result,
+        elapsed_ms: r.elapsed_ms,
+        detail: r.detail,
+      })
       if (r.wasm_result === "success") {
-        toast.success(`${plugin.name} 测试派发成功`, { description: `result: ${r.wasm_result} · 耗时 ${r.elapsed_ms} ms` })
+        toast.success(`${plugin.name} 测试派发成功`, { description })
       } else {
-        toast.error(`${plugin.name} 测试派发失败`, { description: `result: ${r.wasm_result} · 耗时 ${r.elapsed_ms} ms` })
+        toast.error(`${plugin.name} 测试派发失败`, { description })
       }
       bump()
     } catch (e) {
+      // 必填配置没填时宿主直接 400，body 就是点名缺哪一项的中文说明。
       toast.error((e as Error).message)
     } finally {
       setTesting(null)

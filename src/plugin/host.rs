@@ -1,7 +1,8 @@
 //! 引擎与加载(R6)、宿主函数(R8)、事件派发入口。
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -90,6 +91,10 @@ pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
 /// 能写的多」,否则面板成了绕过插件存储限额的后门。
 pub const KV_VALUE_MAX: usize = 8 * 1024;
 
+/// kv 的 key 上限,128 字节。面板、manifest 的 `[[config]]` 声明与 kv 命名空间
+/// 共用这一个数字:三处各写一份,迟早会漂。
+pub const KV_KEY_MAX: usize = 128;
+
 /// 插件 http 请求的墙钟超时(A13):4 秒,落在 5 秒的派发预算内,留 1 秒给宿主
 /// 自己的开销。挂在请求上:插件走 `App::plugin_http`(不跟随重定向的那个),
 /// 它的 client 级超时是 15 秒,服务于宿主侧下载,不能为插件收短。
@@ -98,6 +103,16 @@ pub(super) const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 /// 单次 http 响应体的硬上限:64 KiB。插件声明的 resp_cap 再大也读这么多——
 /// 有界下载要防的正是"cap 被声明成超大值/响应体本身无限大"的内存放大。
 const HTTP_RESP_MAX: usize = 64 * 1024;
+
+/// 一次调用里留在日志汇集点里的最多条数。16 条足够说清「为什么失败」,又能
+/// 让一个话多的插件在内存上封顶——超出的从**最旧**一端丢弃(失败原因一般在
+/// 最新几行里)。
+const LOG_LINES_MAX: usize = 16;
+
+/// 单条日志的长度上限:200 字节。tg-notify 那句「kv 里没有 bot_token；请在
+/// 面板的插件 KV 编辑器里填写」约 110 字节,必须整句留下;这条上限挡的是一次
+/// `host_log` 就把整条 detail 占满。
+const LOG_LINE_MAX: usize = 200;
 
 /// Store 的 user data:宿主函数看得见的全部宿主侧状态。
 pub(crate) struct PluginState {
@@ -113,6 +128,126 @@ pub(crate) struct PluginState {
     /// 时回落到这里,插件可以少传两个参数。
     resp_ptr: i32,
     resp_cap: i32,
+    /// 本次调用里插件经 `host.log` 打出的日志。见 [`PluginLog`]。
+    logs: LogSink,
+}
+
+/// 一次调用里插件自己打出的日志,供面板在派发失败时显示「为什么」。
+///
+/// 记全部级别(0-3)不做过滤:插件可能返回非 0 却一条 warn 都没打,只掉 info 会
+/// 让这里空着;而失败说明通常就是它打的最后一条,「留最新」已经把顺序问题解掉
+/// 了。真要收窄,过滤点就在这里一个判断。
+///
+/// 为什么是 `Arc<Mutex<_>>` 而不是 Store 上的普通字段:Store 在 `call_on_event`
+/// 里就没了,而调用方要在那之后读。更关键的是**超时路径**——`run_one` 放弃那个
+/// 后台任务时,`call_on_event` 的返回值永远拿不到了,只有调用方事先持有的这个
+/// Arc 才能看到"被放弃前插件打了什么"。
+///
+/// 有界:条数与单条长度都在这里截,不在读侧截。超时后那个被放弃的任务仍在往里
+/// 写,读侧设限挡不住它继续长。
+#[derive(Default)]
+pub(crate) struct PluginLog {
+    /// 最新在**后**。超 [`LOG_LINES_MAX`] 时从最旧一端丢。
+    lines: VecDeque<String>,
+    /// 被挤掉的条数,渲染时折算成一句「更早的 N 行已省略」。
+    dropped: usize,
+}
+
+/// 会把面板「一行一项」的显示契约打破、或被用来伪装文本的不可见字符。
+///
+/// - `Cc`:换行、回车、制表等,能凭空多出一行或覆盖掉前一行;
+/// - `Zl` / `Zp`(U+2028 / U+2029):同样是硬换行,但不在 `Cc` 里,CSS 的
+///   `white-space: pre-line` 照样在这里断行;
+/// - `Cf`:零宽字符与双向控制符,如 U+202E 能在一行之内把可见顺序颠倒。
+///
+/// 一并折成空格。detail 是给排障的操作员看的,保真让位于可读。
+fn breaks_display(c: char) -> bool {
+    // Cf 是逐码位的集合,std 没有 is_format;这里列的是对显示有影响的那部分
+    // (零宽、双向、行/段分隔周边与哨兵字符),不追求覆盖 Cf 全集。
+    const CF_RANGES: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD), // 软连字符
+        (0x0600, 0x0605),
+        (0x061C, 0x061C),
+        (0x06DD, 0x06DD),
+        (0x070F, 0x070F),
+        (0x0890, 0x0891),
+        (0x08E2, 0x08E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F), // 零宽 + LRM/RLM + 双向嵌入标记
+        (0x202A, 0x202E), // 双向嵌入与覆盖(LRE/RLE/PDF/LRO/RLO)
+        (0x2060, 0x2064),
+        (0x2066, 0x206F), // 双向隔离 + 已弃用的格式字符
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0001, 0xE0001),
+        (0xE0020, 0xE007F),
+    ];
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || CF_RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&(c as u32)))
+}
+
+impl PluginLog {
+    /// 记一条。不可见/换行类字符先换成空格(见 [`breaks_display`]):面板按行显示,
+    /// 插件文案里的 `\n` 能凭空多出一行、`\r` 能覆盖掉前一行、`U+202E` 能颠倒一行
+    /// 内的可见顺序。这个函数在 wasm 调用路径上,只做分配与截断,不会 panic。
+    fn push(&mut self, line: &str) {
+        let cleaned: String = line.chars().map(|c| if breaks_display(c) { ' ' } else { c }).collect();
+        self.lines.push_back(truncate(&cleaned, LOG_LINE_MAX));
+        while self.lines.len() > LOG_LINES_MAX {
+            self.lines.pop_front();
+            self.dropped += 1;
+        }
+    }
+}
+
+/// 一次调用的日志汇集点。`Arc`:Store 的 user data 与调用方共享同一个。
+pub(crate) type LogSink = Arc<Mutex<PluginLog>>;
+
+/// 建一个空汇集点。每次调用一个——跨调用复用会把上一次的日志混进来。
+pub(super) fn new_log_sink() -> LogSink {
+    Arc::new(Mutex::new(PluginLog::default()))
+}
+
+/// 把汇集点渲染成 `DispatchEntry.detail`,留最新、不超过 `max` 字节。没有任何
+/// 日志时返回 `None`(JSON 里就是 null)。
+///
+/// 从最新往旧累积,所以下游那道上限不会吃掉失败原因;累积到放不下为止,再翻回
+/// 时间顺序。省略标记放**开头**——面板的一行摘要取的是最后一行,那必须是插件
+/// 最新打的那条。
+pub(super) fn render_log(sink: &LogSink, max: usize) -> Option<String> {
+    // 省略标记要占的位置,先留出来,免得加完标记反而超出 max。
+    const NOTE_RESERVE: usize = 48;
+    let log = sink.lock().unwrap_or_else(|e| e.into_inner());
+    if log.lines.is_empty() {
+        return None;
+    }
+    let budget = max.saturating_sub(NOTE_RESERVE);
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for line in log.lines.iter().rev() {
+        let cost = line.len() + 1;
+        if used + cost > budget && !kept.is_empty() {
+            break;
+        }
+        // 最新那条即使独占超预算也要留下——否则 detail 就空了;截到预算内,契约
+        // 「不超过 max」才不会被一个很小的 max 打破。
+        let line = if cost > budget { truncate(line, budget) } else { line.clone() };
+        used += line.len() + 1;
+        kept.push(line);
+    }
+    let omitted = log.dropped + (log.lines.len() - kept.len());
+    kept.reverse();
+    let body = kept.join("\n");
+    if omitted == 0 {
+        return Some(body);
+    }
+    Some(format!("…（更早的 {omitted} 行已省略）\n{body}"))
 }
 
 /// 宿主函数的返回错误码。成功:kv_get/http_post 返回写入字节数,其余返回 0。
@@ -359,6 +494,9 @@ fn resp_write_plan(resp_ptr: i32, resp_cap: i32, last: (i32, i32), bytes_len: us
 
 /// 新建 Store(带 fuel 与墙钟 deadline)、注册宿主函数、实例化。`call_on_event`
 /// 的骨架,也是测试直接驱动单个宿主函数的入口。
+///
+/// `logs` 由调用方建、调用方留一份:Store 随本次调用消失,而插件日志要在那之后
+/// 才读得到,超时被放弃的任务更是只剩调用方手里这一个 [`LogSink`]。
 pub(crate) fn instantiate(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
@@ -366,6 +504,7 @@ pub(crate) fn instantiate(
     module: &wasmtime::Module,
     fuel_limit: u64,
     timeout_ms: u64,
+    logs: &LogSink,
 ) -> Result<InstanceHandle> {
     let mut store = Store::new(
         engine,
@@ -375,6 +514,7 @@ pub(crate) fn instantiate(
             deadline: std::time::Instant::now() + Duration::from_millis(timeout_ms),
             resp_ptr: 0,
             resp_cap: 0,
+            logs: Arc::clone(logs),
         },
     );
     // fuel 在任何 wasm 执行(含 start 段)之前就位。
@@ -396,13 +536,22 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
         "log",
         |mut caller: Caller<'_, PluginState>, level: i32, ptr: i32, len: i32| {
             let plugin_id = caller.data().plugin_id.clone();
+            // 先取一份 sink 再 read_text:后者要可变借用 caller,借完就借不到
+            // data() 了。Arc 克隆只是引用计数。
+            let logs = Arc::clone(&caller.data().logs);
             let text = match read_text(&mut caller, ptr, len) {
                 Some(text) => text,
                 None => {
+                    // 宿主自己发现的坏参数:只进 hub 日志,不进 detail——detail 是
+                    // 插件自己的话,混进宿主的声音会让人分不清谁在说。
                     warn!(plugin = %plugin_id, "host_log 越界或非法 UTF-8: ptr={ptr} len={len}");
                     String::new()
                 }
             };
+            // 空文本不记:越界分支上面已经落了日志,再记一条空行是噪声。
+            if !text.is_empty() {
+                logs.lock().unwrap_or_else(|e| e.into_inner()).push(&text);
+            }
             match level {
                 0 => tracing::debug!(plugin = %plugin_id, "{text}"),
                 1 => tracing::info!(plugin = %plugin_id, "{text}"),
@@ -906,6 +1055,9 @@ fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginState>> {
 /// `timeout_ms` 折算成 deadline 存进 PluginState,宿主函数(http_post/kv_get)
 /// 入口检查——预算耗尽后宿主调用被拒绝,wasm 循环每轮拿到负数返回值,配合
 /// fuel 兜底,两种死循环都出得来。http 的单请求超时见 [`HTTP_TIMEOUT`]。
+///
+/// `logs` 是本次调用的日志汇集点,由调用方持有——返回 i32 带不出任何东西,超时
+/// 路径上连返回值都没有。
 pub fn call_on_event(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
@@ -913,9 +1065,10 @@ pub fn call_on_event(
     event: &Event,
     fuel_limit: u64,
     timeout_ms: u64,
+    logs: &LogSink,
 ) -> Result<i32> {
     let mut handle =
-        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
+        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms, logs)?;
     let payload = serde_json::to_vec(event)?;
     let alloc = handle
         .instance
@@ -972,9 +1125,10 @@ pub fn call_hook(
     hook: &str,
     fuel_limit: u64,
     timeout_ms: u64,
+    logs: &LogSink,
 ) -> Result<i32> {
     let mut handle =
-        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
+        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms, logs)?;
     let func = handle
         .instance
         .get_typed_func::<(), i32>(&mut handle.store, hook)
@@ -987,6 +1141,9 @@ pub fn call_hook(
 /// 约定:导出签名 `(ptr: i32, len: i32) -> i32`,返回值是写回 host_resp_alloc
 /// 缓冲的响应字节数(0 表示空响应,负数是插件自定义错误码)。宿主用最近一次
 /// host_resp_alloc 记下的缓冲读回响应体。
+///
+/// 日志 sink 在函数体内建、用完即弃:页面/清理的失败已由调用方转成 502 与一条
+/// 宿主 warn,detail 没有任何读者,不必让调用方多传一个没人看的参数。
 pub fn call_json_hook(
     engine: &wasmtime::Engine,
     app: &Arc<App>,
@@ -996,8 +1153,15 @@ pub fn call_json_hook(
     fuel_limit: u64,
     timeout_ms: u64,
 ) -> Result<Vec<u8>> {
-    let mut handle =
-        instantiate(engine, app, &plugin.manifest.plugin_id, &plugin.module, fuel_limit, timeout_ms)?;
+    let mut handle = instantiate(
+        engine,
+        app,
+        &plugin.manifest.plugin_id,
+        &plugin.module,
+        fuel_limit,
+        timeout_ms,
+        &new_log_sink(),
+    )?;
     let alloc = handle
         .instance
         .get_typed_func::<(i32,), i32>(&mut handle.store, "__alloc")
@@ -1078,13 +1242,30 @@ mod tests {
         let app = app();
         let plugin = load(&engine, &row(compile(MINIMAL_WAT))).unwrap();
         assert_eq!(
-            call_on_event(&engine, &app, &plugin, &expiry_event(), DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS)
-                .unwrap(),
+            call_on_event(
+                &engine,
+                &app,
+                &plugin,
+                &expiry_event(),
+                DEFAULT_FUEL_LIMIT,
+                DEFAULT_TIMEOUT_MS,
+                &new_log_sink(),
+            )
+            .unwrap(),
             0
         );
         let online = Event::AgentOnline { node_id: 5, name: "edge-1".into(), observed_at: 300 };
         assert_eq!(
-            call_on_event(&engine, &app, &plugin, &online, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap(),
+            call_on_event(
+                &engine,
+                &app,
+                &plugin,
+                &online,
+                DEFAULT_FUEL_LIMIT,
+                DEFAULT_TIMEOUT_MS,
+                &new_log_sink(),
+            )
+            .unwrap(),
             0
         );
     }
@@ -1110,8 +1291,16 @@ mod tests {
         let app = app();
         let plugin = load(&engine, &row(compile(wat_text))).unwrap();
         let event = expiry_event();
-        let n =
-            call_on_event(&engine, &app, &plugin, &event, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap();
+        let n = call_on_event(
+            &engine,
+            &app,
+            &plugin,
+            &event,
+            DEFAULT_FUEL_LIMIT,
+            DEFAULT_TIMEOUT_MS,
+            &new_log_sink(),
+        )
+        .unwrap();
         let json = serde_json::to_vec(&event).unwrap();
         assert_eq!(n as usize, json.len());
     }
@@ -1166,7 +1355,16 @@ mod tests {
     /// 实例化一个 WAT 模块并保留 Store:测试要直接读内存与 db。
     fn spawn(engine: &wasmtime::Engine, app: &Arc<App>, wat_text: &str) -> InstanceHandle {
         let module = wasmtime::Module::new(engine, compile(wat_text)).unwrap();
-        instantiate(engine, app, "com.example.test", &module, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap()
+        instantiate(
+            engine,
+            app,
+            "com.example.test",
+            &module,
+            DEFAULT_FUEL_LIMIT,
+            DEFAULT_TIMEOUT_MS,
+            &new_log_sink(),
+        )
+        .unwrap()
     }
 
     /// 同上,但指定 plugin_id——namespace 隔离的测试要两个不同身份的插件。
@@ -1177,7 +1375,8 @@ mod tests {
         wat_text: &str,
     ) -> InstanceHandle {
         let module = wasmtime::Module::new(engine, compile(wat_text)).unwrap();
-        instantiate(engine, app, plugin_id, &module, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS).unwrap()
+        instantiate(engine, app, plugin_id, &module, DEFAULT_FUEL_LIMIT, DEFAULT_TIMEOUT_MS, &new_log_sink())
+            .unwrap()
     }
 
     /// 驱动 on_event 并返回其返回值。
@@ -1602,8 +1801,16 @@ mod tests {
         let engine = engine();
         let app = app();
         let plugin = load(&engine, &row(compile(wat_text))).unwrap();
-        let err =
-            call_on_event(&engine, &app, &plugin, &expiry_event(), 10_000, DEFAULT_TIMEOUT_MS).unwrap_err();
+        let err = call_on_event(
+            &engine,
+            &app,
+            &plugin,
+            &expiry_event(),
+            10_000,
+            DEFAULT_TIMEOUT_MS,
+            &new_log_sink(),
+        )
+        .unwrap_err();
         // trap 信息在错误链深处,格式化整条链再找。
         let whole = format!("{err:#}");
         assert!(whole.to_lowercase().contains("fuel"), "应是 fuel 耗尽,实际: {whole}");
@@ -1633,14 +1840,100 @@ mod tests {
         let plugin = load(&engine, &row(compile(wat_text))).unwrap();
         let started = std::time::Instant::now();
         // fuel 给到 50ms 内烧不完的量级;墙钟预算只有 50ms。
-        let code = call_on_event(&engine, &app, &plugin, &expiry_event(), 1_000_000_000, 50).unwrap();
+        let code = call_on_event(&engine, &app, &plugin, &expiry_event(), 1_000_000_000, 50, &new_log_sink())
+            .unwrap();
         let elapsed = started.elapsed();
         assert_eq!(code, -1, "循环应以 kv_get 的预算耗尽返回码退出");
         assert!(elapsed < Duration::from_secs(5), "应在墙钟预算附近终止,实际 {elapsed:?}");
     }
 
-    /// #16:resp_write_plan 的分支——完整写回、截断到 cap、resp_ptr=0 回落、
-    /// 硬上限、无缓冲。纯函数直接驱动,不需要网络。
+    // ---- 插件日志汇集(A:失败原因的透出) ----
+
+    /// 插件经 `host.log` 打的话要落进汇集点:面板上「为什么失败」全靠它。
+    #[test]
+    fn host_log_lines_land_in_the_sink() {
+        let wat_text = r#"
+(module
+  (import "host" "log" (func $log (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "no bot_token")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (call $log (i32.const 2) (i32.const 1024) (i32.const 12))
+    (i32.const 7)))"#;
+        let engine = engine();
+        let app = app();
+        let module = wasmtime::Module::new(&engine, compile(wat_text)).unwrap();
+        let logs = new_log_sink();
+        let mut handle = instantiate(
+            &engine,
+            &app,
+            "com.example.test",
+            &module,
+            DEFAULT_FUEL_LIMIT,
+            DEFAULT_TIMEOUT_MS,
+            &logs,
+        )
+        .unwrap();
+        assert_eq!(drive(&mut handle), 7, "插件自己的返回码不受日志捕获影响");
+        let detail = render_log(&logs, 500).expect("打过日志就该有 detail");
+        assert_eq!(detail, "no bot_token");
+    }
+
+    /// 汇集点有界:留最新 `LOG_LINES_MAX` 条,挤掉的记数,渲染时折算成省略标记。
+    /// 留最新而不是最早——失败原因通常是插件最后打的那条。
+    #[test]
+    fn the_log_sink_keeps_the_newest_lines_and_counts_the_rest() {
+        let logs = new_log_sink();
+        {
+            let mut log = logs.lock().unwrap();
+            for i in 0..20 {
+                log.push(&format!("line {i}"));
+            }
+            assert_eq!(log.lines.len(), LOG_LINES_MAX);
+            assert_eq!(log.dropped, 4);
+            assert_eq!(log.lines.front().unwrap(), "line 4", "最旧的 4 条被挤掉");
+            assert_eq!(log.lines.back().unwrap(), "line 19");
+        }
+        let detail = render_log(&logs, 500).unwrap();
+        assert!(detail.starts_with("…（更早的 4 行已省略）"), "实际: {detail}");
+        assert!(detail.ends_with("line 19"), "最新一条要在最后(面板取最后一行),实际: {detail}");
+    }
+
+    /// 超过 `max` 时从最新往回装:最新那条必须完整留下,更早的折成省略标记。
+    /// 空汇集点是 `None`(json 里的 null),不是空串。
+    #[test]
+    fn render_log_fits_the_budget_and_keeps_the_newest_line() {
+        assert_eq!(render_log(&new_log_sink(), 500), None);
+        let logs = new_log_sink();
+        {
+            let mut log = logs.lock().unwrap();
+            for i in 0..6 {
+                log.push(&format!("{}{i}", "x".repeat(90)));
+            }
+        }
+        let detail = render_log(&logs, 300).unwrap();
+        assert!(detail.len() <= 300, "不该超过 max,实际 {}", detail.len());
+        assert!(detail.ends_with("5"), "最新的一条要在最后,实际: {detail}");
+        assert!(detail.contains("已省略"), "放不下的更早行要折成省略,实际: {detail}");
+        // max 比单条还小时同样守约:把最新那条截进去,而不是原样塞回来。
+        let tight = render_log(&logs, 40).unwrap();
+        assert!(tight.len() <= 40, "实际 {}: {tight}", tight.len());
+    }
+
+    /// 单条日志里的不可见字符折成空格:面板按行显示,插件文案里的 `\n` 能凭空
+    /// 多出一行、`\r` 能覆盖掉前一行。只折 `Cc` 不够——`U+2028` 同样是硬换行
+    /// 却不在 `Cc` 里,`U+202E` 能把一行内的可见顺序颠倒,两者都要挡。
+    #[test]
+    fn control_characters_in_a_log_line_are_neutralized() {
+        let logs = new_log_sink();
+        logs.lock().unwrap().push("first\r\nsecond");
+        assert_eq!(render_log(&logs, 500).unwrap(), "first  second");
+        let logs = new_log_sink();
+        logs.lock().unwrap().push("evil\u{2028}line\u{202e}reversed\u{feff}");
+        assert_eq!(render_log(&logs, 500).unwrap(), "evil line reversed ");
+    }
+
     #[test]
     fn resp_write_plan_covers_full_truncated_fallback_and_limits() {
         // 完整写回:cap 足够,写全部字节。
