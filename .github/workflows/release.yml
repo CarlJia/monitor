@@ -17,12 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The default theme arrives as a published archive, verified against the
-      # hash in web-theme.pin. Run on the runner rather than left to build.rs,
-      # because the cross container below does not necessarily carry curl; it
-      # finds the theme already unpacked.
-      - run: ./scripts/theme.sh
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -36,6 +30,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # 单个 target 的 release 冷编译约 3.5 分钟，慢在 wasmtime 48 与 bundled
+      # rusqlite 的依赖上（release profile 还是 lto + codegen-units=1）。缓存后
+      # 只有本 crate 的改动会重编并重新链接。key 按 target 分开，否则两个 matrix
+      # job 会互相覆盖对方的产物。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The default theme arrives as a published archive, verified against the
+      # hash in web-theme.pin. Run on the runner rather than left to build.rs,
+      # because the cross container below does not necessarily carry curl; it
+      # finds the theme already unpacked. 排在缓存恢复之后，否则刚解包的 theme 会
+      # 被缓存里与 pin 不符的旧 theme 覆盖。
+      - run: ./scripts/theme.sh
 
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
