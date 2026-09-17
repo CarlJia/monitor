@@ -109,12 +109,22 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 非 2xx 响应给操作者看的一句话。宿主刻意用纯文本体带出中文原因；但空体响应
+ * （如 plugin_or_404 的 `StatusCode::NOT_FOUND`）落不到它，而 HTTP/2、HTTP/3
+ * 又删掉了 statusText，旧写法 `body || statusText` 于是得到 ""——toast 里是
+ * 一块空白，读起来像「没出错」。空到无话可说时退回状态码，绝不返回空串。
+ */
+export function httpErrorText(status: number, statusText: string, body: string): string {
+  return body.trim() || statusText || `请求失败（HTTP ${status}）`
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     ...init,
     headers: init?.body ? { "content-type": "application/json", ...init?.headers } : init?.headers,
   })
-  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
+  if (!res.ok) throw new ApiError(res.status, httpErrorText(res.status, res.statusText, await res.text()))
   return res.status === 204 ? (undefined as T) : res.json()
 }
 
@@ -191,7 +201,7 @@ export async function uploadPlugin(file: File): Promise<{
   }
   if (!res.ok) {
     if (res.status === 413) throw new ApiError(413, "文件过大")
-    throw new ApiError(res.status, (await res.text()) || res.statusText)
+    throw new ApiError(res.status, httpErrorText(res.status, res.statusText, await res.text()))
   }
   return res.json()
 }
@@ -316,7 +326,7 @@ export async function upload<T>(
         res.status,
         res.status === 413
           ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-          : (await res.text()) || res.statusText,
+          : httpErrorText(res.status, res.statusText, await res.text()),
       )
     }
     last = res

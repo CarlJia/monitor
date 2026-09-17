@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { changes, GIB, provisioningSite, trafficCorrection } from "./api.ts"
+import { changes, GIB, httpErrorText, provisioningSite, trafficCorrection } from "./api.ts"
 import { dispatchResultText, money } from "./format.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
@@ -48,4 +48,16 @@ assert.equal(
   dispatchResultText({ result: "other:19", elapsed_ms: 1, detail: "🚀".repeat(120) }, 120),
   `${"🚀".repeat(120)} · result: other:19 · 耗时 1 ms`,
 )
+// 非 2xx 的错误文案（api() 与两处上传共用）。空 body、且 HTTP/2/3 下 statusText
+// 也为空时，旧写法 `body || statusText` 得到 ""——toast 是一块空白，读起来像
+// 「没出错」。必须退回带状态码的一句话，绝不返回空串。
+assert.equal(httpErrorText(404, "", ""), "请求失败（HTTP 404）")
+assert.equal(httpErrorText(502, "", "  \n "), "请求失败（HTTP 502）")
+// 后端给了原因就用它，去掉首尾空白。
+assert.equal(httpErrorText(400, "", " 插件包超过 8 MiB 的上限 "), "插件包超过 8 MiB 的上限")
+// body 优先于 statusText。
+assert.equal(httpErrorText(400, "Bad Request", "缺 bot_token"), "缺 bot_token")
+// HTTP/1.1 仍带 statusText：空 body 时用它。
+assert.equal(httpErrorText(404, "Not Found", ""), "Not Found")
+
 console.log("partial edits, traffic corrections, provisioning and dispatch-result checks passed")

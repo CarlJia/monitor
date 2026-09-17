@@ -242,14 +242,17 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   }, [plugins])
 
   useEffect(() => {
-    // 删除插件后 pulse 递增会带着旧 id 重查：selected 已不在最新列表里就跳过，
-    // 免得和「删除成功」并排弹一个 404。
-    if (selected == null || !plugins.some((p) => p.id === selected)) return
+    // 守卫：selected 不在最新列表里就跳过——别拿已删 id 去请求 logs（404）。删除
+    // 后 plugins 更新会让选中项回退，但那次回退所在的渲染里 selected 还是旧值，
+    // 这道门就负责拦下那一帧。
+    // 先清日志：无论是否跳过，都不该把上一帧（可能属于已删插件）的记录留在屏上。
     setEntries(null)
+    if (selected == null || !plugins.some((p) => p.id === selected)) return
     pluginLogs(selected)
       .then(setEntries)
       .catch((e: Error) => { setEntries([]); toast.error(e.message) })
-    // pulse：列表页的动作（测试、启停、删除）之后由父组件递增，日志随之刷新。
+    // pulse：「测试」（不重拉列表）与「启停」后由父组件递增，触发本 effect 重跑；
+    // 上传/删除只重拉列表，靠 plugins 变化触发（见 remove()）。
   }, [selected, pulse, tick, plugins])
 
   if (!plugins.length || selected == null) return null
@@ -345,12 +348,22 @@ export function Plugins({ go }: { go: (to: string) => void }) {
   const [deleting, setDeleting] = useState<Plugin | null>(null)
   const [removing, setRemoving] = useState(false)
   const [kvFor, setKvFor] = useState<Plugin | null>(null)
-  // 列表上的动作（测试、启停、删除）之后递增，让日志卡片跟着刷新。
+  // 动作后递增，让日志卡片跟着刷新。「测试」只能靠它（不重拉列表）；启停额外
+  // 重拉列表；删除刻意不 pulse——见 remove()。
   const [pulse, setPulse] = useState(0)
   const fileInput = useRef<HTMLInputElement>(null)
 
-  const load = () =>
-    listPlugins().then(setPlugins).catch((e: Error) => { setPlugins([]); toast.error(e.message) })
+  // 序号化的重拉：并发的 listPlugins 响应若乱序，只有最新一次的落地——否则删除
+  // 前发出的旧请求晚到会把已删行「复活」回列表，日志守卫随之放行。
+  const loadSeq = useRef(0)
+  const load = () => {
+    const seq = ++loadSeq.current
+    return listPlugins()
+      .then((list) => { if (seq === loadSeq.current) setPlugins(list) })
+      .catch((e: Error) => {
+        if (seq === loadSeq.current) { setPlugins([]); toast.error(e.message) }
+      })
+  }
   useEffect(() => { load() }, [])
 
   const bump = () => setPulse((n) => n + 1)
@@ -437,8 +450,10 @@ export function Plugins({ go }: { go: (to: string) => void }) {
       await deletePlugin(deleting.id)
       toast.success("插件已删除")
       setDeleting(null)
+      // 不 pulse：日志卡片由 plugins 更新自己回退选中项并重查。若在这里递增
+      // pulse，效果会赶在 load() 落地前、用仍含该 id 的旧列表重跑，带着已删 id
+      // 去请求 logs 拿到 404。
       load()
-      bump()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
