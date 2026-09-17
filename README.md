@@ -176,6 +176,7 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 ```json
 {
   "title": "财务统计",
+  "toast": {"kind": "success", "text": "已保存"},
   "blocks": [
     {"type": "notice", "kind": "warning", "text": "汇率不可用……"},
     {"type": "stat", "items": [
@@ -188,9 +189,15 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
      "columns": ["节点", "到期日", "剩余天数"],
      "rows": [["edge-1","2026-10-01",3]]},
     {"type": "form", "title": "节点财务数据", "action": "save_node",
-     "fields": ["name","price","currency","billing_cycle","expires_at"],
+     "fields": [
+       {"name": "name", "label": "节点名", "type": "text"},
+       {"name": "price", "label": "价格", "type": "number"},
+       {"name": "currency", "label": "币种", "type": "select", "options": ["CNY","USD"]},
+       {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": ["monthly","once"]},
+       {"name": "expires_at", "label": "到期日", "type": "date"}
+     ],
      "rows": [{"id":1,"name":"edge-1","price":12.5,"currency":"USD",
-              "billing_cycle":"12","expires_at":"2027-01-01"}]}
+               "billing_cycle":"monthly","expires_at":"2027-01-01"}]}
   ]
 }
 ```
@@ -200,13 +207,47 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 `table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，提交
 `{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
 
-`form` 的字段名决定控件类型，这是**协议的一部分**（不是实现细节）：名字里
-含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at` 结尾的用日期
-输入框，其余用文本框。字段名不合这套规则就会拿到错误的控件（比如把价格叫
-`unit_cost_value` 仍会被认成数字，但叫 `fee` 就只会是文本框）。
+顶层可选的 `toast` 是**操作回执**：`{"kind": …, "text": …}`，面板在
+`on_action` 的响应到达时弹一次，文案由插件给（宿主不替插件编文案）。`kind`
+取 `success` / `error` / `info` / `warning`，省略或写了别的值按 `success`
+处理；`text` 为空（或没有 `toast`）就不弹。**初始 `render_page` 的响应不触发
+提示**——否则每次打开页面都会重播上一次操作的结果。失败分支也走这条路：插件
+把原因写进 `toast.text`（`kind: "error"`）比只把状态码塞进页面更直接。
+
+`form` 的 `fields` 有两种形态，都接受：
+
+```json
+"fields": ["name", "price", "currency", "billing_cycle", "expires_at"]
+"fields": [{"name": "price", "label": "价格", "type": "number"},
+           {"name": "currency", "label": "币种", "type": "select",
+            "options": ["CNY", "USD"]}]
+```
+
+- `name`（必填）是提交载荷里的键，也是取值时的键；没有名字的条目会被丢弃。
+- `label` 是编辑表的列头文案，缺省（或全是空白）时用字段名——旧式声明因此
+  照旧显示字段标识，新式声明才能显示「节点名」这类中文表头。
+- `type` 取 `text` / `number` / `date` / `select`。**声明优先**：写了
+  `type: "number"` 的字段即使名字叫 `fee` 也会渲染成数字输入框、并按数字
+  提交。
+- `select` 需要一并给 `options`（字符串数组），面板渲染成下拉，选中值写进该
+  行草稿、随该行的「保存」一起提交。**没给 `options` 的 `select` 会回退**到
+  下面的字段名启发式——一个没有可选项的下拉是死控件，既改不了也清不掉。
+- `type` 缺省或认不出（比如写成 `currency`、`int`）同样回退到字段名启发式:
+  插件写错一个词不该让整列变成不能用的控件。
+
+`label` 是给操作者看的，`name` 才是协议；两者不一致时以 `name` 为准。
+
+旧式字段名启发式（`fields` 没给 `type` 时）仍是**协议的一部分**（不是实现
+细节）：名字里含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at`
+结尾的用日期输入框，其余用文本框。字段名不合这套规则就会拿到错误的控件
+（比如把价格叫 `unit_cost_value` 仍会被认成数字，但叫 `fee` 就只会是文本框
+——新式声明写 `type` 才治本）。
 
 数字字段清空表示"不改这个字段"，不会存成 0——`Number("")` 是 0，而 0 在这类
-字段里通常有实际含义（比如财务插件的 0 表示免费）。
+字段里通常有实际含义（比如财务插件的 0 表示免费）。非空但解析不出数字的
+（如 `12,5`）也一样跳过，保留服务端原值。行内控件与「保存」按钮共用同一把
+锁：一次 action 在途时整表禁用，否则响应回来重挂载表单会静默丢弃这几秒里的
+改动。
 
 ### 资源限制
 

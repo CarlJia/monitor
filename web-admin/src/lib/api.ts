@@ -244,6 +244,119 @@ export const deletePluginKv = (id: number, key: string) =>
 /** 列出一个插件的全部 kv 行（R13）。 */
 export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)
 
+/**
+ * form 块的一项字段声明（KTD1）。两种形态并存：
+ * - 旧式：纯字符串，只给字段名，控件类型交给下面的启发式猜（向后兼容）；
+ * - 新式：对象，可带显示用标签、控件类型与下拉选项。
+ */
+export type PluginFieldDecl = string | {
+  /** 提交载荷里的键，也是取值时的键；没有名字的声明会被丢弃。 */
+  name: string
+  /** 列头文案；缺省（或全空白）用字段名。 */
+  label?: string
+  /** 控件类型；缺省或认不出时回退到按字段名的启发式。 */
+  type?: string
+  /** 仅 `type: "select"` 用得上。 */
+  options?: string[]
+}
+
+/** 归一化后的字段声明：渲染与取值都只看它。 */
+export type PluginField = {
+  name: string
+  /** 列头文案，已兜底成非空。 */
+  label: string
+  type: "text" | "number" | "date" | "select"
+  /** 仅 `select` 非空。 */
+  options: string[]
+}
+
+/** 取一个可能是任何东西的 JSON 值为字符串；不是字符串就取空串。 */
+function asText(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+/**
+ * 旧式字段名 → 控件类型：名字里含 `price`/`cost`/`amount`（不分大小写）用数字
+ * 输入框，以 `at` 结尾的用日期输入框，其余文本。插件没声明 `type` 时按它猜；
+ * 名字不合这套规则就会拿到错误的控件（比如把价格叫 `fee` 只会是文本框），
+ * 所以新式声明应当显式写 `type`。
+ */
+export function inputType(field: string): "text" | "number" | "date" {
+  if (/price|cost|amount/i.test(field)) return "number"
+  if (/at$/.test(field)) return "date"
+  return "text"
+}
+
+/**
+ * 把 form 块的字段声明归一化成渲染器的输入。声明优先、缺省回退启发式；
+ * 声明里认不出的 `type` 同样回退——插件写错一个词不该把整列渲染成废控件。
+ *
+ * `fields` 来自插件写的 JSON：类型是断言不是保证。这里按垃圾输入防御，
+ * null、数字、缺 name 的条目一律丢掉，而不是渲染一格空控件或把页面炸掉。
+ */
+export function normalizeFields(decls?: PluginFieldDecl[]): PluginField[] {
+  const fields: PluginField[] = []
+  for (const raw of (decls ?? []) as unknown[]) {
+    const obj = typeof raw === "string" ? { name: raw } : raw
+    if (typeof obj !== "object" || obj === null) continue
+    const decl = obj as Record<string, unknown>
+    const name = asText(decl.name).trim()
+    if (name === "") continue
+    const options = Array.isArray(decl.options) ? decl.options.filter((o) => typeof o === "string") : []
+    // 声明值两边可能带空白,先修掉再比对——插件手写 JSON 时很容易多一个空格。
+    const declared = asText(decl.type).trim()
+    // `select` 没给可选项时也回退：一个没有选项的下拉是死控件（既不能改也
+    // 不能清），按字段名猜至少还能操作。
+    const type = declared === "select" && options.length > 0 ? "select"
+      : declared === "text" || declared === "number" || declared === "date" ? declared
+      : inputType(name)
+    fields.push({ name, label: asText(decl.label).trim() || name, type, options })
+  }
+  return fields
+}
+
+/**
+ * 一行草稿 → 提交载荷（`{id, ...字段}`）。数字字段沿用既有规矩：空串跳过、
+ * 解析不出数字的跳过——`Number("")` 是 0，而 0 在价格这类字段里有实际含义
+ * （财务插件的 0 表示免费），存成 0 等于静默改掉一个字段；跳过即保留服务端
+ * 原值。控件类型看归一化后的声明（`fields`），不再单看字段名。
+ */
+export function formPayload(
+  fields: PluginField[],
+  id: unknown,
+  values: Record<string, string>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {}
+  if (id !== undefined) payload.id = id
+  for (const f of fields) {
+    const raw = values[f.name] ?? ""
+    if (f.type !== "number") {
+      payload[f.name] = raw
+      continue
+    }
+    const typed = raw.trim()
+    if (typed === "") continue
+    const n = Number(typed)
+    if (!Number.isNaN(n)) payload[f.name] = n
+  }
+  return payload
+}
+
+/** 响应携带的提示条：文案由插件给，面板替它弹一次（KTD2）。 */
+export type PluginToast = {
+  /** 断言不是保证：插件写错时按 `success` 处理，见 `toastKind`。 */
+  kind?: "success" | "error" | "info" | "warning"
+  text: string
+}
+
+/**
+ * 提示的 `kind` → 前端该调哪一个 toast；缺省或认不出的都回退到 `success`
+ * （协议只声明了四种，写错的提示宁可当成功也不该静默丢掉）。
+ */
+export function toastKind(kind?: string): "success" | "error" | "info" | "warning" {
+  return kind === "success" || kind === "error" || kind === "info" || kind === "warning" ? kind : "success"
+}
+
 /** 插件面板页面的 JSON UI 描述（U5/KTD5）。前端按词汇表渲染。 */
 export type PluginBlock = {
   type: string
@@ -262,11 +375,11 @@ export type PluginBlock = {
    * 区分：数组→表格，对象→表单。
    */
   rows?: unknown[][] | Record<string, unknown>[]
-  /** form 块的字段名；编辑后按字段名与 block.action 提交。 */
-  fields?: string[]
+  /** form 块的字段声明；旧式纯字符串或新式带标签/控件/选项的对象。 */
+  fields?: PluginFieldDecl[]
 }
 
-export type PluginPage = { title?: string; blocks?: PluginBlock[] }
+export type PluginPage = { title?: string; toast?: PluginToast; blocks?: PluginBlock[] }
 
 /** /db 响应的插件空间汇总（U9/KTD11）。宿主只展示，清理由插件自己决定。 */
 export type PluginUsage = {
