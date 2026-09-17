@@ -5,6 +5,7 @@
 *.db-shm
 *.db-wal
 .env
+.DS_Store
 
 # 私有文档与本地 AI 配置，不进开源仓库
 /docs/
