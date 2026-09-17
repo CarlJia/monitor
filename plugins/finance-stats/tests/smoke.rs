@@ -379,6 +379,39 @@ fn page_warns_when_fx_unavailable() {
     assert!(page.contains("汇率不可用"), "页面应提示汇率不可用：{page}");
 }
 
+/// 页面钩子的开销随机器数线性增长,而宿主给的预算是每次调用固定的(见仓库
+/// README「资源限制」的钩子那一档)。按那个预算跑一个真实规模的页面:一百台
+/// 机器的财务记录必须渲染得出来——超出预算的那次,生产里就是点页面回 502
+/// (实测 20 台约 150 万 fuel、100 台约 580 万)。
+#[test]
+fn page_renders_within_the_production_fuel_budget() {
+    /// 宿主的 `plugin.hook_fuel_limit` 默认值,见仓库 README 的资源限制表。
+    const PROD_HOOK_FUEL: u64 = 20_000_000;
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    store.set_fuel(PROD_HOOK_FUEL).unwrap();
+
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    for i in 1..=100 {
+        seed(
+            &store,
+            &format!("node:{i}"),
+            &node_record(&format!("edge-{i}"), 10.0, "USD", "monthly", Some("2027-01-20")),
+        );
+    }
+
+    // call_json 在 trap 时 panic:渲染不出来就是这条断言先炸。
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    let rows = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "form").unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(rows, 100, "页面要列出全部一百台机器");
+}
+
 /// Covers AE1 + AE6：多币种年化汇总换算正确；price=0 不计入。
 #[test]
 fn page_totals_convert_and_skip_free() {

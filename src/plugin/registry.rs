@@ -18,6 +18,7 @@ use crate::App;
 
 use super::host::{
     call_hook, call_json_hook, call_on_event, load, truncate, LoadedPlugin, DEFAULT_FUEL_LIMIT,
+    DEFAULT_HOOK_FUEL_LIMIT,
 };
 use super::log::{new_log_sink, render_log};
 
@@ -31,6 +32,9 @@ pub const RESULT_SUCCESS: &str = "success";
 
 /// fuel 限额的 setting key(KTD6)。每次派发都重读,改完下一次扫描即生效。
 const SETTING_FUEL_LIMIT: &str = "plugin.fuel_limit";
+/// ABI v2 数据面钩子(`on_tick`/`render_page`/`on_action`/`on_cleanup`)的 fuel
+/// 限额 setting key。与派发分开的理由见 [`DEFAULT_HOOK_FUEL_LIMIT`]。
+const SETTING_HOOK_FUEL_LIMIT: &str = "plugin.hook_fuel_limit";
 /// 墙钟超时的 setting key(KTD6),单位毫秒。与 fuel 同读,理由相同。
 const SETTING_TIMEOUT_MS: &str = "plugin.timeout_ms";
 /// 超时缺省值:留出宿主开销后,略宽于插件 http 的 4 秒上限(见
@@ -290,7 +294,7 @@ impl Registry {
         if plugins.is_empty() {
             return;
         }
-        let fuel = setting_u64(app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let fuel = setting_u64(app, SETTING_HOOK_FUEL_LIMIT, DEFAULT_HOOK_FUEL_LIMIT);
         let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
         for plugin in plugins {
             let plugin_id = plugin.manifest.plugin_id.clone();
@@ -340,7 +344,7 @@ impl Registry {
             };
             (reg.engine.clone(), app_arc, plugin)
         };
-        let fuel = setting_u64(app, SETTING_FUEL_LIMIT, DEFAULT_FUEL_LIMIT);
+        let fuel = setting_u64(app, SETTING_HOOK_FUEL_LIMIT, DEFAULT_HOOK_FUEL_LIMIT);
         let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
         call_json_hook(&engine, &app_arc, &plugin, hook, input, fuel, timeout_ms)
     }
@@ -583,6 +587,56 @@ mod tests {
         .await;
         assert_eq!(entries[0].result, "fuel_exhausted");
         assert_eq!(entries[0].plugin_id, "com.test.spin");
+    }
+
+    /// ABI v2 的数据面钩子(`on_tick` 与 `render_page`)读的是
+    /// `plugin.hook_fuel_limit` 这一档,与派发那档互不影响:派发预算压到 1
+    /// 指令,钩子照样跑完;只有压它们自己那一档才截断。两档共用一个 key 的话,
+    /// 为钩子调大预算会顺带放宽事件派发的沙箱。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_hooks_use_their_own_fuel_budget() {
+        const LOOP_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0))
+  (func $spin (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_u (local.get $i) (i32.const 1000)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again))))
+  (func (export "on_tick") (result i32) (call $spin) (i32.const 0))
+  (func (export "render_page") (param i32 i32) (result i32) (call $spin) (i32.const 0)))"#;
+        let app = runtime_app();
+        // tick 要 manifest 声明才会被 dispatch_ticks 挑中;页面钩子走 call_json
+        // 直接调,不需要声明。
+        let manifest = "plugin_id = \"com.test.hookloop\"\nname = \"hookloop\"\n\
+                        version = \"1.0.0\"\nabi_version = 2\nsubscribes = []\ntick = true";
+        let row = app
+            .db
+            .create_plugin("com.test.hookloop", "hookloop", "1.0.0", manifest, &compile(LOOP_WAT), "")
+            .unwrap();
+        app.db.set_plugin_enabled(row.id, true).unwrap();
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(&app, row.id).unwrap();
+
+        // 1 指令的派发预算:任何事件派发都跑不完。钩子不看这一档。
+        app.db.set("plugin.fuel_limit", "1").unwrap();
+        assert!(
+            Registry::call_json(&app, row.id, "render_page", b"{}").is_ok(),
+            "页面钩子不该受 plugin.fuel_limit 约束"
+        );
+        Registry::dispatch_ticks(&app);
+        assert_eq!(snapshot(&app)[0].result, "success", "tick 不该受 plugin.fuel_limit 约束");
+
+        // 压钩子自己那一档 → 两条路径都截断。
+        app.db.set("plugin.hook_fuel_limit", "1").unwrap();
+        let err = Registry::call_json(&app, row.id, "render_page", b"{}").unwrap_err();
+        let whole = format!("{err:#}").to_lowercase();
+        assert!(whole.contains("fuel"), "页面钩子应被钩子预算截断,实际: {err:#}");
+        Registry::dispatch_ticks(&app);
+        // dispatch_log_snapshot 最新在前。
+        assert_eq!(snapshot(&app)[0].result, "fuel_exhausted", "tick 应被钩子预算截断");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

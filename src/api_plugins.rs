@@ -1548,6 +1548,49 @@ title = "Finance"
         );
     }
 
+    /// 页面钩子的 fuel 预算与事件派发分开(README「资源限制」)。一页列出几百台
+    /// 机器的财务记录是几百万 fuel 的活,套用按有界事件载荷定的 1,000,000 会
+    /// trap,页面端点回 502——部署里点「财务统计」报 502 就是这条路径。
+    /// 这里用一个空转约 270 万 fuel 的页面钩子证明它走的是宽预算那一档。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_hook_that_burns_millions_of_fuel_still_renders() {
+        // 30 万次循环 × 每轮约 9 条指令 ≈ 270 万 fuel:远超派发那档 1,000,000,
+        // 仍远低于钩子那档 20,000,000。换成派发那档会 trap 成 502。
+        const HEAVY_PAGE_WAT: &str = r#"
+(module
+  (import "host" "resp_alloc" (func $alloc (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{\"title\":\"Finance\"}")
+  (func (export "__alloc") (param i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0))
+  (func $spin (local $i i32)
+    (block $done
+      (loop $again
+        (br_if $done (i32.ge_u (local.get $i) (i32.const 300000)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $again))))
+  (func (export "render_page") (param i32 i32) (result i32)
+    (local $ptr i32)
+    (call $spin)
+    (local.set $ptr (call $alloc (i32.const 64)))
+    (memory.copy (local.get $ptr) (i32.const 1024) (i32.const 19))
+    (i32.const 19))
+  (func (export "on_action") (param i32 i32) (result i32) (i32.const 0)))"#;
+
+        let app = plugin_app();
+        let archive = tarball(&[
+            ("plugin.toml", PAGE_MANIFEST.as_bytes().to_vec()),
+            ("plugin.wasm", wat::parse_str(HEAVY_PAGE_WAT).unwrap()),
+        ]);
+        assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+
+        let resp = render_plugin_page(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "重活的页面钩子不该被派发那档预算截断");
+        assert_eq!(body_of(resp).await["title"], "Finance");
+    }
+
     /// 未声明 cleanup 的插件,清理端点 404(KTD11)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cleanup_404s_without_the_declaration() {
