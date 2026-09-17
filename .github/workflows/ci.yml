@@ -22,12 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The default theme arrives as a published archive, verified against the
-      # hash in web-theme.pin. Run here rather than left to build.rs so the
-      # download happens on the runner: release builds go through cross, whose
-      # container does not necessarily carry curl.
-      - run: ./scripts/theme.sh
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -47,6 +41,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      # 根 crate 拖进了 wasmtime 48 和 bundled 的 rusqlite，冷编译一次要几分钟，
+      # 而 clippy 与三次 test 各要编一遍。三个 crate 彼此独立（根 package 没有
+      # [workspace]），所以逐个列出各自缓存 target/；Cargo.lock 不变时命中，之后
+      # 只有改动的 crate 会重编。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins/tg-notify -> target
+            plugins/finance-stats -> target
+
+      # The default theme arrives as a published archive, verified against the
+      # hash in web-theme.pin. Run here rather than left to build.rs so the
+      # download happens on the runner: release builds go through cross, whose
+      # container does not necessarily carry curl. 排在缓存恢复之后：theme 解包在
+      # target/theme，先解包再恢复会被缓存里与 pin 不符的旧 theme 覆盖。
+      - run: ./scripts/theme.sh
+
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
