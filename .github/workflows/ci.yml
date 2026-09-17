@@ -43,15 +43,8 @@ jobs:
           components: clippy, rustfmt
 
       # 根 crate 拖进了 wasmtime 48 和 bundled 的 rusqlite，冷编译一次要几分钟，
-      # 而 clippy 与三次 test 各要编一遍。三个 crate 彼此独立（根 package 没有
-      # [workspace]），所以逐个列出各自缓存 target/；Cargo.lock 不变时命中，之后
-      # 只有改动的 crate 会重编。
+      # 而 clippy 与 test 各要编一遍。缓存依赖后只重编改动部分。
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            plugins/tg-notify -> target
-            plugins/finance-stats -> target
 
       # The default theme arrives as a published archive, verified against the
       # hash in web-theme.pin. Run here rather than left to build.rs so the
@@ -64,11 +57,28 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-      # 插件是独立 crate(不在根 workspace 里),上面那条 `cargo test` 不会覆盖
-      # 它们——而它们正是宿主到期/财务行为的替代覆盖所在。冒烟测试会嵌套构建
-      # wasm32 产物,所以目标也要装。
+  # 插件是独立 crate(不在根 workspace 里),check 里那条 `cargo test` 覆盖不到它们——
+  # 而它们正是宿主到期/财务行为的替代覆盖所在。拆成独立 job 与 check 并行：各自缓存
+  # 自己的 target/(互不干扰),check 也无需等这两段编译串行跑完。
+  plugins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        plugin: [tg-notify, finance-stats]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 两个 matrix 实例的 job 名相同,靠 plugin 名分池,否则会互相覆盖缓存。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.plugin }}
+          workspaces: "plugins/${{ matrix.plugin }} -> target"
+
+      # 冒烟测试会嵌套构建 wasm32 产物,所以目标也要装。
       - run: rustup target add wasm32-unknown-unknown
+
       - run: cargo test
-        working-directory: plugins/tg-notify
-      - run: cargo test
-        working-directory: plugins/finance-stats
+        working-directory: plugins/${{ matrix.plugin }}
