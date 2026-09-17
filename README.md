@@ -212,7 +212,8 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 
 | 限制 | 值 | 说明 |
 |---|---|---|
-| fuel | 默认 1,000,000 指令/调用 | setting `plugin.fuel_limit` 可调；耗尽即中断（死循环被截断） |
+| fuel（事件派发） | 默认 1,000,000 指令/调用 | setting `plugin.fuel_limit` 可调；耗尽即中断（死循环被截断） |
+| fuel（数据面钩子） | 默认 20,000,000 指令/调用 | setting `plugin.hook_fuel_limit` 可调；`on_tick`/`render_page`/`on_action`/`on_cleanup` 用这一档——它们读插件自己的数据，开销随数据规模增长（财务插件的页面要列出全部节点：实测空页面 44 万 fuel、每台机器再 5.4 万，tick 是 67 万 + 每台 2.4 万），按有界事件载荷定的派发那档不够用 |
 | 墙钟 | 默认 5 秒/调用 | setting `plugin.timeout_ms` 可调 |
 | kv 值 | 8 KiB | `host_kv_set` 与面板 KV 编辑器同限 |
 | plugin_data 行 | 256 KiB | `host_data_put` 单行上限；超出返回 -6 |
