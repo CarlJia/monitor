@@ -54,6 +54,8 @@ struct Host {
     nodes: Mutex<Vec<(i64, String, bool)>>,
     /// http_get 的应答体；None 表示请求失败（返回 -4）。
     http_body: Mutex<Option<String>>,
+    /// http_get 的调用次数——用来断言"该拉的拉了、不该拉的一次都没拉"。
+    http_calls: Mutex<u32>,
     /// 最近一次 resp_alloc 拿到的缓冲指针与容量（与生产宿主一致）。
     resp: Mutex<(i32, i32)>,
     logs: Mutex<Vec<(i32, String)>>,
@@ -127,6 +129,7 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
             "http_get",
             |mut caller: Caller<'_, Host>, url_ptr: i32, url_len: i32, resp_ptr: i32, resp_cap: i32| -> i32 {
                 let Some(url) = read_text(&mut caller, url_ptr, url_len) else { return -1 };
+                *caller.data().http_calls.lock().unwrap() += 1;
                 if !url.starts_with("https://") {
                     return -2;
                 }
@@ -280,6 +283,42 @@ fn fx_json(base: &str) -> String {
     )
 }
 
+/// 与插件 `fmt_ts` 同格式的时间文案。
+fn ts(secs: i64) -> String {
+    DateTime::from_timestamp(secs, 0).unwrap().format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
+/// 直接塞进 plugin_data 的汇率缓存记录（`fx_json` 是 http 应答体，字段不同）。
+fn fx_record(base: &str, fetched_at: i64) -> String {
+    serde_json::json!({
+        "base": base,
+        "rates": {"USD": 0.14, "CNY": 1.0, "EUR": 0.13},
+        "fetched_at": fetched_at,
+    })
+    .to_string()
+}
+
+/// 直接塞进 plugin_data 的拉取失败记录。
+fn fx_status_record(reason: &str, attempted_at: i64) -> String {
+    serde_json::json!({ "reason": reason, "attempted_at": attempted_at }).to_string()
+}
+
+/// http_get 的调用次数。
+fn http_calls(store: &Store<Host>) -> u32 {
+    *store.data().http_calls.lock().unwrap()
+}
+
+/// 页面里全部 notice 块的文本。
+fn notice_texts(page: &serde_json::Value) -> Vec<String> {
+    page["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["type"] == "notice")
+        .map(|b| b["text"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
 /// 造一个 seed 插件数据记录的辅助：直接往桩宿主的数据表里塞。
 fn seed(store: &Store<Host>, key: &str, value: &str) {
     store.data().data.lock().unwrap().insert(key.to_owned(), value.to_owned());
@@ -389,6 +428,7 @@ fn threshold_node_emits_event() {
 }
 
 /// Covers AE3：尚无汇率缓存时页面显示「汇率不可用」。
+/// U3 之后 render_page 自己也会试一次（KTD3），失败原因与尝试时间一并上提示条。
 #[test]
 fn page_warns_when_fx_unavailable() {
     let engine = engine();
@@ -401,6 +441,210 @@ fn page_warns_when_fx_unavailable() {
     call_unit(&mut store, &instance, "on_tick"); // 尝试拉，失败
     let page = call_json(&mut store, &instance, "render_page", "{}");
     assert!(page.contains("汇率不可用"), "页面应提示汇率不可用：{page}");
+    assert!(page.contains("尚未成功拉取过汇率"), "页面应说明从未成功拉取过：{page}");
+}
+
+/// Covers AE3（R4/KTD3）：无缓存 + 拉取成功——打开页面即触发一次 http_get，
+/// 页面立刻有汇率更新时间与统计块，不必等 tick。
+#[test]
+fn render_page_fetches_fx_when_cache_missing() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "node:1", &node_record("paid", 10.0, "USD", "monthly", None));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    assert_eq!(http_calls(&store), 1, "首屏应恰好拉一次汇率");
+    let notices = notice_texts(&page);
+    assert!(
+        notices.iter().any(|t| t.contains(&format!("汇率基准 CNY，更新时间 {}", ts(NOW)))),
+        "页面应显示刷新后的汇率时间：{notices:?}"
+    );
+    assert!(
+        page["blocks"].as_array().unwrap().iter().any(|b| b["type"] == "stat"),
+        "拉到汇率后应有统计块：{page}"
+    );
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("fx"), "首屏拉取的汇率应落缓存");
+    assert!(!data.contains_key("fx_status"), "成功的拉取不留失败记录");
+}
+
+/// Covers AE4（R5/KTD4）：无缓存 + 拉取失败——warning 条含「尚未成功拉取过汇率」
+/// 与具体失败原因（http 负错误码分类）和尝试时间。
+#[test]
+fn render_page_warns_with_failure_reason_when_fetch_fails() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // http_body 保持 None → 桩宿主返回 -4
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    assert_eq!(http_calls(&store), 1, "首屏应尝试过一次");
+    let text = &notice_texts(&page)[0];
+    assert!(text.contains("尚未成功拉取过汇率"), "应区分「从未成功拉取过」：{text}");
+    assert!(text.contains("网络请求失败或超时"), "应带上可读的失败原因：{text}");
+    assert!(text.contains(&ts(NOW)), "应带上尝试时间：{text}");
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(!data.contains_key("fx"), "失败的拉取不写缓存");
+    assert!(data.contains_key("fx_status"), "失败原因应落盘：{data:?}");
+}
+
+/// KTD3：有缓存（且陈旧）时打开页面不拉——刷新交给每小时 tick。
+#[test]
+fn render_page_does_not_fetch_when_cache_present() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // 拉的话会失败：计数为 0 才说明根本没试
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "fx", &fx_record("CNY", NOW - 86_400));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    assert_eq!(http_calls(&store), 0, "有缓存就不该再拉");
+    assert_eq!(
+        notice_texts(&page),
+        vec![format!("汇率基准 CNY，更新时间 {}", ts(NOW - 86_400))],
+        "有缓存且无失败记录时提示条维持现状"
+    );
+}
+
+/// R5/KTD4：有缓存 + 存在失败记录——保留汇率基准条，并追加一行失败原因。
+#[test]
+fn cached_page_appends_last_refresh_failure() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "fx", &fx_record("CNY", NOW - 7_200));
+    seed(&store, "fx_status", &fx_status_record("网络请求失败或超时", NOW));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    assert_eq!(http_calls(&store), 0, "有缓存不拉");
+    let notices = notice_texts(&page);
+    assert!(
+        notices.iter().any(|t| t.contains(&format!("汇率基准 CNY，更新时间 {}", ts(NOW - 7_200)))),
+        "汇率基准条保留：{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|t| t.contains(&format!("最近一次刷新 {} 失败：网络请求失败或超时", ts(NOW)))),
+        "应追加失败原因与尝试时间：{notices:?}"
+    );
+}
+
+/// KTD3：动作路径不拉汇率——保存不阻塞在网络往返上。
+#[test]
+fn on_action_never_fetches_fx() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // 拉了会失败，正好用计数断言"没拉"
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "node:1", &node_record("edge-1", 10.0, "USD", "monthly", None));
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"save_node","id":1,"name":"edge-renamed","price":10.0,
+            "currency":"USD","billing_cycle":"monthly","expires_at":""}"#,
+    ))
+    .unwrap();
+
+    assert_eq!(http_calls(&store), 0, "action 路径不该拉汇率");
+    assert_eq!(toast_of(&resp), ("success".into(), "已保存".into()));
+    // 没缓存时页面照样给出「尚未成功拉取过」的 warning（现有语义不变）。
+    let notices = notice_texts(&resp);
+    assert!(
+        notices.iter().any(|t| t.contains("尚未成功拉取过汇率")),
+        "无缓存时 action 返回的页面仍应 warning：{notices:?}"
+    );
+}
+
+/// R5/KTD4：拉取成功后失败记录被清除。
+#[test]
+fn successful_refresh_clears_failure_status() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "fx_status", &fx_status_record("网络请求失败或超时", NOW - 3_600));
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"refresh_fx"}"#,
+    ))
+    .unwrap();
+
+    assert_eq!(toast_of(&resp).0, "success");
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(data.contains_key("fx"), "成功应写入汇率缓存");
+    assert!(!data.contains_key("fx_status"), "成功应清掉失败记录：{data:?}");
+    assert!(
+        !notice_texts(&resp).iter().any(|t| t.contains("失败")),
+        "清掉失败记录后页面不应再提失败：{:?}",
+        notice_texts(&resp)
+    );
+}
+
+/// R5/KTD4：失败记录写在 refresh_fx 内部，tick 这条路径同样留痕；
+/// 原因按错误种类分类（非 JSON 响应、响应缺 rates）。
+#[test]
+fn failure_reasons_are_classified_and_recorded_everywhere() {
+    let engine = engine();
+    let wasm = build_wasm();
+
+    // 网络失败（http 负错误码 -4）：tick 也要记。
+    let host = Host::default();
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    tick(&mut store, &instance);
+    let st: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    assert_eq!(st["reason"], "网络请求失败或超时", "负错误码应分类成可读文案：{st}");
+    assert_eq!(st["attempted_at"], NOW, "应记下尝试时间");
+
+    // 响应不是 JSON。
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace("<html>502</html>".into());
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    tick(&mut store, &instance);
+    let st: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    let reason = st["reason"].as_str().unwrap();
+    assert!(reason.contains("JSON"), "解析失败要说明是 JSON 问题：{reason}");
+
+    // 是 JSON 但没有 rates。
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(r#"{"amount":1.0,"base":"CNY"}"#.into());
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    tick(&mut store, &instance);
+    let st: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    assert!(
+        st["reason"].as_str().unwrap().contains("rates"),
+        "缺 rates 要有自己的文案：{st}"
+    );
 }
 
 /// 页面钩子的开销随机器数线性增长,而宿主给的预算是每次调用固定的(见仓库

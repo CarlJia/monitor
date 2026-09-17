@@ -9,6 +9,7 @@
 //!   （到期的在线节点按周期向后滚动；进入阈值窗口的经 `emit_event` 发
 //!   `plugin_expiry_soon`）；
 //! - `render_page` 渲染统计页（年化续费成本 / 剩余价值 / 到期列表 / 编辑表）；
+//!   打开页面时若尚无汇率缓存，先同步拉一次（R4/KTD3），action 路径不拉；
 //! - `on_action` 处理页面交互（切币种 / 保存节点 / 立即刷新汇率）；
 //! - `on_cleanup` 清掉已删除节点的残留记录。
 //!
@@ -18,6 +19,7 @@
 //! |-----|-------|
 //! | `config` | `{target_currency, threshold_days, imported}` |
 //! | `fx` | `{base, rates: {CUR: number}, fetched_at}` |
+//! | `fx_status` | `{reason, attempted_at}`——最近一次拉取失败的原因与时间；成功即删（R5/KTD4） |
 //! | `node:<id>` | `{name, price, currency, billing_cycle, expires_at, purchased_at}` |
 //!
 //! 时间一律向宿主要（`host_now`），日期算术交给 chrono 的 NaiveDate。
@@ -174,6 +176,14 @@ struct Fx {
     fetched_at: i64,
 }
 
+/// 最近一次拉取汇率的失败记录（R5/KTD4）：成功时删掉这个键，失败时覆盖写入。
+/// 只要它存在，页面提示条就会带上原因与尝试时间——不管有没有旧缓存。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FxStatus {
+    reason: String,
+    attempted_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     #[serde(default = "default_target")]
@@ -326,7 +336,43 @@ fn nodes_basic() -> Option<Vec<(i64, String)>> {
 // 汇率（Frankfurter，KTD2/KTD5）
 // ---------------------------------------------------------------------------
 
-/// 拉一次汇率，以目标币种为 base。成功则更新缓存并返回 true。
+/// http 负错误码 → 可读的失败原因（码表见 hub 的 src/plugin/host_funcs.rs）。
+fn http_error_reason(code: i32) -> String {
+    match code {
+        -1 => "宿主内存写入失败".to_owned(),
+        -2 => "目标地址不是 https，宿主拒绝".to_owned(),
+        -4 => "网络请求失败或超时".to_owned(),
+        -5 => "汇率服务返回非 2xx 响应".to_owned(),
+        -9 => "目标地址解析到私有/保留网段，宿主拒绝".to_owned(),
+        other => format!("宿主返回错误码 {other}"),
+    }
+}
+
+/// 记下这次失败的原因与时间；下一次成功拉取会把它删掉。
+/// 拉取有多个入口（页面首屏 / 每小时 tick / 手动刷新），记录放在 `refresh_fx`
+/// 内部，谁触发都留痕——页面才不会只看得见"没拉过"而看不见"一直拉失败"。
+fn record_fx_failure(reason: String) {
+    let st = FxStatus { reason, attempted_at: unsafe { host_now() } };
+    if let Ok(s) = serde_json::to_string(&st) {
+        data_put("fx_status", &s);
+    }
+}
+
+fn clear_fx_failure() {
+    data_delete("fx_status");
+}
+
+fn load_fx_status() -> Option<FxStatus> {
+    data_get("fx_status").and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Unix 秒 → 页面上的时间文案（与汇率更新时间同格式）。
+fn fmt_ts(secs: i64) -> String {
+    DateTime::from_timestamp(secs, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
+}
+
+/// 拉一次汇率，以目标币种为 base。成功则更新缓存、清掉失败记录并返回 true；
+/// 失败则把失败原因与尝试时间写入 `fx_status` 并返回 false。
 fn refresh_fx(cfg: &Config) -> bool {
     let base = &cfg.target_currency;
     let url = format!("https://api.frankfurter.dev/v1/latest?base={base}");
@@ -335,7 +381,9 @@ fn refresh_fx(cfg: &Config) -> bool {
     let mut buf = vec![0u8; 64 * 1024];
     let n = unsafe { host_http_get(up, ul, buf.as_mut_ptr() as i32, buf.len() as i32) };
     if n <= 0 {
-        log(2, &format!("finance-stats: 汇率拉取失败（{n}）"));
+        let reason = http_error_reason(n);
+        log(2, &format!("finance-stats: 汇率拉取失败（{n}）：{reason}"));
+        record_fx_failure(reason);
         return false;
     }
     let body = bytes_to_string(&buf[..n as usize]);
@@ -343,6 +391,7 @@ fn refresh_fx(cfg: &Config) -> bool {
         Ok(v) => v,
         Err(e) => {
             log(2, &format!("finance-stats: 汇率响应不是 JSON: {e}"));
+            record_fx_failure(format!("汇率响应不是合法 JSON：{e}"));
             return false;
         }
     };
@@ -350,13 +399,16 @@ fn refresh_fx(cfg: &Config) -> bool {
         v.get("rates").and_then(|r| serde_json::from_value(r.clone()).ok()).unwrap_or_default();
     if rates.is_empty() {
         log(2, "finance-stats: 汇率响应没有 rates");
+        record_fx_failure("汇率响应里没有 rates 字段".to_owned());
         return false;
     }
     let fx = Fx { base: base.clone(), rates, fetched_at: unsafe { host_now() } };
     if let Ok(s) = serde_json::to_string(&fx) {
         data_put("fx", &s);
+        clear_fx_failure();
         return true;
     }
+    record_fx_failure("汇率缓存序列化失败，未写入".to_owned());
     false
 }
 
@@ -534,31 +586,51 @@ fn with_toast(mut page: Value, kind: &str, text: &str) -> Value {
     page
 }
 
-fn build_page() -> Value {
+fn build_page(allow_fetch: bool) -> Value {
     let mut cfg = Config::load();
     ensure_imported(&mut cfg);
     let today = today();
-    let fx = load_fx();
+    let mut fx = load_fx();
+    if fx.is_none() && allow_fetch {
+        // KTD3：拉取只发生在页面打开且无缓存时。动作路径（保存/切币种）不拉——
+        // 否则每次保存都要同步等一次网络往返。已有缓存也不拉，陈旧由 tick 兜底。
+        refresh_fx(&cfg);
+        fx = load_fx();
+    }
+    let failure = load_fx_status();
     let target = cfg.target_currency.clone();
 
     let mut blocks: Vec<Value> = Vec::new();
 
-    // 汇率状态提示。
+    // 汇率状态提示：成功过就报基准与更新时间，否则 warn。只要存在失败记录
+    // （不管有没有旧缓存）就把原因与尝试时间并进来（R5/KTD4）。
     match &fx {
         Some(f) => {
-            let when = DateTime::from_timestamp(f.fetched_at, 0)
-                .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
-                .unwrap_or_default();
             blocks.push(json!({
                 "type": "notice",
-                "text": format!("汇率基准 {}，更新时间 {when}", f.base),
+                "text": format!("汇率基准 {}，更新时间 {}", f.base, fmt_ts(f.fetched_at)),
             }));
+            if let Some(st) = &failure {
+                blocks.push(json!({
+                    "type": "notice",
+                    "kind": "warning",
+                    "text": format!(
+                        "最近一次刷新 {} 失败：{}",
+                        fmt_ts(st.attempted_at), st.reason
+                    ),
+                }));
+            }
         }
-        None => blocks.push(json!({
-            "type": "notice",
-            "kind": "warning",
-            "text": "汇率不可用——尚未成功拉取过汇率，统计暂缺",
-        })),
+        None => {
+            let text = match &failure {
+                Some(st) => format!(
+                    "汇率不可用——尚未成功拉取过汇率，统计暂缺；最近一次尝试 {} 失败：{}",
+                    fmt_ts(st.attempted_at), st.reason
+                ),
+                None => "汇率不可用——尚未成功拉取过汇率，统计暂缺".to_owned(),
+            };
+            blocks.push(json!({ "type": "notice", "kind": "warning", "text": text }));
+        }
     }
 
     // 汇总统计。
@@ -669,7 +741,7 @@ fn handle_action(input: &str) -> Value {
                 cfg.save();
                 refresh_fx(&cfg);
             }
-            with_toast(build_page(), "success", "已切换币种")
+            with_toast(build_page(false), "success", "已切换币种")
         }
         "refresh_fx" => {
             let cfg = Config::load();
@@ -679,14 +751,14 @@ fn handle_action(input: &str) -> Value {
             } else {
                 ("error", "汇率刷新失败，统计沿用最近一次缓存")
             };
-            with_toast(build_page(), kind, text)
+            with_toast(build_page(false), kind, text)
         }
         "save_node" => {
             let Some(id) = req.get("id").and_then(|v| v.as_i64()) else {
-                return with_toast(build_page(), "error", "未指定要保存的节点");
+                return with_toast(build_page(false), "error", "未指定要保存的节点");
             };
             let Some(mut n) = load_node(id) else {
-                return with_toast(build_page(), "error", "节点记录不存在，未保存");
+                return with_toast(build_page(false), "error", "节点记录不存在，未保存");
             };
             if let Some(v) = req.get("name").and_then(|v| v.as_str()) {
                 n.name = v.to_owned();
@@ -704,9 +776,9 @@ fn handle_action(input: &str) -> Value {
                 n.expires_at = if v.is_empty() { None } else { Some(v.to_owned()) };
             }
             save_node(id, &n);
-            with_toast(build_page(), "success", "已保存")
+            with_toast(build_page(false), "success", "已保存")
         }
-        _ => build_page(),
+        _ => build_page(false),
     }
 }
 
@@ -753,10 +825,10 @@ pub extern "C" fn on_tick() -> i32 {
     0
 }
 
-/// 渲染面板页面。
+/// 渲染面板页面。打开页面是唯一允许"顺手拉一次汇率"的入口（KTD3）。
 #[no_mangle]
 pub extern "C" fn render_page(_ptr: i32, _len: i32) -> i32 {
-    respond(&build_page())
+    respond(&build_page(true))
 }
 
 /// 处理页面交互。
