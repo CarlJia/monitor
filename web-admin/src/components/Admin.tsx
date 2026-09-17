@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Puzzle, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
@@ -1143,19 +1143,15 @@ function SettingsTab() {
 // and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
 
-function Sessions() {
-  const [rows, setRows] = useState<Session[] | null>(null)
+function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
   const [busy, setBusy] = useState("")
-
-  const load = () => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message))
-  useEffect(() => { load() }, [])
 
   async function remove(id: string) {
     setBusy(id)
     try {
       await api(`/sessions/${id}`, { method: "DELETE" })
       toast.success("已删除会话")
-      load()
+      reload()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1163,7 +1159,6 @@ function Sessions() {
     }
   }
 
-  if (!rows) return null
   return (
     <Card className="gap-4 p-5">
       <div>
@@ -1195,13 +1190,25 @@ function Sessions() {
 
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
+  const [sessions, setSessions] = useState<Session[] | null>(null)
+  const [sessionsFailed, setSessionsFailed] = useState(false)
   const [password, setPassword] = useState("")
-  if (!s) return null
+  // 会话卡片排在最上面。它此前等 `if (!s)` 放行后才挂载、才发起请求，于是必然
+  // 比它下面的两张卡片晚一拍出现，把已经可见的两张整体推下去——实测 CLS 0.15。
+  // 现在两条请求并行，两边都到齐才渲染，卡片一次性出现，没有可被推动的内容。
+  // 取会话失败时不能再等下去：那时不会插入任何卡片，页面照常渲染，只是少这一张。
+  const loadSessions = useCallback(() => {
+    api<Session[]>("/sessions")
+      .then((rows) => { setSessions(rows); setSessionsFailed(false) })
+      .catch((e: Error) => { toast.error(e.message); setSessionsFailed(true) })
+  }, [])
+  useEffect(() => { loadSessions() }, [loadSessions])
+  if (!s || (!sessions && !sessionsFailed)) return null
   const callback = `${site}/api/auth/github/callback`
 
   return (
     <div className="space-y-4">
-      <Sessions />
+      {sessions && <Sessions rows={sessions} reload={loadSessions} />}
 
       <Card className="gap-4 p-5">
         <div>
