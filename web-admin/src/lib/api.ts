@@ -120,6 +120,18 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ---- plugins（U7）：通知插件的上传、启停删、测试、日志与 kv ----
 
+/** manifest 的 `[[config]]` 声明的一项：面板「配置」对话框据此渲染。 */
+export type PluginConfigDecl = {
+  /** kv 的 key。 */
+  key: string
+  /** 显示用的人话名字；未声明为 null。 */
+  label: string | null
+  /** 点「测试」前是否必须有值（宿主在测试前预检）。 */
+  required: boolean
+  /** 一句话填写说明；未声明为 null。 */
+  hint: string | null
+}
+
 export type Plugin = {
   id: number
   plugin_id: string
@@ -136,6 +148,12 @@ export type Plugin = {
   tick: boolean
   /** v2：声明了统一的清理入口。 */
   cleanup: boolean
+  /**
+   * manifest 声明的渠道配置字段；没声明就是空数组。
+   * 标成可选是因为它来自 JSON——类型是断言不是保证（`api()` 不做运行时校验），
+   * 使用处一律用 `?? []` 兜底。
+   */
+  config?: PluginConfigDecl[]
 }
 
 /** 派发日志的一条（R16）：内存环形缓冲的快照，重启后为空。 */
@@ -146,6 +164,8 @@ export type PluginLogEntry = {
   event_type: string
   elapsed_ms: number
   result: string
+  /** 插件自己经 host.log 打的话（最新几行，有界）；没打就是 null。 */
+  detail: string | null
 }
 
 export type PluginKv = { key: string; value: string }
@@ -186,11 +206,16 @@ export const enablePlugin = (id: number) =>
 export const disablePlugin = (id: number) =>
   api<{ ok: boolean }>(`/plugins/${id}/disable`, { method: "POST" })
 
-/** 测试通知（R12）：合成一个明天的 ExpirySoon 事件走真实派发路径。 */
+/**
+ * 测试通知（R12）：合成一个明天的 ExpirySoon 事件走真实派发路径。
+ * 声明了必填 `[[config]]` 而还没填时返回 400，body 是点名缺哪一项的中文说明
+ * （`api()` 会把它当 error message 抛出来）。
+ */
 export const testPlugin = (id: number) =>
-  api<{ plugin_id: string; wasm_result: string; elapsed_ms: number }>(`/plugins/${id}/test`, {
-    method: "POST",
-  })
+  api<{ plugin_id: string; wasm_result: string; elapsed_ms: number; detail: string | null }>(
+    `/plugins/${id}/test`,
+    { method: "POST" },
+  )
 
 /** 一个插件最近的 100 条派发记录（R16）。 */
 export const pluginLogs = (id: number) => api<PluginLogEntry[]>(`/plugins/${id}/logs`)

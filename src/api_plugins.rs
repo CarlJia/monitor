@@ -39,11 +39,6 @@ const PLUGIN_MAX_EXPANDED: u64 = 32 << 20;
 const PLUGIN_MANIFEST_MAX: usize = 64 * 1024;
 const PLUGIN_WASM_MAX: usize = 16 << 20;
 
-/// 面板 kv 的 key 上限,给 `plugin.<id>:<key>` 的命名空间留出余量。value 的
-/// 上限不在 api 这边定义:面板能写的不能比插件运行时能写的多,单点是
-/// [`plugin::KV_VALUE_MAX`]。
-const PLUGIN_KV_KEY_MAX: usize = 128;
-
 /// 插件 handler 共用的 404 门:多数 handler 只要 plugin_id(delete 连它删的
 /// kv 行也只按 plugin_id 找),所以这里读轻量的 [`Db::plugin_id_of`] 而不是
 /// 整行——整行会连几 MiB 的 wasm blob 一起读出来再扔掉。返回 `Err(响应)`
@@ -281,6 +276,14 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                         "page": m.as_ref().and_then(|m| m.page.as_ref()).map(|p| p.title.clone()),
                         "tick": m.as_ref().map(|m| m.tick).unwrap_or(false),
                         "cleanup": m.as_ref().map(|m| m.cleanup).unwrap_or(false),
+                        // 声明的渠道配置字段:面板「配置」对话框据此渲染标签、
+                        // 标注必填、显示提示,不必让操作者猜 key 名。
+                        "config": m.as_ref().map(|m| m.kv.iter().map(|c| json!({
+                            "key": c.key.clone(),
+                            "label": c.label.clone(),
+                            "required": c.required,
+                            "hint": c.hint.clone(),
+                        })).collect::<Vec<_>>()).unwrap_or_default(),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -352,14 +355,57 @@ pub async fn disable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<
     Json(json!({"ok": true})).into_response()
 }
 
+/// manifest 声明的必填配置里,面板还没填的那些。返回给人看的名字:有 label
+/// 就 `标签(key)`,没有就 `key`。
+///
+/// 「没填」= 行不存在**或值为空**:`host_kv_get` 对两者都返回 0(README
+/// 「`0 = 无值或空`」),这两类必须与插件运行时看到的一致,否则会出现「预检说填好
+/// 了、插件说没有」这种最难查的分歧。纯空白比插件看到的更严——面板不会拦,操作员
+/// 多半是手滑;与其让插件拿着一个空格去请求 Telegram,不如在这里点出来。
+///
+/// 读库失败走 `Err` 而不是被算成「没填」:那是库故障,调用方要报 500,不能把故障
+/// 说成一句自信的「你还没配」。
+fn missing_required_config(app: &App, plugin_id: &str, manifest: &Manifest) -> anyhow::Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for decl in manifest.kv.iter().filter(|d| d.required) {
+        let stored = app.db.try_get(&format!("plugin.{plugin_id}:{}", decl.key))?;
+        if stored.is_none_or(|v| v.trim().is_empty()) {
+            missing.push(match decl.label.as_deref() {
+                Some(label) if !label.trim().is_empty() => format!("{label}({})", decl.key),
+                _ => decl.key.clone(),
+            });
+        }
+    }
+    Ok(missing)
+}
+
 /// 测试通知(R12):合成一个明天的 ExpirySoon 事件,走与真实派发完全相同的
 /// 执行路径(超时、fuel、宿主函数),但绕过 emit 与 notification_log——一次
 /// 手工测试不占幂等键,真实事件的成功与否不该被它覆盖(U4 的 dispatch_one)。
+///
+/// 派发前先按 manifest 的 `[[kv]]` 预检必填项:插件返回 `other:2` 这种码,
+/// 操作者从面板上看不出缺的是什么。只有这一条路径做预检——真实派发没有 400 可
+/// 给,后台事件旁边也没有操作员。
 pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let plugin_id = match plugin_or_404(&app, id) {
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
+    // 未启用/加载失败时取不到 manifest,跳过预检,交给下面 dispatch_one 原有的
+    // 那句「插件未启用或加载失败」——两条错误不该互相盖掉。
+    let manifest = app.plugins.read().unwrap_or_else(|e| e.into_inner()).manifest_of(id);
+    if let Some(manifest) = &manifest {
+        let missing = match missing_required_config(&app, &plugin_id, manifest) {
+            Ok(missing) => missing,
+            Err(e) => return fail(e),
+        };
+        if !missing.is_empty() {
+            return bad(&format!(
+                "插件缺少必填配置:{}；请在插件的「配置」里填写后再测试",
+                missing.join("、")
+            ));
+        }
+    }
     let event = Event::Plugin {
         name: "plugin_expiry_soon".into(),
         payload: serde_json::json!({
@@ -384,6 +430,8 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
             "plugin_id": plugin_id,
             "wasm_result": entry.result,
             "elapsed_ms": entry.elapsed_ms,
+            // 插件自己打的话:错误码是它私有的,`other:2` 光看数字排不了障。
+            "detail": entry.detail,
         }))
         .into_response(),
         // 未加载(未启用或加载失败)是调用侧可修复的状态,400 而不是 500。
@@ -524,17 +572,19 @@ const ACTION_BODY_MAX: usize = 64 * 1024;
 /// kv 的 key 校验,set 与 delete 共用:set 侧挡住不能落库的形状,delete
 /// 侧对同样的形状按 400 拒绝而不是当成不存在的行吞掉——它们只能是打错的
 /// 路由参数,报错比静默成功更接近调用方的预期。
+///
+/// 形状规则单点在 [`plugin::kv_key_problem`],与 manifest 的 `[[kv]]` 声明用的是
+/// 同一份;这里只把它折成面板的文案。首尾空白也拒:接口写入的是**原样** key,
+/// 带空白的那一行与插件声明的字段永远对不上。
 fn kv_key_error(key: &str) -> Option<Response> {
-    if key.trim().is_empty() {
-        return Some(bad("key 不能为空"));
+    match plugin::kv_key_problem(key)? {
+        plugin::KvKeyProblem::Empty => Some(bad("key 不能为空")),
+        plugin::KvKeyProblem::Padded => {
+            Some(bad("key 首尾不能有空白：写入的是原样 key，带空白的那一行与插件声明的字段对不上"))
+        }
+        plugin::KvKeyProblem::Colon => Some(bad("key 不能包含 ':'（它是 kv 命名空间的分隔符）")),
+        plugin::KvKeyProblem::TooLong => Some(bad(&format!("key 超过 {} 字节的上限", plugin::KV_KEY_MAX))),
     }
-    if key.len() > PLUGIN_KV_KEY_MAX {
-        return Some(bad(&format!("key 超过 {PLUGIN_KV_KEY_MAX} 字节的上限")));
-    }
-    if key.contains(':') {
-        return Some(bad("key 不能包含 ':'（它是 kv 命名空间的分隔符）"));
-    }
-    None
 }
 
 /// 写一个插件的 kv 行(R13):渠道配置这类「面板替插件填」的值。落在与
@@ -1010,6 +1060,7 @@ mod tests {
         assert_eq!(body["plugin_id"], "com.example.lifecycle");
         assert_eq!(body["wasm_result"], "success");
         assert!(body["elapsed_ms"].as_u64().is_some());
+        assert!(body["detail"].is_null(), "不打日志的插件 detail 就是 null");
 
         assert_eq!(disable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         let row = app.db.get_plugin(id).unwrap().unwrap();
@@ -1027,6 +1078,102 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(test_plugin(Admin, State(app.clone()), Path(9999)).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// manifest 声明了必填配置时,「测试」前宿主先预检:缺项直接 400 点名,而不是
+    /// 让插件回来一个 `other:2` 让操作者猜。空值算没填——必须与 `host_kv_get` 对
+    /// 「无值或空」都返回 0 的语义一致,否则会出现「预检说填好了、插件说没有」。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_plugin_asks_for_required_config_before_dispatching() {
+        let app = plugin_app();
+        let manifest = format!(
+            "{}[[kv]]\nkey = \"bot_token\"\nlabel = \"Bot Token\"\nrequired = true\n\
+             [[kv]]\nkey = \"note\"\n",
+            plugin_manifest("com.example.needs-config", 2)
+        );
+        assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+
+        let set = |key: &str, value: &str| {
+            set_plugin_kv(
+                Admin,
+                State(app.clone()),
+                Path((id, key.to_owned())),
+                Json(json!({ "value": value })),
+            )
+        };
+        let test = || test_plugin(Admin, State(app.clone()), Path(id));
+
+        // 必填的没填:400 点名「标签(key)」;非必填的不点名。
+        let refused = test().await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let text =
+            String::from_utf8_lossy(&axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap())
+                .into_owned();
+        assert!(text.contains("Bot Token(bot_token)"), "要点名标签与 key,实际:{text}");
+        assert!(!text.contains("note"), "非必填项不点名,实际:{text}");
+
+        // 空串等于没填:预检必须与插件运行时看到的一致。
+        assert_eq!(set("bot_token", "").await.status(), StatusCode::OK);
+        assert_eq!(test().await.status(), StatusCode::BAD_REQUEST, "空值不算填过");
+
+        // 填上真值:放行,回到真实的派发路径(MINIMAL_WAT 返回 0)。
+        assert_eq!(set("bot_token", "123:abc").await.status(), StatusCode::OK);
+        let ok = test().await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_of(ok).await["wasm_result"], "success");
+    }
+
+    /// 预检遇到读库失败要报 500,不能把库故障说成「你还没配」——那是一句自信而错误
+    /// 的指引,会把操作员支去重填一个本来就在的值。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_read_is_a_500_not_a_missing_config() {
+        let app = plugin_app();
+        let manifest = format!(
+            "{}[[kv]]\nkey = \"bot_token\"\nrequired = true\n",
+            plugin_manifest("com.example.broken-db", 2)
+        );
+        assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        // 表没了 —— 一次真实的读库失败,必须与「这一项没填」区分开。
+        app.db.conn().execute("DROP TABLE setting", []).unwrap();
+        assert_eq!(
+            test_plugin(Admin, State(app.clone()), Path(id)).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "库故障不该被报成「缺少必填配置」"
+        );
+    }
+
+    /// 列表接口把 manifest 的 `[[kv]]` 透给面板:key/label/required/hint,
+    /// 缺省的 label/hint 是 null(与 `page` 的约定一致)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_declares_its_config_for_the_panel() {
+        let app = plugin_app();
+        let manifest = format!(
+            "{}[[kv]]\nkey = \"bot_token\"\nlabel = \"Bot Token\"\nrequired = true\n\
+             hint = \"向 @BotFather 申请\"\n[[kv]]\nkey = \"chat_id\"\n",
+            plugin_manifest("com.example.declares", 2)
+        );
+        assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
+        let body = body_of(list_plugins(Admin, State(app.clone())).await).await;
+        assert_eq!(
+            body[0]["config"],
+            json!([
+                {"key": "bot_token", "label": "Bot Token", "required": true, "hint": "向 @BotFather 申请"},
+                {"key": "chat_id", "label": null, "required": false, "hint": null},
+            ])
+        );
+        // 没声明 [[kv]] 的插件解析出空表:面板照旧,不显示配置提示。
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.plain", 2))).await.status(),
+            StatusCode::OK
+        );
+        let body = body_of(list_plugins(Admin, State(app.clone())).await).await;
+        // 列表按 uploaded_at DESC, id DESC:后传的在前。
+        assert_eq!(body[0]["plugin_id"], "com.example.plain");
+        assert_eq!(body[0]["config"], json!([]));
     }
 
     /// 删除把三处状态一起收:db 行、kv 行、内存里的实例;不存在的行是 404。
@@ -1093,7 +1240,7 @@ mod tests {
         // key 为空或含 ':',value 超限,body 形状不对:全部 400,且不落库。
         assert_eq!(put("   ", json!({"value": "x"})).await.status(), StatusCode::BAD_REQUEST);
         assert_eq!(put("a:b", json!({"value": "x"})).await.status(), StatusCode::BAD_REQUEST);
-        let long = "k".repeat(PLUGIN_KV_KEY_MAX + 1);
+        let long = "k".repeat(plugin::KV_KEY_MAX + 1);
         assert_eq!(put(&long, json!({"value": "x"})).await.status(), StatusCode::BAD_REQUEST);
         let big = "v".repeat(plugin::KV_VALUE_MAX + 1);
         assert_eq!(put("k", json!({"value": big})).await.status(), StatusCode::BAD_REQUEST);
@@ -1192,8 +1339,8 @@ mod tests {
         // 已经不存在的行:同样 204,重试幂等。
         assert_eq!(del("webhook").await.status(), StatusCode::NO_CONTENT);
 
-        // key 校验与 set 同一套:空、含 ':'、超长。
-        for bad_key in ["   ", "a:b", &"k".repeat(PLUGIN_KV_KEY_MAX + 1)] {
+        // key 校验与 set 同一套:空、首尾空白、含 ':'、超长。
+        for bad_key in ["   ", " bot", "bot ", "a:b", &"k".repeat(plugin::KV_KEY_MAX + 1)] {
             assert_eq!(del(bad_key).await.status(), StatusCode::BAD_REQUEST, "{bad_key:?}");
         }
         // 插件行不存在是 404,不是静默成功。

@@ -656,6 +656,17 @@ impl Db {
             .flatten()
     }
 
+    /// [`Db::get`] 的传错版本。`get` 把读库失败吞成「没有这一行」,调用方因此分不出
+    /// 「行不存在」与「库坏了」——对「未设就是默认」的读法这没问题,但要把这个区别
+    /// 报成 400/403 还是 500 的地方(必填配置预检、host_kv_get、登录)必须用这个,
+    /// 否则库故障会被说成一句自信而错误的状态。
+    pub fn try_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
         self.conn().execute(
             "INSERT INTO setting (key, value) VALUES (?1, ?2)
@@ -1873,6 +1884,21 @@ mod tests {
         assert_eq!(read("wal_autocheckpoint"), 256);
         assert_eq!(read("journal_size_limit"), 1_048_576);
         assert_eq!(read("busy_timeout"), 5_000);
+    }
+
+    /// `try_get` 与 `get` 的差别只有一处:读库失败时前者传错、后者吞成 None。
+    /// 要区分「行不存在」与「库坏了」的调用方靠这个差别决定报 400/403 还是 500。
+    #[test]
+    fn try_get_separates_a_read_failure_from_a_missing_row() {
+        let db = db();
+        db.set("present", "value").unwrap();
+        assert_eq!(db.try_get("present").unwrap().as_deref(), Some("value"));
+        assert_eq!(db.try_get("absent").unwrap(), None, "行不存在是 Ok(None),不是错");
+        assert_eq!(db.get("absent"), None);
+        // 制造一次真实的读库失败:表没了。两条路在这一刻分道扬镳。
+        db.conn().execute("DROP TABLE setting", []).unwrap();
+        assert!(db.try_get("present").is_err(), "读库失败要传错");
+        assert_eq!(db.get("present"), None, "而 get 把它吞成「没有这一行」");
     }
 
     /// A real file, since these three tests exist to exercise what happens to
