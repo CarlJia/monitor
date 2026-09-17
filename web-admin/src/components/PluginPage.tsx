@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { ArrowLeft, RefreshCw } from "lucide-react"
+import { ArrowLeft, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -8,19 +8,45 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { pluginAction, pluginPage, type PluginBlock, type PluginPage as PluginPageData } from "@/lib/api"
+import {
+  asText,
+  formPayload,
+  normalizeFields,
+  pluginAction,
+  pluginPage,
+  toastKind,
+  type PluginBlock,
+  type PluginPage as PluginPageData,
+  type PluginToast,
+  type ToastKind,
+} from "@/lib/api"
 
-// 字段名 → 输入控件类型。插件不声明每个字段的控件类型，前端从字段名猜：
-// 价格/成本用数字，*_at 用日期，其余文本。插件对未声明的字段做兜底处理。
-function inputType(field: string): "text" | "number" | "date" {
-  if (/price|cost|amount/i.test(field)) return "number"
-  if (/at$/.test(field)) return "date"
-  return "text"
-}
-
-// 把任意 JSON 值渲染成可读字符串：null/undefined 视作空，数字/布尔照常。
+/** 把任意 JSON 值渲染成可读字符串：null/undefined 视作空，数字/布尔照常。 */
 function cell(value: unknown): string {
   return value === null || value === undefined ? "" : String(value)
+}
+
+/**
+ * `ToastKind` → 该调哪一个 toast。写成 `Record<ToastKind, …>` 是刻意的：
+ * 往 `TOAST_KINDS` 里加第五种 kind 时这里会编译不过，而不是被 `switch` 的
+ * `default` 静默当成成功。
+ */
+const TOAST_FN: Record<ToastKind, (m: string) => void> = {
+  success: toast.success,
+  error: toast.error,
+  warning: toast.warning,
+  info: toast.info,
+}
+
+/**
+ * 触发插件随 action 响应带回来的提示。`kind` 缺省或认不出按成功处理
+ * （`toastKind` 已收窄，认不出的落到 `success`）；没有文案就不弹（空白
+ * toast 读起来像「出错了却没原因」）。
+ */
+function fireToast(t: PluginToast) {
+  const text = asText(t.text)
+  if (text.trim() === "") return
+  TOAST_FN[toastKind(t.kind)](text)
 }
 
 // form 块：每行一组可编辑字段 + 单行保存。草稿按行索引存，页面刷新后
@@ -32,28 +58,19 @@ function FormBlock({ block, busy, onSubmit }: {
 }) {
   const [drafts, setDrafts] = useState<Record<number, Record<string, string>>>({})
   const rows = (block.rows ?? []) as Record<string, unknown>[]
-  const fields = block.fields ?? []
+  const fields = normalizeFields(block.fields)
+  // 在途时行内控件一并禁用：响应回来会重挂载表单清空草稿，这几秒里允许编辑
+  // 等于允许用户白改一场。
+  const busyNow = busy !== null
 
-  const draft = (i: number, f: string) => drafts[i]?.[f] ?? cell(rows[i]?.[f])
+  const value = (i: number, f: string) => drafts[i]?.[f] ?? cell(rows[i]?.[f])
   const patch = (i: number, f: string, v: string) =>
     setDrafts((old) => ({ ...old, [i]: { ...(old[i] ?? {}), [f]: v } }))
 
   async function saveRow(row: Record<string, unknown>, i: number) {
-    const payload: Record<string, unknown> = {}
-    if (row.id !== undefined) payload.id = row.id
-    for (const f of fields) {
-      if (inputType(f) === "number") {
-        // 空串要跳过而不是转成 0:`Number("")` 是 0,用户清空价格本意是"没填",
-        // 存成 0 会把它静默标成"免费"。非空但解析不出数字的也跳过,保留服务端原值。
-        const raw = draft(i, f).trim()
-        if (raw === "") continue
-        const n = Number(raw)
-        if (!Number.isNaN(n)) payload[f] = n
-      } else {
-        payload[f] = draft(i, f)
-      }
-    }
-    await onSubmit(block.action ?? "save", payload)
+    const values = Object.fromEntries(fields.map((f) => [f.name, value(i, f.name)]))
+    // 取值规则（数字字段的空串/非数字跳过）在 formPayload 里，见 api.ts。
+    await onSubmit(block.action ?? "save", formPayload(fields, row.id, values))
   }
 
   return (
@@ -61,7 +78,7 @@ function FormBlock({ block, busy, onSubmit }: {
       <Table>
         <TableHeader>
           <TableRow>
-            {fields.map((f) => <TableHead key={f}>{f}</TableHead>)}
+            {fields.map((f) => <TableHead key={f.name}>{f.label}</TableHead>)}
             <TableHead className="text-right">操作</TableHead>
           </TableRow>
         </TableHeader>
@@ -75,19 +92,45 @@ function FormBlock({ block, busy, onSubmit }: {
           ) : rows.map((row, i) => (
             <TableRow key={i}>
               {fields.map((f) => {
-                const initial = cell(row[f])
-                const type = inputType(f)
+                // 值是「草稿，回落到服务端原值」；placeholder 仍是原值，用户
+                // 知道自己抹掉了什么。
+                const shown = value(i, f.name)
+                const initial = cell(row[f.name])
+                // 行里的值可能不在 options 里（插件改过选项集合，老数据还在）：
+                // 补一项进去。否则 Radix 的触发器会显示空白，操作者看不出当前
+                // 值是什么——正是这次改版要消掉的「看不见」。比对的是选项的
+                // `value`（提交载荷里的值），补的那项值与文案都是这串原值：
+                // 它没有声明过的文案可用，至少别让当前值消失。
+                const extra = shown !== "" && !f.options.some((o) => o.value === shown) ? shown : null
                 return (
-                  <TableCell key={f}>
-                    <Input
-                      type={type}
-                      // 值是「草稿，回落到服务端原值」；清空后 placeholder 仍
-                      // 显示原值，用户知道自己抹掉了什么。
-                      value={draft(i, f)}
-                      placeholder={initial}
-                      className="min-w-32"
-                      onChange={(e) => patch(i, f, e.target.value)}
-                    />
+                  <TableCell key={f.name}>
+                    {f.type === "select" ? (
+                      <Select
+                        value={shown}
+                        onValueChange={(v) => patch(i, f.name, v)}
+                        disabled={busyNow}
+                      >
+                        <SelectTrigger className="min-w-32">
+                          <SelectValue placeholder={initial} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {/* 显示 label（人话），提交 value（协议里的标识）。 */}
+                          {f.options.map((opt) => (
+                            <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                          ))}
+                          {extra !== null && <SelectItem key={extra} value={extra}>{extra}</SelectItem>}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <Input
+                        type={f.type}
+                        value={shown}
+                        placeholder={initial}
+                        className="min-w-32"
+                        disabled={busyNow}
+                        onChange={(e) => patch(i, f.name, e.target.value)}
+                      />
+                    )}
                   </TableCell>
                 )
               })}
@@ -95,7 +138,7 @@ function FormBlock({ block, busy, onSubmit }: {
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={busy !== null}
+                  disabled={busyNow}
                   onClick={() => saveRow(row, i)}
                 >
                   保存
@@ -138,6 +181,9 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
       const next = await pluginAction(id, { action, ...payload })
       setPage(next)
       setPageKey((n) => n + 1)
+      // 提示只在 action 的响应上弹一次；初始 pluginPage 加载不弹——否则每次
+      // 打开页面都会重播上一次操作的结果。文案与 kind 都由插件给（KTD2）。
+      if (next.toast) fireToast(next.toast)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -158,7 +204,18 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
       </Card>
     )
   }
-  if (!page) return <p className="text-sm text-muted-foreground">加载中…</p>
+  // 首次加载可能几秒：插件可以在 `render_page` 里顺手做一次性工作（财务插件
+  // 就是在这里拉汇率的），这段时间里只给一句「加载中…」会被读成卡死——多给
+  // 一句为什么慢，操作者才知道该等而不是去点刷新。
+  if (!page) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" aria-hidden />
+        <p className="text-sm text-muted-foreground">加载中…</p>
+        <p className="text-xs text-muted-foreground">首次打开可能需要几秒获取汇率</p>
+      </div>
+    )
+  }
 
   const isTable = (rows: unknown) => Array.isArray(rows) && (rows.length === 0 || Array.isArray(rows[0]))
   const blocks = page.blocks ?? []

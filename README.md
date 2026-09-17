@@ -171,11 +171,16 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 写入字节数。`on_action` 也是同样的协议：body 是 `{action, ...}` 的 JSON，
 返回新页面描述（操作完成后整页重渲染）。
 
+`render_page` 允许带一次性副作用（例如尚无缓存时顺手拉一次汇率），但它在
+每次打开页面和每次刷新时都会被调用，所以这类工作必须**幂等且有界**——面板
+与页面上的刷新按钮会反复调它，副作用不能累积、也不能随调用次数增长。
+
 返回 JSON 形如：
 
 ```json
 {
   "title": "财务统计",
+  "toast": {"kind": "success", "text": "已保存"},
   "blocks": [
     {"type": "notice", "kind": "warning", "text": "汇率不可用……"},
     {"type": "stat", "items": [
@@ -188,32 +193,89 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
      "columns": ["节点", "到期日", "剩余天数"],
      "rows": [["edge-1","2026-10-01",3]]},
     {"type": "form", "title": "节点财务数据", "action": "save_node",
-     "fields": ["name","price","currency","billing_cycle","expires_at"],
+     "fields": [
+       {"name": "name", "label": "节点名", "type": "text"},
+       {"name": "price", "label": "价格", "type": "number"},
+       {"name": "currency", "label": "币种", "type": "select", "options": ["CNY","USD"]},
+       {"name": "billing_cycle", "label": "计费周期", "type": "select",
+        "options": [{"value":"monthly","label":"月付"},{"value":"once","label":"一次性"}]},
+       {"name": "expires_at", "label": "到期日", "type": "date"}
+     ],
      "rows": [{"id":1,"name":"edge-1","price":12.5,"currency":"USD",
-              "billing_cycle":"12","expires_at":"2027-01-01"}]}
+               "billing_cycle":"monthly","expires_at":"2027-01-01"}]}
   ]
 }
 ```
 
 支持的 `type`：`notice`（`kind: warning` 高亮，其余中性背景）、`stat`
-（`items: [{label,value}]`）、`select`（提交 `{action, value}`）、
-`table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，提交
-`{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
+（`items: [{label,value}]`）、`select`（提交 `{action, value}`；这个级别的
+`options` 仍是字符串数组，显示即提交，值本身需要中文文案时改用 `form` 行里的
+`select` 字段）、`table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，
+提交 `{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
 
-`form` 的字段名决定控件类型，这是**协议的一部分**（不是实现细节）：名字里
-含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at` 结尾的用日期
-输入框，其余用文本框。字段名不合这套规则就会拿到错误的控件（比如把价格叫
-`unit_cost_value` 仍会被认成数字，但叫 `fee` 就只会是文本框）。
+顶层可选的 `toast` 是**操作回执**：`{"kind": …, "text": …}`，面板在
+`on_action` 的响应到达时弹一次，文案由插件给（宿主不替插件编文案）。`kind`
+取 `success` / `error` / `info` / `warning`，省略或写了别的值按 `success`
+处理；`text` 为空（或没有 `toast`）就不弹。**初始 `render_page` 的响应不触发
+提示**——否则每次打开页面都会重播上一次操作的结果。失败分支也走这条路：插件
+把原因写进 `toast.text`（`kind: "error"`）比只把状态码塞进页面更直接。
+
+`form` 的 `fields` 有两种形态，都接受：
+
+```json
+"fields": ["name", "price", "currency", "billing_cycle", "expires_at"]
+"fields": [{"name": "price", "label": "价格", "type": "number"},
+           {"name": "currency", "label": "币种", "type": "select",
+            "options": ["CNY", "USD"]},
+           {"name": "billing_cycle", "label": "计费周期", "type": "select",
+            "options": [{"value": "monthly", "label": "月付"},
+                        {"value": "once", "label": "一次性"}]}]
+```
+
+- `name`（必填）是提交载荷里的键，也是取值时的键；没有名字的条目会被丢弃。
+- `label` 是编辑表的列头文案，缺省（或全是空白）时用字段名——旧式声明因此
+  照旧显示字段标识，新式声明才能显示「节点名」这类中文表头。
+- `type` 取 `text` / `number` / `date` / `select`。**声明优先**：写了
+  `type: "number"` 的字段即使名字叫 `fee` 也会渲染成数字输入框、并按数字
+  提交。
+- `select` 需要一并给 `options`，面板渲染成下拉，选中值写进该行草稿、随该行
+  的「保存」一起提交。**没给 `options` 的 `select` 会回退**到下面的字段名
+  启发式——一个没有可选项的下拉是死控件，既改不了也清不掉。
+- `options` 里每一项可以是**裸字符串**（既是提交值也是显示文案），也可以是
+  **`{"value": …, "label": …}` 对象**：面板显示 `label`、提交 `value`。值本身
+  不是人话的字段（`monthly` / `once` / 币种代码）用它把标识与文案分开——
+  `label` 缺省或全是空白时回退成 `value`，`value` 不是非空字符串的项直接
+  丢掉（渲染出来要么是死选项要么是看不见的选项）。**提交的永远是 `value`**，
+  面板不会把 `label` 写回载荷。
+- `type` 缺省或认不出（比如写成 `currency`、`int`）同样回退到字段名启发式:
+  插件写错一个词不该让整列变成不能用的控件。
+
+`label` 是给操作者看的，`name` 才是协议；两者不一致时以 `name` 为准。
+
+`select` 表达不了"清空/未设置"：`options` 里没有空值项，Radix 的触发器也不会
+把选择退回去，所以下拉**只能改、不能清**。需要让操作员清掉某个字段的插件
+（比如把计费周期恢复成未填写）应当把该字段声明成文本字段——文本框清空提交
+空串是明确表达的。这是刻意的收窄：加一个空选项会让"选中空值"和"还没选过"
+在下拉里长得一模一样。
+
+旧式字段名启发式（`fields` 没给 `type` 时）仍是**协议的一部分**（不是实现
+细节）：名字里含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at`
+结尾的用日期输入框，其余用文本框。字段名不合这套规则就会拿到错误的控件
+（比如把价格叫 `unit_cost_value` 仍会被认成数字，但叫 `fee` 就只会是文本框
+——新式声明写 `type` 才治本）。
 
 数字字段清空表示"不改这个字段"，不会存成 0——`Number("")` 是 0，而 0 在这类
-字段里通常有实际含义（比如财务插件的 0 表示免费）。
+字段里通常有实际含义（比如财务插件的 0 表示免费）。非空但解析不出数字的
+（如 `12,5`）也一样跳过，保留服务端原值。行内控件与「保存」按钮共用同一把
+锁：一次 action 在途时整表禁用，否则响应回来重挂载表单会静默丢弃这几秒里的
+改动。
 
 ### 资源限制
 
 | 限制 | 值 | 说明 |
 |---|---|---|
 | fuel（事件派发） | 默认 1,000,000 指令/调用 | setting `plugin.fuel_limit` 可调；耗尽即中断（死循环被截断） |
-| fuel（数据面钩子） | 默认 20,000,000 指令/调用 | setting `plugin.hook_fuel_limit` 可调；`on_tick`/`render_page`/`on_action`/`on_cleanup` 用这一档——它们读插件自己的数据，开销随数据规模增长（财务插件的页面要列出全部节点：实测空页面 44 万 fuel、每台机器再 5.4 万，tick 是 67 万 + 每台 2.4 万），按有界事件载荷定的派发那档不够用 |
+| fuel（数据面钩子） | 默认 20,000,000 指令/调用 | setting `plugin.hook_fuel_limit` 可调；`on_tick`/`render_page`/`on_action`/`on_cleanup` 用这一档——它们的开销随插件自己的数据规模增长，`render_page` 还可能带一次性副作用（如拉一次汇率，见「面板页面协议」），按有界事件载荷定的派发那档不够用；财务插件的页面要列出全部节点：实测空页面 44 万 fuel、每台机器再 5.4 万，tick 是 67 万 + 每台 2.4 万 |
 | 墙钟 | 默认 5 秒/调用 | setting `plugin.timeout_ms` 可调 |
 | kv 值 | 8 KiB | `host_kv_set` 与面板 KV 编辑器同限 |
 | plugin_data 行 | 256 KiB | `host_data_put` 单行上限；超出返回 -6 |

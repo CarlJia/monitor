@@ -1,7 +1,15 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { changes, GIB, httpErrorText, provisioningSite, trafficCorrection } from "./api.ts"
+import { asText, changes, formPayload, GIB, httpErrorText, inputType, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
+import type { PluginFieldDecl } from "./api.ts"
 import { dispatchResultText, money } from "./format.ts"
+
+// `fields` 来自插件写的 JSON，类型只是断言。下面几例故意喂类型系统不允许的
+// 值：归一化必须自己挡住，不能靠调用方守规矩。
+const loose = (decls: unknown) => normalizeFields(decls as PluginFieldDecl[])
+
+// 裸字符串选项归一化后 value 与 label 同值，断言里到处都是，包一个省点噪音。
+const plain = (...values: string[]) => values.map((value) => ({ value, label: value }))
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -60,4 +68,140 @@ assert.equal(httpErrorText(400, "Bad Request", "缺 bot_token"), "缺 bot_token"
 // HTTP/1.1 仍带 statusText：空 body 时用它。
 assert.equal(httpErrorText(404, "Not Found", ""), "Not Found")
 
-console.log("partial edits, traffic corrections, provisioning and dispatch-result checks passed")
+// 表单字段声明归一化（U1/KTD1）。旧式纯字符串按字段名猜控件，标签就是字段名。
+assert.deepEqual(normalizeFields(["name", "price", "unit_cost", "expires_at"]), [
+  { name: "name", label: "name", type: "text", options: [] },
+  { name: "price", label: "price", type: "number", options: [] },
+  { name: "unit_cost", label: "unit_cost", type: "number", options: [] },
+  { name: "expires_at", label: "expires_at", type: "date", options: [] },
+])
+// 没声明 fields（或声明成 null）不是崩溃点：空表头空表单。
+assert.deepEqual(normalizeFields(), [])
+// 新式声明：标签上列头、类型说了算，`select` 带选项。
+assert.deepEqual(
+  normalizeFields([
+    { name: "name", label: "节点名", type: "text" },
+    { name: "fee", label: "费用", type: "number" },
+    { name: "currency", label: "币种", type: "select", options: ["CNY", "USD"] },
+  ]),
+  [
+    { name: "name", label: "节点名", type: "text", options: [] },
+    // 名字里没有 price/cost/amount，靠声明拿到了数字控件——这正是新声明存在的理由。
+    { name: "fee", label: "费用", type: "number", options: [] },
+    { name: "currency", label: "币种", type: "select", options: plain("CNY", "USD") },
+  ],
+)
+// label 缺省或只剩空白时用字段名，不渲染一格空表头。
+assert.deepEqual(normalizeFields([{ name: "price", type: "number" }]), [
+  { name: "price", label: "price", type: "number", options: [] },
+])
+assert.deepEqual(normalizeFields([{ name: "price", label: "  ", type: "number" }]), [
+  { name: "price", label: "price", type: "number", options: [] },
+])
+// 认不出的 type 回退到字段名启发式（插件写错一个词不该把整列变成文本框）。
+assert.deepEqual(normalizeFields([{ name: "price", type: "currency" }]), [
+  { name: "price", label: "price", type: "number", options: [] },
+])
+assert.deepEqual(normalizeFields([{ name: "fee", type: "number " }]), [
+  { name: "fee", label: "fee", type: "number", options: [] },
+])
+// `select` 没给可选项：空下拉是死控件（既不能改也不能清），回退到启发式。
+assert.deepEqual(normalizeFields([{ name: "billing_cycle", type: "select" }]), [
+  { name: "billing_cycle", label: "billing_cycle", type: "text", options: [] },
+])
+assert.deepEqual(normalizeFields([{ name: "price", type: "select", options: [] }]), [
+  { name: "price", label: "price", type: "number", options: [] },
+])
+// 选项里的垃圾值丢掉，别让下拉渲染出 undefined 项。
+assert.deepEqual(loose([{ name: "c", type: "select", options: ["CNY", 7, null, "USD"] }]), [
+  { name: "c", label: "c", type: "select", options: plain("CNY", "USD") },
+])
+// 选项两种形态并存：对象带显示文案（`label` 只给人看，提交的始终是 `value`），
+// 裸字符串是值和文案同一串。计费周期这类「值是英文标识、文案是中文」靠前者。
+assert.deepEqual(
+  normalizeFields([{
+    name: "billing_cycle", label: "计费周期", type: "select",
+    options: [{ value: "monthly", label: "按月" }, "once", { value: "yearly", label: "按年" }],
+  }]),
+  [{
+    name: "billing_cycle", label: "计费周期", type: "select",
+    options: [{ value: "monthly", label: "按月" }, { value: "once", label: "once" }, { value: "yearly", label: "按年" }],
+  }],
+)
+// label 缺省或只剩空白回退到 value：一格可见的英文标识也强过一格看不见的空白。
+assert.deepEqual(
+  loose([{ name: "c", type: "select", options: [{ value: "CNY" }, { value: "USD", label: "   " }] }]),
+  [{ name: "c", label: "c", type: "select", options: plain("CNY", "USD") }],
+)
+// 值不是非空字符串的选项一律丢掉：没有值可提交的项在渲染层是死选项，只剩空白
+// 的项是看不见的选项，两者都会让操作者选到「不知道什么东西」。
+assert.deepEqual(
+  loose([{ name: "c", type: "select", options: [{ value: "" }, { label: "只有文案" }, { value: 7 }, null, "  ", "CNY", "  USD  "] }]),
+  [{ name: "c", label: "c", type: "select", options: plain("CNY", "USD") }],
+)
+// 类型是断言不是保证：JSON 里什么都可能出现，没有名字的条目只能丢掉。
+assert.deepEqual(loose([null, 5, { label: "无名字" }, { name: "" }, { name: "  " }]), [])
+assert.deepEqual(loose([{ name: " name ", label: "名称" }]), [
+  { name: "name", label: "名称", type: "text", options: [] },
+])
+// 容器本身也不是保证：`{}` 与数字迭代不过去（旧写法直接抛），字符串会被逐字符
+// 拆成字段——三种都得挡在门外，返回空数组而不是半张表。
+assert.deepEqual(loose({}), [])
+assert.deepEqual(loose(42), [])
+assert.deepEqual(loose("price"), [])
+assert.deepEqual(loose(null), [])
+// `asText`：非字符串一律空串，缺省与垃圾值同一条路（名字/标签/类型都靠它收口）。
+assert.equal(asText(" price "), " price ")
+assert.equal(asText(42), "")
+assert.equal(asText(undefined), "")
+assert.equal(asText(null), "")
+assert.equal(asText({ value: "USD" }), "")
+
+// 旧式声明按字段名猜控件的那条启发式：价格类给数字框、`at` 结尾给日期框，
+// 其余文本。它只认这几个词，所以插件该显式写 type（见上面的回退用例）。
+assert.equal(inputType("price"), "number")
+assert.equal(inputType("unit_cost"), "number")
+assert.equal(inputType("expires_at"), "date")
+assert.equal(inputType("currency"), "text")
+
+const form = normalizeFields([
+  { name: "name", label: "节点名", type: "text" },
+  { name: "price", label: "价格", type: "number" },
+  { name: "currency", label: "币种", type: "select", options: ["CNY", "USD"] },
+  { name: "expires_at", label: "到期日", type: "date" },
+])
+// 提交载荷：id 领队，数字字段强转成 number，其余原样字符串。
+assert.deepEqual(
+  formPayload(form, 1, { name: "edge-1", price: "12.5", currency: "USD", expires_at: "2027-01-01" }),
+  { id: 1, name: "edge-1", price: 12.5, currency: "USD", expires_at: "2027-01-01" },
+)
+// 没有 id 的行（新增行）不带 id 键，而不是带上 undefined。
+assert.deepEqual(formPayload(normalizeFields(["name"]), undefined, { name: "edge-1" }), { name: "edge-1" })
+// 数字字段清空表示"不改这个字段"：`Number("")` 是 0，存成 0 会被读成「免费」。
+assert.deepEqual(formPayload(form, 1, { name: "edge-1", price: "", currency: "USD" }), {
+  id: 1, name: "edge-1", currency: "USD", expires_at: "",
+})
+assert.deepEqual(formPayload(form, 1, { price: "   " }), {
+  id: 1, name: "", currency: "", expires_at: "",
+})
+// 非空但解析不出数字的同样跳过，保留服务端原值。
+assert.deepEqual(formPayload(form, 1, { price: "12,5" }), {
+  id: 1, name: "", currency: "", expires_at: "",
+})
+assert.deepEqual(formPayload(form, 1, { price: "0" }), {
+  id: 1, name: "", price: 0, currency: "", expires_at: "",
+})
+// 数字控件由声明驱动,不看字段名：叫 fee 也一样强转。
+assert.deepEqual(formPayload(normalizeFields([{ name: "fee", type: "number" }]), 3, { fee: "3" }), { id: 3, fee: 3 })
+assert.deepEqual(formPayload(normalizeFields([{ name: "fee", type: "number" }]), 3, { fee: "3x" }), { id: 3 })
+
+// 提示 kind：四种照原样，缺省或认不出的回退 success（不静默丢提示）。
+assert.equal(toastKind("success"), "success")
+assert.equal(toastKind("error"), "error")
+assert.equal(toastKind("info"), "info")
+assert.equal(toastKind("warning"), "warning")
+assert.equal(toastKind(undefined), "success")
+assert.equal(toastKind("warn"), "success")
+assert.equal(toastKind(""), "success")
+
+console.log("partial edits, traffic corrections, provisioning, page-vocabulary and dispatch-result checks passed")

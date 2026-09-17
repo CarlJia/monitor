@@ -244,6 +244,183 @@ export const deletePluginKv = (id: number, key: string) =>
 /** 列出一个插件的全部 kv 行（R13）。 */
 export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)
 
+/**
+ * 下拉选项的两种写法：
+ * - 裸字符串：既是提交值也是显示文案；
+ * - 对象：`value` 进提交载荷，`label` 只给人看（缺省或全空白用 `value`）。
+ *
+ * 计费周期这类值是英文标识、文案是中文的字段靠对象形态，币种这类两者相同的
+ * 继续写裸字符串。
+ */
+export type PluginOptionDecl = string | {
+  value: string
+  label?: string
+}
+
+/** 归一化后的选项：渲染看 `label`，提交只认 `value`。 */
+export type PluginOption = { value: string; label: string }
+
+/**
+ * form 块的一项字段声明（KTD1）。两种形态并存：
+ * - 旧式：纯字符串，只给字段名，控件类型交给下面的启发式猜（向后兼容）；
+ * - 新式：对象，可带显示用标签、控件类型与下拉选项。
+ */
+export type PluginFieldDecl = string | {
+  /** 提交载荷里的键，也是取值时的键；没有名字的声明会被丢弃。 */
+  name: string
+  /** 列头文案；缺省（或全空白）用字段名。 */
+  label?: string
+  /** 控件类型；缺省或认不出时回退到按字段名的启发式。 */
+  type?: string
+  /** 仅 `type: "select"` 用得上；裸字符串或 `{value, label}` 都接受。 */
+  options?: PluginOptionDecl[]
+}
+
+/**
+ * 字段的控件类型名单：既是运行时校验的名单，也是 `FieldType` 的类型来源——
+ * 两处各写一遍就会有一处先过期。
+ */
+export const FIELD_TYPES = ["text", "number", "date"] as const
+
+export type FieldType = typeof FIELD_TYPES[number]
+
+/** 归一化后的字段声明：渲染与取值都只看它。 */
+export type PluginField = {
+  name: string
+  /** 列头文案，已兜底成非空。 */
+  label: string
+  type: FieldType | "select"
+  /** 仅 `select` 非空。 */
+  options: PluginOption[]
+}
+
+/** 取一个可能是任何东西的 JSON 值为字符串；不是字符串就取空串。 */
+export function asText(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+/**
+ * 旧式字段名 → 控件类型：名字里含 `price`/`cost`/`amount`（不分大小写）用数字
+ * 输入框，以 `at` 结尾的用日期输入框，其余文本。插件没声明 `type` 时按它猜；
+ * 名字不合这套规则就会拿到错误的控件（比如把价格叫 `fee` 只会是文本框），
+ * 所以新式声明应当显式写 `type`。
+ */
+export function inputType(field: string): FieldType {
+  if (/price|cost|amount/i.test(field)) return "number"
+  if (/at$/.test(field)) return "date"
+  return "text"
+}
+
+/**
+ * 选项声明（裸字符串或 `{value, label}`）→ 渲染用的 `{value, label}`。
+ * `value` 先去空白再判空，不是非空字符串的条目丢掉——下拉里没有值可提交的项
+ * 渲染出来就是一格死选项，而只有空白的值渲染出来是一格看不见的选项，两者都
+ * 该丢。`label` 缺省或只剩空白时回退到 `value`：显示标识总比显示空白好。
+ */
+function normalizeOptions(raw: unknown): PluginOption[] {
+  if (!Array.isArray(raw)) return []
+  const options: PluginOption[] = []
+  for (const entry of raw as unknown[]) {
+    // 裸字符串：值即文案。
+    const obj = typeof entry === "string" ? { value: entry } : entry
+    if (typeof obj !== "object" || obj === null) continue
+    const decl = obj as Record<string, unknown>
+    const value = asText(decl.value).trim()
+    if (value === "") continue
+    options.push({ value, label: asText(decl.label).trim() || value })
+  }
+  return options
+}
+
+/**
+ * 把 form 块的字段声明归一化成渲染器的输入。声明优先、缺省回退启发式；
+ * 声明里认不出的 `type` 同样回退——插件写错一个词不该把整列渲染成废控件。
+ *
+ * `fields` 来自插件写的 JSON：类型是断言不是保证。这里按垃圾输入防御，
+ * 容器不是数组、null、数字、缺 name 的条目一律丢掉，而不是渲染一格空控件
+ * 或把页面炸掉（`{}` 与数字连迭代都过不去，字符串则会被逐字符拆成字段）。
+ */
+export function normalizeFields(decls?: PluginFieldDecl[]): PluginField[] {
+  const fields: PluginField[] = []
+  if (!Array.isArray(decls)) return []
+  for (const raw of decls as unknown[]) {
+    const obj = typeof raw === "string" ? { name: raw } : raw
+    if (typeof obj !== "object" || obj === null) continue
+    const decl = obj as Record<string, unknown>
+    const name = asText(decl.name).trim()
+    if (name === "") continue
+    const options = normalizeOptions(decl.options)
+    // 声明值两边可能带空白,先修掉再比对——插件手写 JSON 时很容易多一个空格。
+    const declared = asText(decl.type).trim()
+    // `select` 没给可选项时也回退：一个没有选项的下拉是死控件（既不能改也
+    // 不能清），按字段名猜至少还能操作。
+    const type = declared === "select" && options.length > 0 ? "select"
+      : isFieldType(declared) ? declared
+      : inputType(name)
+    fields.push({ name, label: asText(decl.label).trim() || name, type, options })
+  }
+  return fields
+}
+
+/** `declared` 是否是 `FIELD_TYPES` 里的一员（收窄用，名单只有一份）。 */
+function isFieldType(declared: string): declared is FieldType {
+  return (FIELD_TYPES as readonly string[]).includes(declared)
+}
+
+/**
+ * 一行草稿 → 提交载荷（`{id, ...字段}`）。数字字段沿用既有规矩：空串跳过、
+ * 解析不出数字的跳过——`Number("")` 是 0，而 0 在价格这类字段里有实际含义
+ * （财务插件的 0 表示免费），存成 0 等于静默改掉一个字段；跳过即保留服务端
+ * 原值。控件类型看归一化后的声明（`fields`），不再单看字段名。
+ */
+export function formPayload(
+  fields: PluginField[],
+  id: unknown,
+  values: Record<string, string>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {}
+  if (id !== undefined) payload.id = id
+  for (const f of fields) {
+    const raw = values[f.name] ?? ""
+    if (f.type !== "number") {
+      payload[f.name] = raw
+      continue
+    }
+    const typed = raw.trim()
+    if (typed === "") continue
+    const n = Number(typed)
+    if (!Number.isNaN(n)) payload[f.name] = n
+  }
+  return payload
+}
+
+/**
+ * 提示的四种 `kind`：既是运行时校验的名单，也是 `ToastKind` 的类型来源——
+ * 两处各写一遍就会有一处先过期。
+ */
+export const TOAST_KINDS = ["success", "error", "info", "warning"] as const
+
+export type ToastKind = typeof TOAST_KINDS[number]
+
+/** 响应携带的提示条：文案由插件给，面板替它弹一次（KTD2）。 */
+export type PluginToast = {
+  /**
+   * 运行时的值什么都可能是：它来自插件写的 JSON，`api()` 不做校验，所以这里
+   * 的类型是文档不是保证。使用处一律经 `toastKind` 收窄（缺省或认不出的回退
+   * `success`）。
+   */
+  kind?: string
+  text: string
+}
+
+/**
+ * 提示的 `kind` → 前端该调哪一个 toast；缺省或认不出的都回退到 `success`
+ * （协议只声明了四种，写错的提示宁可当成功也不该静默丢掉）。
+ */
+export function toastKind(kind?: string): ToastKind {
+  return (TOAST_KINDS as readonly string[]).includes(kind ?? "") ? (kind as ToastKind) : "success"
+}
+
 /** 插件面板页面的 JSON UI 描述（U5/KTD5）。前端按词汇表渲染。 */
 export type PluginBlock = {
   type: string
@@ -262,11 +439,11 @@ export type PluginBlock = {
    * 区分：数组→表格，对象→表单。
    */
   rows?: unknown[][] | Record<string, unknown>[]
-  /** form 块的字段名；编辑后按字段名与 block.action 提交。 */
-  fields?: string[]
+  /** form 块的字段声明；旧式纯字符串或新式带标签/控件/选项的对象。 */
+  fields?: PluginFieldDecl[]
 }
 
-export type PluginPage = { title?: string; blocks?: PluginBlock[] }
+export type PluginPage = { title?: string; toast?: PluginToast; blocks?: PluginBlock[] }
 
 /** /db 响应的插件空间汇总（U9/KTD11）。宿主只展示，清理由插件自己决定。 */
 export type PluginUsage = {
