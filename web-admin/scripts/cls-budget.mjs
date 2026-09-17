@@ -26,6 +26,9 @@ const MARKER_TIMEOUT_MS = 5000
 // Chrome 公布调试地址的等待上限。正常在 1s 内，留宽是因为 CI runner 上冷启动
 // 受邻居影响能慢一个数量级，而这条路径已经不再有「猜错端口」那种假失败。
 const LAUNCH_TIMEOUT_MS = 30000
+// 单条 CDP 请求的上限。Chrome 中途死掉时 ws 不再回任何消息，没有它 await 会一直
+// 挂着，门禁就一直挂到 CI 的 job 上限——挂死不比红好，它不给任何归因。
+const RPC_TIMEOUT_MS = 10000
 
 // 一张 1x1 的 PNG，供主题预览图端点使用。图本身不重要，重要的是它在 <img> 的
 // onLoad 里才被显示出来——那条路径会撑开卡片。
@@ -242,6 +245,18 @@ async function measure(chrome, base, profile) {
   child.stderr.setEncoding("utf8")
   child.stderr.on("data", (d) => { stderr += d })
   child.on("close", (code, signal) => { exitReason = signal ? `信号 ${signal}` : `退出码 ${code}` })
+  // spawn 级失败（EACCES/ENOENT/EMFILE）走 'error' 而不是 'close'。不挂它这里
+  // 会是一条未处理的 'error' 事件，裸栈退出，刚收集的 stderr 反而用不上。
+  child.on("error", (e) => { exitReason ??= `启动失败 ${e.code ?? e.message}` })
+
+  // 两种失败分开报：进程自己退出了，就不能说「未在 30s 内公布」——那会把一次
+  // 1 秒的明确崩溃描述成超时，把人往 runner 太慢的方向引。
+  const launchFail = () => new Error(
+    (exitReason
+      ? `Chrome 在公布调试地址之前就失败了（${chrome}），${exitReason}`
+      : `Chrome 未在 ${LAUNCH_TIMEOUT_MS / 1000}s 内公布调试地址（${chrome}），进程仍在运行`)
+    + `\n--- Chrome stderr ---\n${stderr.trim() || "(空)"}`,
+  )
 
   // 进程已退出就不必再等满超时——那只会把一个明确的失败拖成 30 秒。
   const deadline = Date.now() + LAUNCH_TIMEOUT_MS
@@ -250,71 +265,100 @@ async function measure(chrome, base, profile) {
     await sleep(100)
     wsUrl = devToolsUrl(stderr)
   }
-  if (!wsUrl) {
+  // 进程已经没了就不存在可连的端点。不在这里拦，失败会落到 ws 连接那一步，变成
+  // 一个只有 ErrorEvent 的报错——恰好丢掉这次改动想补上的 stderr 与退出码。
+  if (!wsUrl || exitReason) {
     child.kill("SIGKILL")
-    throw new Error(
-      `Chrome 未在 ${LAUNCH_TIMEOUT_MS / 1000}s 内公布调试地址（${chrome}）` +
-      `，${exitReason ?? "进程仍在运行"}\n--- Chrome stderr ---\n${stderr.trim() || "(空)"}`,
-    )
+    throw launchFail()
   }
 
   const ws = new WebSocket(wsUrl)
-  await new Promise((ok, fail) => { ws.onopen = ok; ws.onerror = fail })
-
   let id = 0
   const pending = new Map()
+  // Chrome 中途死掉（OOM、renderer 崩）时 ws 不会再回任何消息。既不在断开时
+  // reject 掉挂着的请求，也不给每条请求加上限，await 就会永远挂着——门禁一直
+  // 挂到 CI 的 job 上限，还指不出卡在哪条路由。挂死不比红好：它不给归因。
+  const rejectAll = (why) => {
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)) }
+    pending.clear()
+  }
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data)
-    if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id) }
+    const p = pending.get(msg.id)
+    if (p) { pending.delete(msg.id); clearTimeout(p.timer); p.resolve(msg) }
   }
-  const send = (method, params = {}, sessionId) => new Promise((ok) => {
+  ws.onclose = () => rejectAll(`与 Chrome 的调试连接已断开${exitReason ? `（Chrome ${exitReason}）` : ""}`)
+  const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
     const m = { id: ++id, method, params }
     if (sessionId) m.sessionId = sessionId
-    pending.set(m.id, ok)
+    const timer = setTimeout(() => {
+      pending.delete(m.id)
+      reject(new Error(`CDP ${method} 在 ${RPC_TIMEOUT_MS / 1000}s 内没有响应${exitReason ? `（Chrome ${exitReason}）` : ""}`))
+    }, RPC_TIMEOUT_MS)
+    pending.set(m.id, { resolve, reject, timer })
     ws.send(JSON.stringify(m))
   })
 
-  const { result: { targetId } } = await send("Target.createTarget", { url: "about:blank" })
-  const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true })
-  await send("Page.enable", {}, sessionId)
-  await send("Runtime.enable", {}, sessionId)
-  await send("Page.addScriptToEvaluateOnNewDocument", { source: OBSERVER }, sessionId)
+  try {
+    await new Promise((ok, fail) => {
+      ws.onopen = ok
+      ws.onerror = () => fail(new Error(`连不上 Chrome 公布的调试地址 ${wsUrl}${exitReason ? `（Chrome ${exitReason}）` : ""}`))
+    })
 
-  const read = async () => {
-    const res = await send("Runtime.evaluate", {
-      expression: "JSON.stringify({cls: Number((window.__cls ?? 0).toFixed(4)), shifts: window.__shifts ?? [], text: document.body.innerText})",
-      returnByValue: true,
-    }, sessionId)
-    if (res.result.exceptionDetails) throw new Error(JSON.stringify(res.result.exceptionDetails))
-    return JSON.parse(res.result.result.value)
-  }
+    const { result: { targetId } } = await send("Target.createTarget", { url: "about:blank" })
+    const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true })
+    await send("Page.enable", {}, sessionId)
+    await send("Runtime.enable", {}, sessionId)
+    // 注入失败要当场报：注入不成功时页面里没有 __cls，下面读数表达式的 ?? 0
+    // 兜底会把「仪器没装上」显示成 CLS 0，这门禁就静默全绿了。
+    const injected = await send("Page.addScriptToEvaluateOnNewDocument", { source: OBSERVER }, sessionId)
+    if (injected.error) throw new Error(`观察器注入失败：${JSON.stringify(injected.error)}`)
 
-  const results = []
-  for (const route of ROUTES) {
-    await send("Page.navigate", { url: base + route.path }, sessionId)
+    const read = async () => {
+      const res = await send("Runtime.evaluate", {
+        expression: "JSON.stringify({probe: typeof window.__cls, cls: Number((window.__cls ?? 0).toFixed(4)), shifts: window.__shifts ?? [], text: document.body.innerText})",
+        returnByValue: true,
+      }, sessionId)
+      if (res.result.exceptionDetails) throw new Error(JSON.stringify(res.result.exceptionDetails))
+      return JSON.parse(res.result.result.value)
+    }
 
-    // 等 marker 出现（页面确实渲染了）再多等一小段：最后一块数据到达往往正是
-    // 抖动发生的时刻，抢在它之前读会漏掉。
-    const deadline = Date.now() + MARKER_TIMEOUT_MS
-    let snap = await read()
-    while (route.markers.some((m) => !snap.text.includes(m)) && Date.now() < deadline) {
-      await sleep(100)
+    const results = []
+    for (const route of ROUTES) {
+      await send("Page.navigate", { url: base + route.path }, sessionId)
+
+      // 等 marker 出现（页面确实渲染了）再多等一小段：最后一块数据到达往往正是
+      // 抖动发生的时刻，抢在它之前读会漏掉。
+      const deadline = Date.now() + MARKER_TIMEOUT_MS
+      let snap = await read()
+      while (route.markers.some((m) => !snap.text.includes(m)) && Date.now() < deadline) {
+        await sleep(100)
+        snap = await read()
+      }
+      // 仪器不在线时 CLS 恒为 0，这个数字不成立——必须先判它。只看数字的话，
+      // 观察器坏掉会让 7 条路由全部报 CLS 0 并判 ok，门禁静默全绿。
+      if (snap.probe !== "number") {
+        results.push({ route: route.path, failed: `页面里没有装上看抖动用的观察器（window.__cls 是 ${snap.probe}），数字不作数` })
+        continue
+      }
+      const missing = route.markers.filter((m) => !snap.text.includes(m))
+      if (missing.length) {
+        results.push({ route: route.path, failed: `页面没有渲染出 ${missing.join("、")}（内容断言失败，数字不作数）` })
+        continue
+      }
+      await sleep(SETTLE_MS)
       snap = await read()
+      results.push({ route: route.path, cls: snap.cls, shifts: snap.shifts })
     }
-    const missing = route.markers.filter((m) => !snap.text.includes(m))
-    if (missing.length) {
-      results.push({ route: route.path, failed: `页面没有渲染出 ${missing.join("、")}（内容断言失败，数字不作数）` })
-      continue
-    }
-    await sleep(SETTLE_MS)
-    snap = await read()
-    results.push({ route: route.path, cls: snap.cls, shifts: snap.shifts })
+    return results
+  } finally {
+    // 任何一步失败都要先收掉 Chrome 再让错误冒泡：调用方的 finally 只做
+    // server.close() 与 rmSync(profile)，不管子进程——漏掉这一手，Chrome 就会
+    // 带着已经被删掉的 user-data-dir 继续跑。
+    try { ws.close() } catch {}
+    child.kill("SIGKILL")
+    await sleep(200)
   }
-
-  ws.close()
-  child.kill("SIGKILL")
-  await sleep(200)
-  return results
 }
 
 // ---- 跑 ----
