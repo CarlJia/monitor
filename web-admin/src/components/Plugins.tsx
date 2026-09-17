@@ -341,7 +341,6 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
 
 export function Plugins({ go }: { go: (to: string) => void }) {
   const [plugins, setPlugins] = useState<Plugin[] | null>(null)
-  const [file, setFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
   const [testing, setTesting] = useState<number | null>(null)
   const [cleaning, setCleaning] = useState<number | null>(null)
@@ -351,7 +350,7 @@ export function Plugins({ go }: { go: (to: string) => void }) {
   // 动作后递增，让日志卡片跟着刷新。「测试」只能靠它（不重拉列表）；启停额外
   // 重拉列表；删除刻意不 pulse——见 remove()。
   const [pulse, setPulse] = useState(0)
-  const fileInput = useRef<HTMLInputElement>(null)
+  const picker = useRef<HTMLInputElement>(null)
 
   // 序号化的重拉：并发的 listPlugins 响应若乱序，只有最新一次的落地——否则删除
   // 前发出的旧请求晚到会把已删行「复活」回列表，日志守卫随之放行。
@@ -368,16 +367,13 @@ export function Plugins({ go }: { go: (to: string) => void }) {
 
   const bump = () => setPulse((n) => n + 1)
 
-  async function upload() {
-    if (!file) return
+  async function upload(file: File) {
     setUploading(true)
     try {
       const installed = await uploadPlugin(file)
       // 上传即入库但默认停用（KTD10）：预检失败也一样入库，行上的红徽标会
       // 给出原因，所以这里只引导去点开关，不报错。
       toast.success("插件已上传，请点击开关启用", { description: installed.plugin_id })
-      setFile(null)
-      if (fileInput.current) fileInput.current.value = ""
       load()
     } catch (e) {
       // 400 的响应体就是后端那句中文原因；413 与网络错误在 uploadPlugin 里
@@ -472,18 +468,21 @@ export function Plugins({ go }: { go: (to: string) => void }) {
             上传后默认停用，到列表里点开关启用。插件在 hub 进程内运行，请只安装可信来源。
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            ref={fileInput}
-            type="file"
-            accept=".gz,.tgz,application/gzip"
-            className="w-auto max-w-sm"
-            disabled={uploading}
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-          <Button size="sm" disabled={!file || uploading} onClick={upload}>
+        <div>
+          <Button size="sm" disabled={uploading} onClick={() => picker.current?.click()}>
             <Upload /> {uploading ? "上传中…" : "上传插件"}
           </Button>
+          <input
+            ref={picker}
+            type="file"
+            accept=".gz,.tgz,application/gzip"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              e.target.value = ""
+              if (file) upload(file)
+            }}
+          />
         </div>
       </Card>
 
