@@ -79,7 +79,9 @@ export function dispatchResultText(
       .map((l) => l.trim())
       .filter(Boolean)
       .pop() ?? null
-  // 按码点截断：插件文案常以 emoji 开头，slice 会把代理对切成半个字符。
-  const reason = line && line.length > max ? `${[...line].slice(0, max).join("")}…` : line
+  // 两侧都按码点：插件文案常以 emoji 开头，UTF-16 的 length/slice 会把代理对切成
+  // 半个字符；而且单位混用会让「码点刚好不超、UTF-16 长度超了」的行凭空多一个省略号。
+  const cps = line === null ? [] : [...line]
+  const reason = cps.length > max ? `${cps.slice(0, max).join("")}…` : line
   return [reason, `result: ${entry.result}`, `耗时 ${entry.elapsed_ms} ms`].filter(Boolean).join(" · ")
 }

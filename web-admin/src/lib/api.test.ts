@@ -42,4 +42,10 @@ assert.equal(
   dispatchResultText({ result: "other:19", elapsed_ms: 3, detail: "🚀".repeat(200) }, 10),
   `${"🚀".repeat(10)}… · result: other:19 · 耗时 3 ms`,
 )
+// 计数也按码点：120 个 emoji 的 UTF-16 长度是 240，码点数才是 120——刚好到 max
+// 就不该截断（单位混用会在这里凭空多出一个省略号）。
+assert.equal(
+  dispatchResultText({ result: "other:19", elapsed_ms: 1, detail: "🚀".repeat(120) }, 120),
+  `${"🚀".repeat(120)} · result: other:19 · 耗时 1 ms`,
+)
 console.log("partial edits, traffic corrections, provisioning and dispatch-result checks passed")

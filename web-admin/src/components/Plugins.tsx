@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Eye, EyeOff, KeyRound, LayoutDashboard, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
@@ -59,6 +59,11 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
   const [saving, setSaving] = useState(false)
   // 已有行里被点删除的 key：保存时逐个 DELETE，取消则丢弃（后端不动）。
   const [deleted, setDeleted] = useState<string[]>([])
+  // 点击「配置」那一刻的 manifest 声明快照。对话框存续期间它不会变——父组件的
+  // plugins 数组重载只换数组，不改这个引用——`useMemo` 把这件事写明，下面的
+  // effect 因此只随 plugin.id 重跑。config 来自 JSON，类型是断言而非保证
+  // （api() 不做运行时校验），缺了就当这个插件没声明任何字段。
+  const decls = useMemo(() => plugin.config ?? [], [plugin.config])
 
   useEffect(() => {
     listPluginKv(plugin.id)
@@ -66,20 +71,18 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
         const stored = new Map(pairs.map(({ key, value }) => [key, value]))
         // 声明过的字段按 manifest 顺序排在最前（带标签、必填标记与提示），没声明
         // 的存量行跟在后面：操作者照声明填，不必猜 key 名，也不会被存量键淹没。
-        const declared: KvRow[] = plugin.config.map((decl) => {
+        const declared: KvRow[] = decls.map((decl) => {
           const value = stored.get(decl.key)
           return { key: decl.key, value: value ?? "", original: value ?? null, decl }
         })
-        const declaredKeys = new Set(plugin.config.map((d) => d.key))
+        const declaredKeys = new Set(decls.map((d) => d.key))
         const rest: KvRow[] = pairs
           .filter(({ key }) => !declaredKeys.has(key))
           .map(({ key, value }) => ({ key, value, original: value }))
         setRows([...declared, ...rest])
       })
       .catch((e: Error) => { setRows([]); toast.error(e.message) })
-    // config 也进依赖：它是行顺序与标签的来源。对话框打开期间列表不会重载
-    // （启停/上传/删除都在对话框之外），所以不会把未保存的编辑冲掉。
-  }, [plugin.id, plugin.config])
+  }, [plugin.id, decls])
 
   const patch = (i: number, next: Partial<KvRow>) =>
     setRows((old) => old?.map((row, j) => (j === i ? { ...row, ...next } : row)) ?? old)
@@ -100,7 +103,10 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
       }
     }
     for (const [key] of writes) {
-      if (!key || key.includes(":") || key.length > 128) {
+      // 长度按**字节**算：服务端比的是 128 字节（plugin::KV_KEY_MAX），而 JS 的
+      // key.length 数的是 UTF-16 单元——100 个中文字的 key 会在本地放行、到服务端
+      // 才 400。
+      if (!key || key.includes(":") || new TextEncoder().encode(key).length > 128) {
         return toast.error(`key「${key}」不合法：非空、不含 ':'、不超过 128 字节`)
       }
     }

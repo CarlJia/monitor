@@ -48,7 +48,7 @@ mod log;
 mod manifest;
 mod registry;
 
-pub use host::{load, new_engine, KV_KEY_MAX, KV_VALUE_MAX};
+pub use host::{kv_key_problem, load, new_engine, KvKeyProblem, KV_KEY_MAX, KV_VALUE_MAX};
 pub use manifest::Manifest;
 pub use registry::Registry;
 

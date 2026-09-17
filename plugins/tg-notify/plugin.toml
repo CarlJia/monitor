@@ -10,13 +10,13 @@ subscribes = ["agent_offline", "agent_online", "plugin_expiry_soon"]
 # key 就是 kv 的 key(命名空间 plugin.com.example.tg-notify:<key>),必须与
 # src/lib.rs 里 kv_get_string 读的名字逐字一致。
 
-[[config]]
+[[kv]]
 key = "bot_token"
 label = "Telegram Bot Token"
 required = true
 hint = "向 @BotFather 申请，形如 123456:ABC-DEF"
 
-[[config]]
+[[kv]]
 key = "chat_id"
 label = "目标会话 ID"
 required = true

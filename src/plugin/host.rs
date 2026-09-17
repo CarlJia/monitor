@@ -94,6 +94,40 @@ pub const KV_VALUE_MAX: usize = 8 * 1024;
 /// 共用这一个数字:三处各写一份,迟早会漂。
 pub const KV_KEY_MAX: usize = 128;
 
+/// 一个 kv key 的形状问题。key 的语法只有一套,[`kv_key_problem`] 是它唯一的
+/// 判定点;两个调用方(manifest 的 `[[kv]]` 校验、面板的 kv 编辑器)只是把结果
+/// 折成自己的文案,不再各写一遍规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvKeyProblem {
+    /// 空,或只有空白。
+    Empty,
+    /// 首尾带空白。面板/接口写入的是**原样** key,带空白的那一行与 manifest
+    /// 声明永远对不上——与其让「声明了却配不上」变成一个谜,不如在两侧都拒掉。
+    Padded,
+    /// 含 `':'`:它是 kv 命名空间 `plugin.<plugin_id>:<key>` 的分隔符。
+    Colon,
+    /// 超过 [`KV_KEY_MAX`] 字节。
+    TooLong,
+}
+
+/// 判一个 kv key 的形状,`None` 表示合法。规则与 kv 命名空间、manifest 声明、
+/// 面板写入共用同一份。
+pub fn kv_key_problem(key: &str) -> Option<KvKeyProblem> {
+    if key.trim().is_empty() {
+        return Some(KvKeyProblem::Empty);
+    }
+    if key != key.trim() {
+        return Some(KvKeyProblem::Padded);
+    }
+    if key.contains(':') {
+        return Some(KvKeyProblem::Colon);
+    }
+    if key.len() > KV_KEY_MAX {
+        return Some(KvKeyProblem::TooLong);
+    }
+    None
+}
+
 /// 插件 http 请求的墙钟超时(A13):4 秒,落在 5 秒的派发预算内,留 1 秒给宿主
 /// 自己的开销。挂在请求上:插件走 `App::plugin_http`(不跟随重定向的那个),
 /// 它的 client 级超时是 15 秒,服务于宿主侧下载,不能为插件收短。

@@ -148,8 +148,12 @@ export type Plugin = {
   tick: boolean
   /** v2：声明了统一的清理入口。 */
   cleanup: boolean
-  /** manifest 声明的渠道配置字段；没声明就是空数组。 */
-  config: PluginConfigDecl[]
+  /**
+   * manifest 声明的渠道配置字段；没声明就是空数组。
+   * 标成可选是因为它来自 JSON——类型是断言不是保证（`api()` 不做运行时校验），
+   * 使用处一律用 `?? []` 兜底。
+   */
+  config?: PluginConfigDecl[]
 }
 
 /** 派发日志的一条（R16）：内存环形缓冲的快照，重启后为空。 */
