@@ -17,9 +17,9 @@ use crate::notification_bus::Event;
 use crate::App;
 
 use super::host::{
-    call_hook, call_json_hook, call_on_event, load, new_log_sink, render_log, truncate, LoadedPlugin,
-    DEFAULT_FUEL_LIMIT,
+    call_hook, call_json_hook, call_on_event, load, truncate, LoadedPlugin, DEFAULT_FUEL_LIMIT,
 };
+use super::log::{new_log_sink, render_log};
 
 /// dispatch_log 的容量(KTD12)。环形:push_back 满了 pop_front,最近 1000 次
 /// 派发结果始终可见,面板与测试都据此判断一次派发是否真的发生、结果如何。
@@ -64,7 +64,7 @@ pub struct DispatchEntry {
     pub elapsed_ms: u64,
     pub result: String,
     /// 本次调用里插件自己打的日志(最新几行,有界),没打就是 `None`。
-    /// 见 [`super::host::PluginLog`]。
+    /// 见 [`super::log::PluginLog`]。
     pub detail: Option<String>,
 }
 
