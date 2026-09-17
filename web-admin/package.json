@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test": "node src/lib/api.test.ts",
+    "cls-budget": "node scripts/cls-budget.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

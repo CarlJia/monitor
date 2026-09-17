@@ -38,6 +38,12 @@ jobs:
       - run: npm ci && npm run lint && npm test && npm run build
         working-directory: web-admin
 
+      # 布局抖动预算：逐条后台路由量 dist/ 产物的 CLS，超过阈值即失败。量的是
+      # 构建产物，所以排在 build 之后。用 runner 自带的 Chrome（ubuntu 镜像已装），
+      # 不为它引入额外的 action。
+      - run: npm run cls-budget
+        working-directory: web-admin
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
