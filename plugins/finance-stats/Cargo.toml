@@ -6,7 +6,7 @@
 
 [package]
 name = "finance-stats"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "财务统计插件（monitor-hub wasm 插件 ABI v2）"

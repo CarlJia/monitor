@@ -5,7 +5,7 @@
 # 宿主事件（它发出的是 plugin_expiry_soon，由 tg-notify 订阅）。
 plugin_id = "io.github.monitor.finance-stats"
 name = "财务统计"
-version = "0.1.0"
+version = "0.2.0"
 abi_version = 2
 subscribes = []
 tick = true
