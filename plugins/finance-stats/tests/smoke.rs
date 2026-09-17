@@ -563,6 +563,71 @@ fn cached_page_appends_last_refresh_failure() {
     );
 }
 
+/// `fx_status` 里存进非 JSON / 形状不对的值时，失败行直接丢掉、页面照常渲染：
+/// 半截写入（或将来改了 `FxStatus` 字段）不该让整页打不开。
+#[test]
+fn junk_fx_status_does_not_break_the_page() {
+    let engine = engine();
+    let wasm = build_wasm();
+
+    for junk in ["{半截的 JSON", r#"{"reason":123,"attempted_at":"昨天"}"#] {
+        let host = Host::default();
+        let (mut store, instance) = instantiate(&engine, &wasm, host);
+        seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+        seed(&store, "fx", &fx_record("CNY", NOW - 3_600));
+        seed(&store, "fx_status", junk);
+
+        let page: serde_json::Value =
+            serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+        assert_eq!(http_calls(&store), 0, "有缓存不拉");
+        assert_eq!(page["title"], "财务统计", "页面应照常渲染：{page}");
+        assert_eq!(
+            notice_texts(&page),
+            vec![format!("汇率基准 CNY，更新时间 {}", ts(NOW - 3_600))],
+            "读不出的失败记录应被丢掉，不留失败提示条（junk={junk}）"
+        );
+    }
+}
+
+/// 协议约定：toast 只挂在 action 响应上——首屏（render_page）不带 toast，
+/// 否则每次打开页面都要弹一次没有来由的提示。
+#[test]
+fn render_page_carries_no_toast() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    assert!(page.get("toast").is_none(), "首屏不该带 toast：{page}");
+    assert_eq!(page["title"], "财务统计", "仍应是一份正常的页面描述：{page}");
+}
+
+/// 认不出的动作不报错也不弹提示：当作「没带动作」返回一份普通页面描述，
+/// 且不触发任何 http_get（动作路径不隐式拉取）。
+#[test]
+fn unknown_action_returns_plain_page_without_toast() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // http_body 保持 None：拉了会失败
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let resp: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "on_action", r#"{"action":"nope"}"#))
+            .unwrap();
+
+    assert_eq!(http_calls(&store), 0, "未注册的动作不该触发 http_get");
+    assert!(resp.get("toast").is_none(), "未注册的动作不该弹提示：{resp}");
+    assert_eq!(resp["title"], "财务统计", "仍应是一份正常的页面描述：{resp}");
+    assert_eq!(form_block(&resp)["action"], "save_node", "页面结构完整（form 块仍在）：{resp}");
+}
+
 /// KTD3：保存这条路不拉汇率——保存不阻塞在网络往返上（切币种与手动刷新
 /// 各自显式拉一次，见 set_currency / refresh_fx_toasts_success_and_failure）。
 #[test]
@@ -772,6 +837,40 @@ fn remaining_value_prorates_within_cycle() {
     assert!((remaining - expect).abs() < 1.0, "剩余价值应约 {expect:.2}，实际 {remaining}");
 }
 
+/// 历史数据里拼错的周期会被 `cycle_months` 静默剔出年化成本（返回 None）——
+/// 页面上要看得见：一条 warning 列出全部认不出的取值。统计口径与结果不变。
+#[test]
+fn unrecognised_billing_cycles_are_surfaced() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "node:1", &node_record("typo-a", 10.0, "USD", "montly", None));
+    seed(&store, "node:2", &node_record("typo-b", 10.0, "USD", "yearlyy", None));
+    seed(&store, "node:3", &node_record("ok", 10.0, "USD", "monthly", None));
+    // once 是统计认得的一次性付费，不该被列进「认不出」的名单。
+    seed(&store, "node:4", &node_record("lifetime", 10.0, "USD", "once", None));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    let notices = notice_texts(&page);
+    let warned: Vec<&String> = notices.iter().filter(|t| t.contains("计费周期无法识别")).collect();
+    assert_eq!(warned.len(), 1, "只发一条周期提示：{notices:?}");
+    let text = warned[0];
+    assert!(text.contains("montly"), "应列出认不出的取值：{text}");
+    assert!(text.contains("yearlyy"), "应列出全部认不出的取值：{text}");
+    assert!(text.contains("未计入年化成本"), "应说明后果：{text}");
+    assert!(!text.contains("once") && !text.contains("monthly"), "认得出的周期不进名单：{text}");
+
+    // 统计口径不变：只有认得出周期的那台进年化（10 USD/月 → 120 USD/年）。
+    let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
+    let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!((annual - 120.0 / 0.14).abs() < 1.0, "只有认得出周期的那台计年化，实际 {annual}");
+}
+
 /// set_currency 持久化到 config，并立即按新币种重算；成功返回提示。
 #[test]
 fn set_currency_persists_and_recomputes() {
@@ -867,17 +966,38 @@ fn form_fields_declare_labels_and_select_options() {
         "币种选项应与 CURRENCIES 一致"
     );
 
-    // 周期下拉：覆盖 cycle_months 认得的全部周期，并含 once。
-    let cycles: Vec<&str> = field_of(form, "billing_cycle")["options"]
+    // 周期下拉：`{value,label}` 对象形态——面板展示 label、提交 value；
+    // value 仍是统计口径认得的字面量，label 是中文。
+    let cycles: Vec<(&str, &str)> = field_of(form, "billing_cycle")["options"]
         .as_array()
         .expect("周期字段应带 options")
         .iter()
-        .map(|o| o.as_str().unwrap())
+        .map(|o| {
+            (
+                o["value"].as_str().unwrap_or_else(|| panic!("周期选项应带 value：{o}")),
+                o["label"].as_str().unwrap_or_else(|| panic!("周期选项应带 label：{o}")),
+            )
+        })
         .collect();
+    assert_eq!(
+        cycles,
+        [
+            ("monthly", "月付"),
+            ("quarterly", "季付"),
+            ("semiannual", "半年付"),
+            ("yearly", "年付"),
+            ("biennial", "两年付"),
+            ("triennial", "三年付"),
+            ("once", "一次性"),
+        ],
+        "周期选项的 value/label 与顺序应与 CYCLE_MONTHS 的配对表一致"
+    );
+    // 覆盖保证：cycle_months 认得的每个周期都在选项里，外加 once。
+    let values: Vec<&str> = cycles.iter().map(|(v, _)| *v).collect();
     for c in ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial"] {
-        assert!(cycles.contains(&c), "周期选项应覆盖 cycle_months 的 {c}：{cycles:?}");
+        assert!(values.contains(&c), "周期选项应覆盖 cycle_months 的 {c}：{values:?}");
     }
-    assert!(cycles.contains(&"once"), "周期选项应含 once：{cycles:?}");
+    assert!(values.contains(&"once"), "周期选项应含 once：{values:?}");
 }
 
 /// Covers AE2（R3）：save_node 成功返回「已保存」提示，节点记录落盘，统计重算。
@@ -940,6 +1060,34 @@ fn save_node_without_record_toasts_error() {
     assert!(
         !store.data().data.lock().unwrap().contains_key("node:404"),
         "失败的保存不应建出记录"
+    );
+}
+
+/// save_node 失败路径：请求里没有 id —— 连读盘都不该发生，直接回 error，不建记录。
+#[test]
+fn save_node_without_id_toasts_error() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // 拉了会失败：计数为 0 才说明没拉
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"save_node","price":9.0}"#,
+    ))
+    .unwrap();
+
+    let (kind, text) = toast_of(&resp);
+    assert_eq!(kind, "error", "缺 id 应给 error 提示");
+    assert!(text.contains("未指定要保存的节点"), "文案应说明缺 id：{text}");
+    assert_eq!(http_calls(&store), 0, "这条路径不该拉汇率");
+    let data = store.data().data.lock().unwrap().clone();
+    assert!(
+        !data.keys().any(|k| k.starts_with("node:")),
+        "缺 id 的保存不该建出任何节点记录：{data:?}"
     );
 }
 

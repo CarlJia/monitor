@@ -217,24 +217,27 @@ impl Config {
     }
 }
 
-/// 周期名 → 月数，顺序即下拉里的展示顺序。统计口径与下拉选项共用这一份，
-/// 才不会出现「选得到但算不出」的缺口。
-const CYCLE_MONTHS: [(&str, u32); 6] = [
-    ("monthly", 1),
-    ("quarterly", 3),
-    ("semiannual", 6),
-    ("yearly", 12),
-    ("biennial", 24),
-    ("triennial", 36),
+/// 周期名 → 月数 → 下拉里的中文展示标签，顺序即下拉里的展示顺序。统计口径、
+/// 下拉取值与展示文案共用这一份，才不会出现「选得到但算不出」的缺口，也不会
+/// 让一张独立的标签表随时间漂移。
+const CYCLE_MONTHS: [(&str, u32, &str); 6] = [
+    ("monthly", 1, "月付"),
+    ("quarterly", 3, "季付"),
+    ("semiannual", 6, "半年付"),
+    ("yearly", 12, "年付"),
+    ("biennial", 24, "两年付"),
+    ("triennial", 36, "三年付"),
 ];
 
 /// 无周期的一次性付费：不在 `CYCLE_MONTHS` 里，故 `cycle_months` 返回 None。
 const ONCE: &str = "once";
+/// `once` 的中文展示标签，与 `CYCLE_MONTHS` 里的标签同一处定义。
+const ONCE_LABEL: &str = "一次性";
 
-/// 计费周期 → 月数：全插件唯一的周期真源（下拉选项也由它派生）。`once`
+/// 计费周期 → 月数：全插件唯一的周期真源（下拉取值与标签也由它派生）。`once`
 /// 无周期（不滚动、不进年化）。
 fn cycle_months(cycle: &str) -> Option<u32> {
-    CYCLE_MONTHS.iter().find(|(name, _)| *name == cycle).map(|(_, months)| *months)
+    CYCLE_MONTHS.iter().find(|(name, _, _)| *name == cycle).map(|(_, months, _)| *months)
 }
 
 fn today() -> NaiveDate {
@@ -345,6 +348,8 @@ fn nodes_basic() -> Option<Vec<(i64, String)>> {
 // ---------------------------------------------------------------------------
 
 /// http 负错误码 → 可读的失败原因（码表见 hub 的 src/plugin/host_funcs.rs）。
+/// `0` 不是错误码——宿主约定它表示调用成功但应答体为空（http_get 返回写入的
+/// 字节数），所以它有自己的文案，不能落进「错误码 0」那句没有信息量的兜底。
 fn http_error_reason(code: i32) -> String {
     match code {
         -1 => "宿主侧读写失败（参数越界/非 UTF-8 或写回失败）".to_owned(),
@@ -352,6 +357,7 @@ fn http_error_reason(code: i32) -> String {
         -4 => "网络请求失败或超时".to_owned(),
         -5 => "汇率服务返回非 2xx 响应".to_owned(),
         -9 => "目标地址解析到私有/保留网段，宿主拒绝".to_owned(),
+        0 => "汇率服务返回了空响应".to_owned(),
         other => format!("宿主返回错误码 {other}"),
     }
 }
@@ -416,6 +422,8 @@ fn refresh_fx(cfg: &Config) -> bool {
         clear_fx_failure();
         return true;
     }
+    // 防御分支：`Fx` 全是可序列化的基础类型，这里实际不会失败，故测试覆盖
+    // 不到（不是死代码——将来给 `Fx` 加上不可序列化的字段时不至于把失败吞掉）。
     record_fx_failure("汇率缓存序列化失败，未写入".to_owned());
     false
 }
@@ -598,8 +606,29 @@ const CURRENCIES: [&str; 12] =
 /// 支持的计费周期下拉选项：`CYCLE_MONTHS` 的全部周期（同序）+ `once`。
 /// 与 `cycle_months` 的覆盖集合同源——下拉里选得到、统计口径就认得出，
 /// 自由文本时代拼错周期（如 `montly`）会被静默剔出年化汇总。
-fn cycle_options() -> Vec<&'static str> {
-    CYCLE_MONTHS.iter().map(|(name, _)| *name).chain(std::iter::once(ONCE)).collect()
+///
+/// 每项是 `{value, label}`：面板展示 label、提交 value。value 仍是统计口径
+/// 认得的那些小写字面量，label 直接取自 `CYCLE_MONTHS` 那一份表，不另立一张
+/// 会漂移的对照表。
+fn cycle_options() -> Vec<Value> {
+    CYCLE_MONTHS
+        .iter()
+        .map(|(name, _, label)| json!({ "value": name, "label": label }))
+        .chain(std::iter::once(json!({ "value": ONCE, "label": ONCE_LABEL })))
+        .collect()
+}
+
+/// 存下来但统计认不出的计费周期（历史数据里的拼写错误等），去重后按字典序
+/// 返回。`cycle_months` 认不出就返回 None，那台机器会被静默剔出年化成本——
+/// 列出来让操作员看得见。（`once` 是认得出的，不算。）
+fn unrecognised_cycles() -> Vec<String> {
+    let mut bad: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (_, n) in all_nodes() {
+        if n.billing_cycle != ONCE && cycle_months(&n.billing_cycle).is_none() {
+            bad.insert(n.billing_cycle);
+        }
+    }
+    bad.into_iter().collect()
 }
 
 /// 给页面描述挂一次性提示（KTD2：文案由插件提供，前端在 action 响应里弹一次）。
@@ -681,6 +710,21 @@ fn build_page(allow_fetch: bool) -> Value {
             }
         }
         None => {}
+    }
+
+    // 存下来但统计认不出的周期会让那台机器静默掉出年化成本（`cycle_months`
+    // 返回 None）。只提醒，统计口径一律不变——这条提示与上面的币种缺失提示
+    // 同类，故紧挨着它放；汇率不可用时同样要给（与汇率无关）。
+    let bad_cycles = unrecognised_cycles();
+    if !bad_cycles.is_empty() {
+        blocks.push(json!({
+            "type": "notice",
+            "kind": "warning",
+            "text": format!(
+                "部分节点的计费周期无法识别（{}），未计入年化成本",
+                bad_cycles.join("、")
+            ),
+        }));
     }
 
     // 币种切换。
