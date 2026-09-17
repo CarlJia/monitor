@@ -234,8 +234,20 @@ const ONCE: &str = "once";
 /// `once` 的中文展示标签，与 `CYCLE_MONTHS` 里的标签同一处定义。
 const ONCE_LABEL: &str = "一次性";
 
+/// 免费机器：同样不在 `CYCLE_MONTHS` 里，但它与 `once` 不是一回事——一次性
+/// 付费仍按购买日折算剩余价值，免费的什么都不算（价格列也不作数）。
+const FREE: &str = "free";
+/// `free` 的中文展示标签。
+const FREE_LABEL: &str = "免费";
+
+/// 这台机器是否不算钱：周期标成免费，或价格为零。汇总、剩余价值与到期表的
+/// 「免费」备注共用这一处判定，免得三处各写一个条件。
+fn is_free(n: &NodeFin) -> bool {
+    n.billing_cycle == FREE || n.price <= 0.0
+}
+
 /// 计费周期 → 月数：全插件唯一的周期真源（下拉取值与标签也由它派生）。`once`
-/// 无周期（不滚动、不进年化）。
+/// 与 `free` 无周期（不滚动、不进年化）。
 fn cycle_months(cycle: &str) -> Option<u32> {
     CYCLE_MONTHS.iter().find(|(name, _, _)| *name == cycle).map(|(_, months, _)| *months)
 }
@@ -291,9 +303,9 @@ fn online_nodes() -> Vec<i64> {
 // ---------------------------------------------------------------------------
 
 /// 首次运行时经 nodes_query 读节点、建初始财务记录。宿主 node 表已不再有
-/// 财务列，所以导入只建「空财务记录」（price=0、币种默认、无到期日）——
-/// 有历史数据的部署在升级前由宿主导出，这里只保证每台机器都有记录可编辑。
-/// 幂等：config.imported 为真即跳过。
+/// 财务列，所以导入只建「空财务记录」（price=0、币种默认 USD、周期默认年付、
+/// 无到期日）——有历史数据的部署在升级前由宿主导出，这里只保证每台机器都有
+/// 记录可编辑。幂等：config.imported 为真即跳过。
 fn ensure_imported(cfg: &mut Config) {
     if cfg.imported {
         return;
@@ -314,7 +326,7 @@ fn ensure_imported(cfg: &mut Config) {
                 name,
                 price: 0.0,
                 currency: "USD".into(),
-                billing_cycle: "monthly".into(),
+                billing_cycle: "yearly".into(),
                 expires_at: None,
                 purchased_at: Some(today().to_string()),
             },
@@ -460,20 +472,20 @@ fn convert(fx: &Fx, amount: f64, from: &str) -> Option<f64> {
 // 统计
 // ---------------------------------------------------------------------------
 
-/// 一台机器的年化成本（原币种）与剩余价值（原币种）。免费的与 once 的按
-/// R10 处理。
+/// 一台机器的年化成本（原币种）。免费的与 once 的按 R10 处理。
 fn annual_cost(n: &NodeFin) -> Option<f64> {
-    let months = cycle_months(&n.billing_cycle)?;
-    if n.price <= 0.0 {
-        return None; // price=0 不计入汇总
+    if is_free(n) {
+        return None; // 免费的不计年化，价格列写多少都不作数
     }
+    let months = cycle_months(&n.billing_cycle)?;
     Some(n.price * (12.0 / months as f64))
 }
 
 /// 剩余价值（原币种）。周期机器按周期内未消耗比例；once 按购买日折算；
 /// 无到期日视为 0。
 fn remaining_value(n: &NodeFin, today: NaiveDate) -> Option<f64> {
-    if n.price <= 0.0 {
+    // 免费的不算剩余（也不进 `once` 那条按购买日折算的分支——它压根没付过钱）。
+    if is_free(n) {
         return None;
     }
     let expires = n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok())?;
@@ -599,11 +611,54 @@ fn tick() {
 // 页面渲染（U5）
 // ---------------------------------------------------------------------------
 
-/// 支持的展示币种：面板原有的六个 + Frankfurter 覆盖的常见币种。
-const CURRENCIES: [&str; 12] =
-    ["CNY", "USD", "EUR", "GBP", "JPY", "CAD", "HKD", "AUD", "CHF", "SGD", "KRW", "INR"];
+/// 支持的展示币种及各自的符号：面板原有的六个 + Frankfurter 覆盖的常见币种。
+/// 币种下拉的文案、汇总金额与价格列的前缀都从这一份派生——符号只此一处，
+/// 三处展示不会各自漂移。日元与人民币都写 ¥ 时分不清，故日元用 JP¥。
+const CURRENCIES: [(&str, &str); 12] = [
+    ("CNY", "¥"),
+    ("USD", "$"),
+    ("EUR", "€"),
+    ("GBP", "£"),
+    ("JPY", "JP¥"),
+    ("CAD", "C$"),
+    ("HKD", "HK$"),
+    ("AUD", "A$"),
+    ("CHF", "CHF"),
+    ("SGD", "S$"),
+    ("KRW", "₩"),
+    ("INR", "₹"),
+];
 
-/// 支持的计费周期下拉选项：`CYCLE_MONTHS` 的全部周期（同序）+ `once`。
+/// 币种 → 符号。表外币种（历史 config 里可能留着的取值）没有符号。
+fn currency_symbol(code: &str) -> Option<&'static str> {
+    CURRENCIES.iter().find(|(c, _)| *c == code).map(|(_, symbol)| *symbol)
+}
+
+/// 价格列显示的前缀：认得的币种给符号，认不得的退回代码本身——总比什么都不放
+/// 好读，那串数字至少还认得出是哪种钱。
+fn currency_prefix(code: &str) -> &str {
+    currency_symbol(code).unwrap_or(code)
+}
+
+/// 金额文案：认得的币种带符号（`¥123.45`），认不得的退回「金额 + 代码」
+/// （`123.45 XXX`）——展示币种可以是表外的历史取值，只印一个数字会读不出是
+/// 什么钱。
+fn money(code: &str, amount: f64) -> String {
+    match currency_symbol(code) {
+        Some(symbol) => format!("{symbol}{amount:.2}"),
+        None => format!("{amount:.2} {code}"),
+    }
+}
+
+/// 币种下拉的选项：展示「¥ CNY」、提交 `CNY`（KTD5 的 `{value,label}` 形态）。
+fn currency_options() -> Vec<Value> {
+    CURRENCIES
+        .iter()
+        .map(|(code, symbol)| json!({ "value": code, "label": format!("{symbol} {code}") }))
+        .collect()
+}
+
+/// 支持的计费周期下拉选项：`CYCLE_MONTHS` 的全部周期（同序）+ `once` + `free`。
 /// 与 `cycle_months` 的覆盖集合同源——下拉里选得到、统计口径就认得出，
 /// 自由文本时代拼错周期（如 `montly`）会被静默剔出年化汇总。
 ///
@@ -614,17 +669,21 @@ fn cycle_options() -> Vec<Value> {
     CYCLE_MONTHS
         .iter()
         .map(|(name, _, label)| json!({ "value": name, "label": label }))
-        .chain(std::iter::once(json!({ "value": ONCE, "label": ONCE_LABEL })))
+        .chain(
+            [(ONCE, ONCE_LABEL), (FREE, FREE_LABEL)]
+                .into_iter()
+                .map(|(name, label)| json!({ "value": name, "label": label })),
+        )
         .collect()
 }
 
 /// 存下来但统计认不出的计费周期（历史数据里的拼写错误等），去重后按字典序
 /// 返回。`cycle_months` 认不出就返回 None，那台机器会被静默剔出年化成本——
-/// 列出来让操作员看得见。（`once` 是认得出的，不算。）
+/// 列出来让操作员看得见。（`once` 与 `free` 是认得出的，不算。）
 fn unrecognised_cycles() -> Vec<String> {
     let mut bad: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (_, n) in all_nodes() {
-        if n.billing_cycle != ONCE && cycle_months(&n.billing_cycle).is_none() {
+        if n.billing_cycle != ONCE && n.billing_cycle != FREE && cycle_months(&n.billing_cycle).is_none() {
             bad.insert(n.billing_cycle);
         }
     }
@@ -687,17 +746,11 @@ fn build_page(allow_fetch: bool) -> Value {
         }
     }
 
-    // 汇总统计。
-    let currency_label = target.clone();
-    match totals(fx.as_ref(), today) {
+    // 汇总统计与币种切换合成一处：第一格是展示币种下拉、后两格是金额，操作者
+    // 一眼能把「哪两个数」和「按什么币种算的」对上。汇率不可用时金额印「—」，
+    // 但下拉照常给——否则没缓存的部署连币种都换不了。
+    let (annual, remaining) = match totals(fx.as_ref(), today) {
         Some(((annual, remaining), missing)) => {
-            blocks.push(json!({
-                "type": "stat",
-                "items": [
-                    {"label": format!("年化续费总成本（{currency_label}）"), "value": format!("{annual:.2}")},
-                    {"label": format!("剩余总价值（{currency_label}）"), "value": format!("{remaining:.2}")},
-                ],
-            }));
             if !missing.is_empty() {
                 blocks.push(json!({
                     "type": "notice",
@@ -708,9 +761,22 @@ fn build_page(allow_fetch: bool) -> Value {
                     ),
                 }));
             }
+            (money(&target, annual), money(&target, remaining))
         }
-        None => {}
-    }
+        None => ("—".to_owned(), "—".to_owned()),
+    };
+    blocks.push(json!({
+        "type": "stat",
+        "items": [
+            {"label": "展示币种", "select": {
+                "value": target,
+                "options": currency_options(),
+                "action": "set_currency",
+            }},
+            {"label": "年化续费总成本", "value": annual},
+            {"label": "剩余总价值", "value": remaining},
+        ],
+    }));
 
     // 存下来但统计认不出的周期会让那台机器静默掉出年化成本（`cycle_months`
     // 返回 None）。只提醒，统计口径一律不变——这条提示与上面的币种缺失提示
@@ -727,16 +793,6 @@ fn build_page(allow_fetch: bool) -> Value {
         }));
     }
 
-    // 币种切换。
-    blocks.push(json!({
-        "type": "select",
-        "name": "target_currency",
-        "label": "展示币种",
-        "value": target,
-        "options": CURRENCIES,
-        "action": "set_currency",
-    }));
-
     // 到期窗口列表。
     let window = cfg.threshold_days;
     let mut due: Vec<Value> = Vec::new();
@@ -744,11 +800,14 @@ fn build_page(allow_fetch: bool) -> Value {
     for (id, n) in all_nodes() {
         let days_left =
             n.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|e| (e - today).num_days());
-        let free = n.price <= 0.0;
+        let free = is_free(&n);
         all.push(json!({
             "id": id,
             "name": n.name,
             "price": n.price,
+            // 价格列的前缀（币种符号）与同一行的币种绑在一起发给面板：前端照
+            // 字段声明里的 prefix_key 取它，不用认识币种代码。
+            "price_symbol": currency_prefix(&n.currency),
             "currency": n.currency,
             "billing_cycle": n.billing_cycle,
             "expires_at": n.expires_at,
@@ -778,14 +837,16 @@ fn build_page(allow_fetch: bool) -> Value {
 
     // 全量编辑表（价格/币种/周期/到期日）。
     // 字段声明用新式对象形态（KTD1）：带中文列头、控件类型与下拉选项。
+    // 价格是 `money`：面板按钱渲染它（右对齐、两位小数），前缀取同行 `price_symbol`
+    // 那一列——符号由插件算好，面板照样不认识币种代码。
     blocks.push(json!({
         "type": "form",
         "title": "节点财务数据",
         "action": "save_node",
         "fields": [
             {"name": "name", "label": "节点名", "type": "text"},
-            {"name": "price", "label": "价格", "type": "number"},
-            {"name": "currency", "label": "币种", "type": "select", "options": CURRENCIES},
+            {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
+            {"name": "currency", "label": "币种", "type": "select", "options": currency_options()},
             {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": cycle_options()},
             {"name": "expires_at", "label": "到期日", "type": "date"},
         ],

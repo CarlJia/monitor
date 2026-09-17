@@ -364,6 +364,58 @@ fn field_of<'a>(form: &'a serde_json::Value, name: &str) -> &'a serde_json::Valu
         .unwrap_or_else(|| panic!("表单应有字段 {name}：{form}"))
 }
 
+/// 页面里的 stat 块。
+fn stat_block(page: &serde_json::Value) -> &serde_json::Value {
+    page["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "stat")
+        .unwrap_or_else(|| panic!("页面应有 stat 块：{page}"))
+}
+
+/// stat 块里某一格的 `value` 文本（按中文标签定位，不按下标——格子顺序是
+/// 界面的一部分，会变）。
+fn stat_value<'a>(page: &'a serde_json::Value, label: &str) -> &'a str {
+    let stats = stat_block(page);
+    let item = stats["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|it| it["label"] == label)
+        .unwrap_or_else(|| panic!("统计块应有「{label}」这一格：{stats}"));
+    item["value"].as_str().unwrap_or_else(|| panic!("「{label}」应是数值格：{item}"))
+}
+
+/// 统计格里的金额数字：值形如「¥123.45」（符号由插件拼好），取数字部分。
+fn stat_amount(page: &serde_json::Value, label: &str) -> f64 {
+    let text = stat_value(page, label);
+    let start = text
+        .find(|c: char| c.is_ascii_digit() || c == '-')
+        .unwrap_or_else(|| panic!("「{label}」的值应含数字：{text}"));
+    text[start..].parse::<f64>().unwrap_or_else(|e| panic!("「{label}」的金额解析失败（{text}）：{e}"))
+}
+
+/// stat 块第一格里的下拉控件（展示币种）。
+fn stat_control(page: &serde_json::Value) -> &serde_json::Value {
+    &stat_block(page)["items"].as_array().unwrap()[0]["select"]
+}
+
+/// 币种选项的 (value, label)，用来查「展示成什么、提交什么」。
+fn option_pairs(options: &serde_json::Value) -> Vec<(&str, &str)> {
+    options
+        .as_array()
+        .unwrap_or_else(|| panic!("选项应是数组：{options}"))
+        .iter()
+        .map(|o| {
+            (
+                o["value"].as_str().unwrap_or_else(|| panic!("选项应带 value：{o}")),
+                o["label"].as_str().unwrap_or_else(|| panic!("选项应带 label：{o}")),
+            )
+        })
+        .collect()
+}
+
 /// (kind, text)，响应没带 toast 时 panic。
 fn toast_of(resp: &serde_json::Value) -> (String, String) {
     let toast = resp.get("toast").unwrap_or_else(|| panic!("响应应带 toast：{resp}"));
@@ -392,6 +444,10 @@ fn tick_imports_nodes_once() {
     assert!(data.contains_key("node:1"), "导入应建 node:1");
     assert!(data.contains_key("node:2"));
     assert!(data.contains_key("fx"), "汇率缓存已写");
+    // 导入的是空白记录：价格 0、周期默认年付。
+    let imported: serde_json::Value = serde_json::from_str(&data["node:1"]).unwrap();
+    assert_eq!(imported["price"], 0.0, "导入的记录价格从 0 起：{imported}");
+    assert_eq!(imported["billing_cycle"], "yearly", "导入的默认周期是年付：{imported}");
 
     // 手工改一条，再 tick 不应被覆盖（imported 标志生效）。
     seed(&store, "node:1", &node_record("edge-1", 42.0, "USD", "monthly", None));
@@ -459,6 +515,11 @@ fn page_warns_when_fx_unavailable() {
     let page = call_json(&mut store, &instance, "render_page", "{}");
     assert!(page.contains("汇率不可用"), "页面应提示汇率不可用：{page}");
     assert!(page.contains("尚未成功拉取过汇率"), "页面应说明从未成功拉取过：{page}");
+    // 统计格里的金额印「—」（没有汇率就没有数），但展示币种的下拉照常给——
+    // 否则没缓存的部署连币种都换不了。
+    let parsed: serde_json::Value = serde_json::from_str(&page).unwrap();
+    assert_eq!(stat_value(&parsed, "年化续费总成本"), "—");
+    assert_eq!(stat_control(&parsed)["value"], "CNY");
 }
 
 /// Covers AE3（R4/KTD3）：无缓存 + 拉取成功——打开页面即触发一次 http_get，
@@ -808,10 +869,12 @@ fn page_totals_convert_and_skip_free() {
     call_unit(&mut store, &instance, "on_tick");
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
-    let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
-    let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    let stats = stat_block(&page);
+    let annual = stat_amount(&page, "年化续费总成本");
     // 10 USD * 12 = 120 USD/年 → /0.14 ≈ 857.14 CNY。免费节点不计入。
     assert!((annual - 120.0 / 0.14).abs() < 1.0, "年化应约 {:.2}，实际 {annual}", 120.0 / 0.14);
+    // 金额带币种符号：目标币种 CNY → ¥（符号由插件拼好，面板不认识币种）。
+    assert!(stat_value(&page, "年化续费总成本").starts_with('¥'), "金额应带币种符号：{stats}");
 }
 
 /// Covers AE2：周期内剩余比例折算。
@@ -827,14 +890,16 @@ fn remaining_value_prorates_within_cycle() {
     // 月付 10 USD，30 天周期还剩 15 天 → 5 USD → /0.14 CNY。
     let in15 = (today() + chrono::Duration::days(15)).to_string();
     seed(&store, "node:1", &node_record("edge", 10.0, "USD", "monthly", Some(&in15)));
+    // 标成免费的机器：留着价格与到期日也不算剩余。它与 once 走的不是同一条路
+    // ——一旦落进「按购买日折算」那支，这台会凭空多出一份剩余价值。
+    seed(&store, "node:2", &node_record("freebie", 10.0, "USD", "free", Some(&in15)));
 
     call_unit(&mut store, &instance, "on_tick");
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
-    let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
-    let remaining = stats["items"][1]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    let remaining = stat_amount(&page, "剩余总价值");
     let expect = 5.0 / 0.14;
-    assert!((remaining - expect).abs() < 1.0, "剩余价值应约 {expect:.2}，实际 {remaining}");
+    assert!((remaining - expect).abs() < 1.0, "只有付费那台折算剩余：应约 {expect:.2}，实际 {remaining}");
 }
 
 /// 历史数据里拼错的周期会被 `cycle_months` 静默剔出年化成本（返回 None）——
@@ -850,8 +915,9 @@ fn unrecognised_billing_cycles_are_surfaced() {
     seed(&store, "node:1", &node_record("typo-a", 10.0, "USD", "montly", None));
     seed(&store, "node:2", &node_record("typo-b", 10.0, "USD", "yearlyy", None));
     seed(&store, "node:3", &node_record("ok", 10.0, "USD", "monthly", None));
-    // once 是统计认得的一次性付费，不该被列进「认不出」的名单。
+    // once 与 free 都是统计认得的一次性/免费取值，不该被列进「认不出」的名单。
     seed(&store, "node:4", &node_record("lifetime", 10.0, "USD", "once", None));
+    seed(&store, "node:5", &node_record("gratis", 10.0, "USD", "free", None));
 
     let page: serde_json::Value =
         serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
@@ -863,11 +929,14 @@ fn unrecognised_billing_cycles_are_surfaced() {
     assert!(text.contains("montly"), "应列出认不出的取值：{text}");
     assert!(text.contains("yearlyy"), "应列出全部认不出的取值：{text}");
     assert!(text.contains("未计入年化成本"), "应说明后果：{text}");
-    assert!(!text.contains("once") && !text.contains("monthly"), "认得出的周期不进名单：{text}");
+    assert!(
+        !text.contains("once") && !text.contains("free") && !text.contains("monthly"),
+        "认得出的周期不进名单：{text}"
+    );
 
-    // 统计口径不变：只有认得出周期的那台进年化（10 USD/月 → 120 USD/年）。
-    let stats = page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
-    let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    // 统计口径不变：只有认得出周期的那台进年化（10 USD/月 → 120 USD/年）；
+    // 免费的与一次性的都不进。
+    let annual = stat_amount(&page, "年化续费总成本");
     assert!((annual - 120.0 / 0.14).abs() < 1.0, "只有认得出周期的那台计年化，实际 {annual}");
 }
 
@@ -891,6 +960,48 @@ fn set_currency_persists_and_recomputes() {
     let cfg = store.data().data.lock().unwrap()["config"].clone();
     assert!(cfg.contains("EUR"), "config 应持久化新币种：{cfg}");
     assert_eq!(toast_of(&resp), ("success".into(), "已切换币种".into()), "切币种成功应提示");
+}
+
+/// 币种符号跟目标币种走：汇总金额、展示币种的下拉与行里的价格前缀一起换。
+#[test]
+fn currency_symbols_follow_the_target_currency() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "node:1", &node_record("paid-usd", 10.0, "USD", "monthly", None));
+    seed(&store, "node:2", &node_record("paid-cny", 10.0, "CNY", "yearly", None));
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+
+    // 汇总按目标币种 CNY 印 ¥。
+    assert!(stat_value(&page, "年化续费总成本").starts_with('¥'), "汇总应带目标币种符号：{page}");
+    // 展示币种是 stat 卡片的第一格（与两个金额同一行），取值与选项都带符号。
+    let control = stat_control(&page);
+    assert_eq!(control["value"], "CNY");
+    assert_eq!(control["action"], "set_currency");
+    let opts = option_pairs(&control["options"]);
+    assert!(opts.contains(&("USD", "$ USD")), "展示币种的下拉应带符号：{opts:?}");
+    // 行里的价格前缀随**同行**的币种，不随目标币种。
+    let rows = form_block(&page)["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["price_symbol"], "$", "USD 那台的前缀是 $：{rows:?}");
+    assert_eq!(rows[1]["price_symbol"], "¥", "CNY 那台的前缀是 ¥：{rows:?}");
+
+    // 切到 EUR：汇总符号与下拉取值一起变，行前缀不动（节点自己的币种没改）。
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"set_currency","value":"EUR"}"#,
+    ))
+    .unwrap();
+    assert!(stat_value(&resp, "年化续费总成本").starts_with('€'), "切币种后汇总符号应跟着换：{resp}");
+    assert_eq!(stat_control(&resp)["value"], "EUR");
+    let rows = form_block(&resp)["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["price_symbol"], "$", "换展示币种不该动节点自己的币种：{rows:?}");
 }
 
 /// 清理：删掉已不在节点表里的残留记录，返回统计。
@@ -946,39 +1057,39 @@ fn form_fields_declare_labels_and_select_options() {
         assert_eq!(field_of(form, name)["label"], label, "{name} 应有中文标签：{form}");
     }
 
-    // 控件类型（R2）。
-    assert_eq!(field_of(form, "price")["type"], "number");
+    // 控件类型（R2）。价格是 `money`（右对齐、两位小数），前缀取自同行
+    // `price_symbol` 那一列——面板据此把币种符号摆在价格前。
+    assert_eq!(field_of(form, "price")["type"], "money");
+    assert_eq!(field_of(form, "price")["prefix_key"], "price_symbol");
     assert_eq!(field_of(form, "expires_at")["type"], "date");
     assert_eq!(field_of(form, "name")["type"], "text");
     assert_eq!(field_of(form, "currency")["type"], "select");
     assert_eq!(field_of(form, "billing_cycle")["type"], "select");
 
-    // 币种下拉选项 = CURRENCIES。
-    let currencies: Vec<&str> = field_of(form, "currency")["options"]
-        .as_array()
-        .expect("币种字段应带 options")
-        .iter()
-        .map(|o| o.as_str().unwrap())
-        .collect();
+    // 币种下拉选项 = CURRENCIES：展示「¥ CNY」、提交 `CNY`。
+    let currencies = option_pairs(&field_of(form, "currency")["options"]);
     assert_eq!(
         currencies,
-        ["CNY", "USD", "EUR", "GBP", "JPY", "CAD", "HKD", "AUD", "CHF", "SGD", "KRW", "INR"],
-        "币种选项应与 CURRENCIES 一致"
+        [
+            ("CNY", "¥ CNY"),
+            ("USD", "$ USD"),
+            ("EUR", "€ EUR"),
+            ("GBP", "£ GBP"),
+            ("JPY", "JP¥ JPY"),
+            ("CAD", "C$ CAD"),
+            ("HKD", "HK$ HKD"),
+            ("AUD", "A$ AUD"),
+            ("CHF", "CHF CHF"),
+            ("SGD", "S$ SGD"),
+            ("KRW", "₩ KRW"),
+            ("INR", "₹ INR"),
+        ],
+        "币种选项应是「符号 + 代码」，且与 CURRENCIES 一致"
     );
 
     // 周期下拉：`{value,label}` 对象形态——面板展示 label、提交 value；
     // value 仍是统计口径认得的字面量，label 是中文。
-    let cycles: Vec<(&str, &str)> = field_of(form, "billing_cycle")["options"]
-        .as_array()
-        .expect("周期字段应带 options")
-        .iter()
-        .map(|o| {
-            (
-                o["value"].as_str().unwrap_or_else(|| panic!("周期选项应带 value：{o}")),
-                o["label"].as_str().unwrap_or_else(|| panic!("周期选项应带 label：{o}")),
-            )
-        })
-        .collect();
+    let cycles = option_pairs(&field_of(form, "billing_cycle")["options"]);
     assert_eq!(
         cycles,
         [
@@ -989,15 +1100,17 @@ fn form_fields_declare_labels_and_select_options() {
             ("biennial", "两年付"),
             ("triennial", "三年付"),
             ("once", "一次性"),
+            ("free", "免费"),
         ],
         "周期选项的 value/label 与顺序应与 CYCLE_MONTHS 的配对表一致"
     );
-    // 覆盖保证：cycle_months 认得的每个周期都在选项里，外加 once。
+    // 覆盖保证：cycle_months 认得的每个周期都在选项里，外加 once 与 free。
     let values: Vec<&str> = cycles.iter().map(|(v, _)| *v).collect();
     for c in ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial"] {
         assert!(values.contains(&c), "周期选项应覆盖 cycle_months 的 {c}：{values:?}");
     }
     assert!(values.contains(&"once"), "周期选项应含 once：{values:?}");
+    assert!(values.contains(&"free"), "周期选项应含 free：{values:?}");
 }
 
 /// Covers AE2（R3）：save_node 成功返回「已保存」提示，节点记录落盘，统计重算。
@@ -1033,9 +1146,11 @@ fn save_node_toasts_and_persists() {
     assert_eq!(rec["expires_at"], "2027-06-01");
 
     // 响应里的新页面描述已按新数据重算：42.5 EUR/年 → /0.13 CNY。
-    let stats = resp["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
-    let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    let annual = stat_amount(&resp, "年化续费总成本");
     assert!((annual - 42.5 / 0.13).abs() < 1.0, "年化应随保存重算，实际 {annual}");
+    // 这台改成 EUR 后，编辑表里它的价格前缀应跟着换成 €。
+    let rows = form_block(&resp)["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["price_symbol"], "€", "价格前缀应随同行币种：{rows:?}");
 }
 
 /// save_node 失败路径：目标记录不存在时不谎报成功，也不凭空建记录。

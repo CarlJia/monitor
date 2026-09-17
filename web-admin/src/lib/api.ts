@@ -274,13 +274,22 @@ export type PluginFieldDecl = string | {
   type?: string
   /** 仅 `type: "select"` 用得上；裸字符串或 `{value, label}` 都接受。 */
   options?: PluginOptionDecl[]
+  /**
+   * 这一列里显示在值前面的文本取自**同一行**的哪个键（如价格列前的币种符号）；
+   * 该键不在字段声明里，所以它只是一格前缀、不会多出一列。缺省或全空白表示
+   * 没有前缀。
+   */
+  prefix_key?: string
 }
 
 /**
  * 字段的控件类型名单：既是运行时校验的名单，也是 `FieldType` 的类型来源——
  * 两处各写一遍就会有一处先过期。
+ *
+ * `money` 是数字的展示形态：右对齐、两位小数（是不是钱由插件声明，面板不按
+ * 字段名猜）。提交时按数字处理——格式化后的文本不该漏进载荷。
  */
-export const FIELD_TYPES = ["text", "number", "date"] as const
+export const FIELD_TYPES = ["text", "number", "date", "money"] as const
 
 export type FieldType = typeof FIELD_TYPES[number]
 
@@ -292,6 +301,8 @@ export type PluginField = {
   type: FieldType | "select"
   /** 仅 `select` 非空。 */
   options: PluginOption[]
+  /** 值前面要显示的文本取自同一行的哪个键；无前缀时是空串。 */
+  prefixKey: string
 }
 
 /** 取一个可能是任何东西的 JSON 值为字符串；不是字符串就取空串。 */
@@ -313,11 +324,13 @@ export function inputType(field: string): FieldType {
 
 /**
  * 选项声明（裸字符串或 `{value, label}`）→ 渲染用的 `{value, label}`。
+ * 页面上的三个下拉（顶层 select 块、form 字段、stat 格子里的控件）共用这一份：
+ * 同一件事归一化两遍，迟早有一处漏掉某种形态。
  * `value` 先去空白再判空，不是非空字符串的条目丢掉——下拉里没有值可提交的项
  * 渲染出来就是一格死选项，而只有空白的值渲染出来是一格看不见的选项，两者都
  * 该丢。`label` 缺省或只剩空白时回退到 `value`：显示标识总比显示空白好。
  */
-function normalizeOptions(raw: unknown): PluginOption[] {
+export function normalizeOptions(raw: unknown): PluginOption[] {
   if (!Array.isArray(raw)) return []
   const options: PluginOption[] = []
   for (const entry of raw as unknown[]) {
@@ -357,7 +370,13 @@ export function normalizeFields(decls?: PluginFieldDecl[]): PluginField[] {
     const type = declared === "select" && options.length > 0 ? "select"
       : isFieldType(declared) ? declared
       : inputType(name)
-    fields.push({ name, label: asText(decl.label).trim() || name, type, options })
+    fields.push({
+      name,
+      label: asText(decl.label).trim() || name,
+      type,
+      options,
+      prefixKey: asText(decl.prefix_key).trim(),
+    })
   }
   return fields
 }
@@ -372,6 +391,9 @@ function isFieldType(declared: string): declared is FieldType {
  * 解析不出数字的跳过——`Number("")` 是 0，而 0 在价格这类字段里有实际含义
  * （财务插件的 0 表示免费），存成 0 等于静默改掉一个字段；跳过即保留服务端
  * 原值。控件类型看归一化后的声明（`fields`），不再单看字段名。
+ *
+ * `money` 与 `number` 同路：它只是数字的一个展示形态（两位小数），提交的必须
+ * 是数字——把「1200.00」当字符串发回去，插件那侧读不出金额。
  */
 export function formPayload(
   fields: PluginField[],
@@ -382,7 +404,7 @@ export function formPayload(
   if (id !== undefined) payload.id = id
   for (const f of fields) {
     const raw = values[f.name] ?? ""
-    if (f.type !== "number") {
+    if (f.type !== "number" && f.type !== "money") {
       payload[f.name] = raw
       continue
     }
@@ -392,6 +414,18 @@ export function formPayload(
     if (!Number.isNaN(n)) payload[f.name] = n
   }
   return payload
+}
+
+/**
+ * `money` 列的展示值：两位小数。空值返回空串、解析不出数字的值原样返回——
+ * 两者都不能被格式化成 `0.00` 或 `NaN`，否则一个没填的价格会读成免费，一个
+ * 坏掉的值会从页面上消失。展示成什么样由这一列的声明决定，面板不猜哪列是钱。
+ */
+export function moneyCell(value: unknown): string {
+  const text = value === null || value === undefined ? "" : String(value).trim()
+  if (text === "") return ""
+  const n = Number(text)
+  return Number.isFinite(n) ? n.toFixed(2) : text
 }
 
 /**
@@ -421,6 +455,23 @@ export function toastKind(kind?: string): ToastKind {
   return (TOAST_KINDS as readonly string[]).includes(kind ?? "") ? (kind as ToastKind) : "success"
 }
 
+/**
+ * stat 块里的一格：正常是「标签 + 只读数值」，`select` 存在时这一格是「标签 +
+ * 一个下拉控件」（如展示币种的切换）。两者取其一，`value` 与 `select` 同时
+ * 出现时按 `select` 渲染。
+ */
+export type PluginStatItem = {
+  label: string
+  value?: string
+  select?: {
+    /** 当前取值；缺省时下拉显示占位。 */
+    value?: string
+    /** 提交的动作名；缺省时前端按空动作提交。 */
+    action?: string
+    options?: PluginOptionDecl[]
+  }
+}
+
 /** 插件面板页面的 JSON UI 描述（U5/KTD5）。前端按词汇表渲染。 */
 export type PluginBlock = {
   type: string
@@ -431,8 +482,8 @@ export type PluginBlock = {
   name?: string
   value?: string
   action?: string
-  options?: string[]
-  items?: { label: string; value: string }[]
+  options?: PluginOptionDecl[]
+  items?: PluginStatItem[]
   columns?: string[]
   /**
    * 行的两种形态：table 块是单元格数组，form 块是字段对象。前端用首行形态

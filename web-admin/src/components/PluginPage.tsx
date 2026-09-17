@@ -11,11 +11,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import {
   asText,
   formPayload,
+  moneyCell,
   normalizeFields,
+  normalizeOptions,
   pluginAction,
   pluginPage,
   toastKind,
   type PluginBlock,
+  type PluginField,
   type PluginPage as PluginPageData,
   type PluginToast,
   type ToastKind,
@@ -24,6 +27,17 @@ import {
 /** 把任意 JSON 值渲染成可读字符串：null/undefined 视作空，数字/布尔照常。 */
 function cell(value: unknown): string {
   return value === null || value === undefined ? "" : String(value)
+}
+
+/**
+ * stat 块按格子数决定列数。Tailwind 只认字面量类名（拼出来的
+ * `sm:grid-cols-${n}` 会被 purge 掉），所以查表而不是拼串。
+ */
+const STAT_COLS: Record<number, string> = {
+  1: "grid-cols-1",
+  2: "grid-cols-2 sm:grid-cols-4",
+  3: "grid-cols-1 sm:grid-cols-3",
+  4: "grid-cols-2 sm:grid-cols-4",
 }
 
 /**
@@ -63,12 +77,14 @@ function FormBlock({ block, busy, onSubmit }: {
   // 等于允许用户白改一场。
   const busyNow = busy !== null
 
-  const value = (i: number, f: string) => drafts[i]?.[f] ?? cell(rows[i]?.[f])
+  // 草稿优先，没有草稿回落到行里的原值；`money` 列的原值按两位小数展示。
+  const value = (i: number, f: PluginField) =>
+    drafts[i]?.[f.name] ?? (f.type === "money" ? moneyCell(rows[i]?.[f.name]) : cell(rows[i]?.[f.name]))
   const patch = (i: number, f: string, v: string) =>
     setDrafts((old) => ({ ...old, [i]: { ...(old[i] ?? {}), [f]: v } }))
 
   async function saveRow(row: Record<string, unknown>, i: number) {
-    const values = Object.fromEntries(fields.map((f) => [f.name, value(i, f.name)]))
+    const values = Object.fromEntries(fields.map((f) => [f.name, value(i, f)]))
     // 取值规则（数字字段的空串/非数字跳过）在 formPayload 里，见 api.ts。
     await onSubmit(block.action ?? "save", formPayload(fields, row.id, values))
   }
@@ -78,7 +94,12 @@ function FormBlock({ block, busy, onSubmit }: {
       <Table>
         <TableHeader>
           <TableRow>
-            {fields.map((f) => <TableHead key={f.name}>{f.label}</TableHead>)}
+            {fields.map((f) => (
+              // 金额列右对齐：列头与格里的数字同一边，竖着扫才成一条线。
+              <TableHead key={f.name} className={f.type === "money" ? "text-right" : undefined}>
+                {f.label}
+              </TableHead>
+            ))}
             <TableHead className="text-right">操作</TableHead>
           </TableRow>
         </TableHeader>
@@ -94,14 +115,30 @@ function FormBlock({ block, busy, onSubmit }: {
               {fields.map((f) => {
                 // 值是「草稿，回落到服务端原值」；placeholder 仍是原值，用户
                 // 知道自己抹掉了什么。
-                const shown = value(i, f.name)
+                const shown = value(i, f)
                 const initial = cell(row[f.name])
+                const money = f.type === "money"
+                // 金额前的符号是插件算好的文本（同一行里 `prefixKey` 指的那一
+                // 列），前端不认识币种代码、也不猜哪一列是价格。
+                const prefix = f.prefixKey === "" ? "" : cell(row[f.prefixKey])
                 // 行里的值可能不在 options 里（插件改过选项集合，老数据还在）：
                 // 补一项进去。否则 Radix 的触发器会显示空白，操作者看不出当前
                 // 值是什么——正是这次改版要消掉的「看不见」。比对的是选项的
                 // `value`（提交载荷里的值），补的那项值与文案都是这串原值：
                 // 它没有声明过的文案可用，至少别让当前值消失。
                 const extra = shown !== "" && !f.options.some((o) => o.value === shown) ? shown : null
+                const input = (
+                  <Input
+                    // 金额也是数字输入框（浏览器的数字键盘、上下键都对），
+                    // `money` 只是它右对齐、按两位小数展示。
+                    type={money ? "number" : f.type}
+                    value={shown}
+                    placeholder={initial}
+                    className={money ? "w-32 shrink-0 text-right" : "min-w-32"}
+                    disabled={busyNow}
+                    onChange={(e) => patch(i, f.name, e.target.value)}
+                  />
+                )
                 return (
                   <TableCell key={f.name}>
                     {f.type === "select" ? (
@@ -121,15 +158,15 @@ function FormBlock({ block, busy, onSubmit }: {
                           {extra !== null && <SelectItem key={extra} value={extra}>{extra}</SelectItem>}
                         </SelectContent>
                       </Select>
+                    ) : money ? (
+                      <div className="flex items-center justify-end gap-1">
+                        {prefix !== "" && (
+                          <span className="text-sm text-muted-foreground">{prefix}</span>
+                        )}
+                        {input}
+                      </div>
                     ) : (
-                      <Input
-                        type={f.type}
-                        value={shown}
-                        placeholder={initial}
-                        className="min-w-32"
-                        disabled={busyNow}
-                        onChange={(e) => patch(i, f.name, e.target.value)}
-                      />
+                      input
                     )}
                   </TableCell>
                 )
@@ -249,19 +286,41 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
                 {block.text}
               </div>
             )
-          case "stat":
+          case "stat": {
+            const items = block.items ?? []
+            const cols = STAT_COLS[items.length] ?? STAT_COLS[4]
             return (
               <Card key={i} className="p-5">
-                <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                  {(block.items ?? []).map((item, j) => (
-                    <div key={j}>
-                      <div className="text-xs text-muted-foreground">{item.label}</div>
-                      <div className="tnum mt-0.5 text-base">{item.value}</div>
-                    </div>
-                  ))}
+                <div className={`grid gap-4 ${cols}`}>
+                  {items.map((item, j) => {
+                    // 一格要么是只读数值，要么是个控件（如展示币种的下拉）。
+                    const control = item.select
+                    return (
+                      <div key={j}>
+                        <div className="text-xs text-muted-foreground">{item.label}</div>
+                        {control ? (
+                          <Select
+                            value={control.value ?? ""}
+                            onValueChange={(v) => act(control.action ?? "", { value: v })}
+                            disabled={busy !== null}
+                          >
+                            <SelectTrigger className="mt-0.5 w-40"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              {normalizeOptions(control.options).map((opt) => (
+                                <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        ) : (
+                          <div className="tnum mt-0.5 text-base">{item.value}</div>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               </Card>
             )
+          }
           case "select": {
             const action = block.action ?? ""
             return (
@@ -275,8 +334,8 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
                   >
                     <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      {(block.options ?? []).map((opt) => (
-                        <SelectItem key={opt} value={opt}>{opt}</SelectItem>
+                      {normalizeOptions(block.options).map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
