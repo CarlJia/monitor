@@ -293,6 +293,30 @@ fn node_record(name: &str, price: f64, currency: &str, cycle: &str, expires: Opt
     .to_string()
 }
 
+/// 页面里的 form 块。
+fn form_block(page: &serde_json::Value) -> &serde_json::Value {
+    page["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "form").expect("页面应有 form 块")
+}
+
+/// 按字段名取一条字段声明。
+fn field_of<'a>(form: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    form["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == name)
+        .unwrap_or_else(|| panic!("表单应有字段 {name}：{form}"))
+}
+
+/// (kind, text)，响应没带 toast 时 panic。
+fn toast_of(resp: &serde_json::Value) -> (String, String) {
+    let toast = resp.get("toast").unwrap_or_else(|| panic!("响应应带 toast：{resp}"));
+    (
+        toast["kind"].as_str().unwrap_or_default().to_owned(),
+        toast["text"].as_str().unwrap_or_else(|| panic!("toast 应带文案：{toast}")).to_owned(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -458,7 +482,7 @@ fn remaining_value_prorates_within_cycle() {
     assert!((remaining - expect).abs() < 1.0, "剩余价值应约 {expect:.2}，实际 {remaining}");
 }
 
-/// set_currency 持久化到 config，并立即按新币种重算。
+/// set_currency 持久化到 config，并立即按新币种重算；成功返回提示。
 #[test]
 fn set_currency_persists_and_recomputes() {
     let engine = engine();
@@ -468,9 +492,16 @@ fn set_currency_persists_and_recomputes() {
     let (mut store, instance) = instantiate(&engine, &wasm, host);
     seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
 
-    call_json(&mut store, &instance, "on_action", r#"{"action":"set_currency","value":"EUR"}"#);
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"set_currency","value":"EUR"}"#,
+    ))
+    .unwrap();
     let cfg = store.data().data.lock().unwrap()["config"].clone();
     assert!(cfg.contains("EUR"), "config 应持久化新币种：{cfg}");
+    assert_eq!(toast_of(&resp), ("success".into(), "已切换币种".into()), "切币种成功应提示");
 }
 
 /// 清理：删掉已不在节点表里的残留记录，返回统计。
@@ -490,4 +521,175 @@ fn cleanup_prunes_deleted_nodes() {
     let data = store.data().data.lock().unwrap().clone();
     assert!(data.contains_key("node:1"), "保留的节点不动");
     assert!(!data.contains_key("node:99"), "已删除节点的记录被清");
+}
+
+/// Covers AE1（R1/R2）：form 字段是新式对象声明，列头为中文，币种与周期是
+/// 带选项的下拉；选项集合与插件的 `CURRENCIES` / `cycle_months` 覆盖集一致。
+#[test]
+fn form_fields_declare_labels_and_select_options() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let page: serde_json::Value =
+        serde_json::from_str(&call_json(&mut store, &instance, "render_page", "{}")).unwrap();
+    let form = form_block(&page);
+
+    // 字段顺序即列顺序；每个字段都是对象形态（KTD1 的新式声明）。
+    let names: Vec<&str> =
+        form["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["name", "price", "currency", "billing_cycle", "expires_at"],
+        "字段集合与顺序不变：{form}"
+    );
+
+    // 中文列头（R1）。
+    for (name, label) in [
+        ("name", "节点名"),
+        ("price", "价格"),
+        ("currency", "币种"),
+        ("billing_cycle", "计费周期"),
+        ("expires_at", "到期日"),
+    ] {
+        assert_eq!(field_of(form, name)["label"], label, "{name} 应有中文标签：{form}");
+    }
+
+    // 控件类型（R2）。
+    assert_eq!(field_of(form, "price")["type"], "number");
+    assert_eq!(field_of(form, "expires_at")["type"], "date");
+    assert_eq!(field_of(form, "name")["type"], "text");
+    assert_eq!(field_of(form, "currency")["type"], "select");
+    assert_eq!(field_of(form, "billing_cycle")["type"], "select");
+
+    // 币种下拉选项 = CURRENCIES。
+    let currencies: Vec<&str> = field_of(form, "currency")["options"]
+        .as_array()
+        .expect("币种字段应带 options")
+        .iter()
+        .map(|o| o.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        currencies,
+        ["CNY", "USD", "EUR", "GBP", "JPY", "CAD", "HKD", "AUD", "CHF", "SGD", "KRW", "INR"],
+        "币种选项应与 CURRENCIES 一致"
+    );
+
+    // 周期下拉：覆盖 cycle_months 认得的全部周期，并含 once。
+    let cycles: Vec<&str> = field_of(form, "billing_cycle")["options"]
+        .as_array()
+        .expect("周期字段应带 options")
+        .iter()
+        .map(|o| o.as_str().unwrap())
+        .collect();
+    for c in ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial"] {
+        assert!(cycles.contains(&c), "周期选项应覆盖 cycle_months 的 {c}：{cycles:?}");
+    }
+    assert!(cycles.contains(&"once"), "周期选项应含 once：{cycles:?}");
+}
+
+/// Covers AE2（R3）：save_node 成功返回「已保存」提示，节点记录落盘，统计重算。
+#[test]
+fn save_node_toasts_and_persists() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    // rates（base=CNY）：EUR=0.13 → 1 EUR = 1/0.13 CNY。
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "node:1", &node_record("edge-1", 10.0, "USD", "monthly", None));
+    call_unit(&mut store, &instance, "on_tick"); // 先把汇率缓存灌进去，页面才有统计块
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"save_node","id":1,"name":"edge-renamed","price":42.5,
+            "currency":"EUR","billing_cycle":"yearly","expires_at":"2027-06-01"}"#,
+    ))
+    .unwrap();
+
+    assert_eq!(toast_of(&resp), ("success".into(), "已保存".into()), "保存成功应提示");
+
+    let rec: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["node:1"]).unwrap();
+    assert_eq!(rec["name"], "edge-renamed");
+    assert_eq!(rec["price"], 42.5);
+    assert_eq!(rec["currency"], "EUR");
+    assert_eq!(rec["billing_cycle"], "yearly");
+    assert_eq!(rec["expires_at"], "2027-06-01");
+
+    // 响应里的新页面描述已按新数据重算：42.5 EUR/年 → /0.13 CNY。
+    let stats = resp["blocks"].as_array().unwrap().iter().find(|b| b["type"] == "stat").unwrap();
+    let annual = stats["items"][0]["value"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!((annual - 42.5 / 0.13).abs() < 1.0, "年化应随保存重算，实际 {annual}");
+}
+
+/// save_node 失败路径：目标记录不存在时不谎报成功，也不凭空建记录。
+#[test]
+fn save_node_without_record_toasts_error() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default();
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"save_node","id":404,"price":9.0}"#,
+    ))
+    .unwrap();
+    let (kind, text) = toast_of(&resp);
+    assert_eq!(kind, "error", "保存失败应给 error 提示");
+    assert!(text.contains("不存在"), "文案应说明未保存：{text}");
+    assert!(
+        !store.data().data.lock().unwrap().contains_key("node:404"),
+        "失败的保存不应建出记录"
+    );
+}
+
+/// refresh_fx 的两个分支各有对应文案：拉到汇率提示成功，拉不到提示失败。
+#[test]
+fn refresh_fx_toasts_success_and_failure() {
+    let engine = engine();
+    let wasm = build_wasm();
+
+    // 成功：http 有应答，缓存写入。
+    let host = Host::default();
+    host.http_body.lock().unwrap().replace(fx_json("CNY"));
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    let ok: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"refresh_fx"}"#,
+    ))
+    .unwrap();
+    assert_eq!(toast_of(&ok).0, "success", "刷新成功应给 success 提示");
+    assert!(store.data().data.lock().unwrap().contains_key("fx"), "成功应写入汇率缓存");
+
+    // 失败：http 返回错误码（桩宿主 -4），缓存不写、提示为失败。
+    let host = Host::default(); // http_body 保持 None
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    let bad: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"refresh_fx"}"#,
+    ))
+    .unwrap();
+    let (kind, text) = toast_of(&bad);
+    assert_eq!(kind, "error", "刷新失败应给 error 提示");
+    assert!(text.contains("失败"), "文案应说明失败：{text}");
+    assert!(
+        !store.data().data.lock().unwrap().contains_key("fx"),
+        "失败的刷新不应写入汇率缓存"
+    );
 }

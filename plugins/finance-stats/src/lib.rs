@@ -520,6 +520,20 @@ fn tick() {
 const CURRENCIES: [&str; 12] =
     ["CNY", "USD", "EUR", "GBP", "JPY", "CAD", "HKD", "AUD", "CHF", "SGD", "KRW", "INR"];
 
+/// 支持的计费周期：`cycle_months` 认得的全部周期 + `once`（无周期）。
+/// 与 `cycle_months` 的覆盖集合保持一致——下拉里选得到、统计口径就认得出，
+/// 自由文本时代拼错周期（如 `montly`）会被静默剔出年化汇总。
+const CYCLE_OPTIONS: [&str; 7] =
+    ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial", "once"];
+
+/// 给页面描述挂一次性提示（KTD2：文案由插件提供，前端在 action 响应里弹一次）。
+fn with_toast(mut page: Value, kind: &str, text: &str) -> Value {
+    if let Some(obj) = page.as_object_mut() {
+        obj.insert("toast".into(), json!({ "kind": kind, "text": text }));
+    }
+    page
+}
+
 fn build_page() -> Value {
     let mut cfg = Config::load();
     ensure_imported(&mut cfg);
@@ -622,11 +636,18 @@ fn build_page() -> Value {
     }));
 
     // 全量编辑表（价格/币种/周期/到期日）。
+    // 字段声明用新式对象形态（KTD1）：带中文列头、控件类型与下拉选项。
     blocks.push(json!({
         "type": "form",
         "title": "节点财务数据",
         "action": "save_node",
-        "fields": ["name", "price", "currency", "billing_cycle", "expires_at"],
+        "fields": [
+            {"name": "name", "label": "节点名", "type": "text"},
+            {"name": "price", "label": "价格", "type": "number"},
+            {"name": "currency", "label": "币种", "type": "select", "options": CURRENCIES},
+            {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": CYCLE_OPTIONS},
+            {"name": "expires_at", "label": "到期日", "type": "date"},
+        ],
         "rows": all,
     }));
 
@@ -648,35 +669,42 @@ fn handle_action(input: &str) -> Value {
                 cfg.save();
                 refresh_fx(&cfg);
             }
-            build_page()
+            with_toast(build_page(), "success", "已切换币种")
         }
         "refresh_fx" => {
             let cfg = Config::load();
-            refresh_fx(&cfg);
-            build_page()
+            // 拉取结果决定提示文案：失败时不谎报成功，用户才知道统计为什么没动。
+            let (kind, text) = if refresh_fx(&cfg) {
+                ("success", "汇率已刷新")
+            } else {
+                ("error", "汇率刷新失败，统计沿用最近一次缓存")
+            };
+            with_toast(build_page(), kind, text)
         }
         "save_node" => {
-            if let Some(id) = req.get("id").and_then(|v| v.as_i64()) {
-                if let Some(mut n) = load_node(id) {
-                    if let Some(v) = req.get("name").and_then(|v| v.as_str()) {
-                        n.name = v.to_owned();
-                    }
-                    if let Some(v) = req.get("price").and_then(|v| v.as_f64()) {
-                        n.price = v;
-                    }
-                    if let Some(v) = req.get("currency").and_then(|v| v.as_str()) {
-                        n.currency = v.to_owned();
-                    }
-                    if let Some(v) = req.get("billing_cycle").and_then(|v| v.as_str()) {
-                        n.billing_cycle = v.to_owned();
-                    }
-                    if let Some(v) = req.get("expires_at").and_then(|v| v.as_str()) {
-                        n.expires_at = if v.is_empty() { None } else { Some(v.to_owned()) };
-                    }
-                    save_node(id, &n);
-                }
+            let Some(id) = req.get("id").and_then(|v| v.as_i64()) else {
+                return with_toast(build_page(), "error", "未指定要保存的节点");
+            };
+            let Some(mut n) = load_node(id) else {
+                return with_toast(build_page(), "error", "节点记录不存在，未保存");
+            };
+            if let Some(v) = req.get("name").and_then(|v| v.as_str()) {
+                n.name = v.to_owned();
             }
-            build_page()
+            if let Some(v) = req.get("price").and_then(|v| v.as_f64()) {
+                n.price = v;
+            }
+            if let Some(v) = req.get("currency").and_then(|v| v.as_str()) {
+                n.currency = v.to_owned();
+            }
+            if let Some(v) = req.get("billing_cycle").and_then(|v| v.as_str()) {
+                n.billing_cycle = v.to_owned();
+            }
+            if let Some(v) = req.get("expires_at").and_then(|v| v.as_str()) {
+                n.expires_at = if v.is_empty() { None } else { Some(v.to_owned()) };
+            }
+            save_node(id, &n);
+            with_toast(build_page(), "success", "已保存")
         }
         _ => build_page(),
     }
