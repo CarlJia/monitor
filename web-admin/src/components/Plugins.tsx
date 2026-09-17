@@ -245,8 +245,9 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
     // 守卫：selected 不在最新列表里就跳过——别拿已删 id 去请求 logs（404）。删除
     // 后 plugins 更新会让选中项回退，但那次回退所在的渲染里 selected 还是旧值，
     // 这道门就负责拦下那一帧。
-    if (selected == null || !plugins.some((p) => p.id === selected)) return
+    // 先清日志：无论是否跳过，都不该把上一帧（可能属于已删插件）的记录留在屏上。
     setEntries(null)
+    if (selected == null || !plugins.some((p) => p.id === selected)) return
     pluginLogs(selected)
       .then(setEntries)
       .catch((e: Error) => { setEntries([]); toast.error(e.message) })
@@ -352,8 +353,17 @@ export function Plugins({ go }: { go: (to: string) => void }) {
   const [pulse, setPulse] = useState(0)
   const fileInput = useRef<HTMLInputElement>(null)
 
-  const load = () =>
-    listPlugins().then(setPlugins).catch((e: Error) => { setPlugins([]); toast.error(e.message) })
+  // 序号化的重拉：并发的 listPlugins 响应若乱序，只有最新一次的落地——否则删除
+  // 前发出的旧请求晚到会把已删行「复活」回列表，日志守卫随之放行。
+  const loadSeq = useRef(0)
+  const load = () => {
+    const seq = ++loadSeq.current
+    return listPlugins()
+      .then((list) => { if (seq === loadSeq.current) setPlugins(list) })
+      .catch((e: Error) => {
+        if (seq === loadSeq.current) { setPlugins([]); toast.error(e.message) }
+      })
+  }
   useEffect(() => { load() }, [])
 
   const bump = () => setPulse((n) => n + 1)
