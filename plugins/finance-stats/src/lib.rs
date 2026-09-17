@@ -9,8 +9,9 @@
 //!   （到期的在线节点按周期向后滚动；进入阈值窗口的经 `emit_event` 发
 //!   `plugin_expiry_soon`）；
 //! - `render_page` 渲染统计页（年化续费成本 / 剩余价值 / 到期列表 / 编辑表）；
-//!   打开页面时若尚无汇率缓存，先同步拉一次（R4/KTD3），action 路径不拉；
-//! - `on_action` 处理页面交互（切币种 / 保存节点 / 立即刷新汇率）；
+//!   首次渲染时若尚无汇率缓存，先同步拉一次（R4/KTD3）；
+//! - `on_action` 处理页面交互（切币种 / 保存节点 / 立即刷新汇率）——其余动作
+//!   路径不**隐式**拉取（切币种与手动刷新各自显式拉一次）；
 //! - `on_cleanup` 清掉已删除节点的残留记录。
 //!
 //! # 数据模型（plugin_data 的记录）
@@ -216,17 +217,24 @@ impl Config {
     }
 }
 
-/// 计费周期 → 月数。`once` 无周期（不滚动、不进年化）。
+/// 周期名 → 月数，顺序即下拉里的展示顺序。统计口径与下拉选项共用这一份，
+/// 才不会出现「选得到但算不出」的缺口。
+const CYCLE_MONTHS: [(&str, u32); 6] = [
+    ("monthly", 1),
+    ("quarterly", 3),
+    ("semiannual", 6),
+    ("yearly", 12),
+    ("biennial", 24),
+    ("triennial", 36),
+];
+
+/// 无周期的一次性付费：不在 `CYCLE_MONTHS` 里，故 `cycle_months` 返回 None。
+const ONCE: &str = "once";
+
+/// 计费周期 → 月数：全插件唯一的周期真源（下拉选项也由它派生）。`once`
+/// 无周期（不滚动、不进年化）。
 fn cycle_months(cycle: &str) -> Option<u32> {
-    Some(match cycle {
-        "monthly" => 1,
-        "quarterly" => 3,
-        "semiannual" => 6,
-        "yearly" => 12,
-        "biennial" => 24,
-        "triennial" => 36,
-        _ => return None,
-    })
+    CYCLE_MONTHS.iter().find(|(name, _)| *name == cycle).map(|(_, months)| *months)
 }
 
 fn today() -> NaiveDate {
@@ -339,7 +347,7 @@ fn nodes_basic() -> Option<Vec<(i64, String)>> {
 /// http 负错误码 → 可读的失败原因（码表见 hub 的 src/plugin/host_funcs.rs）。
 fn http_error_reason(code: i32) -> String {
     match code {
-        -1 => "宿主内存写入失败".to_owned(),
+        -1 => "宿主侧读写失败（参数越界/非 UTF-8 或写回失败）".to_owned(),
         -2 => "目标地址不是 https，宿主拒绝".to_owned(),
         -4 => "网络请求失败或超时".to_owned(),
         -5 => "汇率服务返回非 2xx 响应".to_owned(),
@@ -572,11 +580,12 @@ fn tick() {
 const CURRENCIES: [&str; 12] =
     ["CNY", "USD", "EUR", "GBP", "JPY", "CAD", "HKD", "AUD", "CHF", "SGD", "KRW", "INR"];
 
-/// 支持的计费周期：`cycle_months` 认得的全部周期 + `once`（无周期）。
-/// 与 `cycle_months` 的覆盖集合保持一致——下拉里选得到、统计口径就认得出，
+/// 支持的计费周期下拉选项：`CYCLE_MONTHS` 的全部周期（同序）+ `once`。
+/// 与 `cycle_months` 的覆盖集合同源——下拉里选得到、统计口径就认得出，
 /// 自由文本时代拼错周期（如 `montly`）会被静默剔出年化汇总。
-const CYCLE_OPTIONS: [&str; 7] =
-    ["monthly", "quarterly", "semiannual", "yearly", "biennial", "triennial", "once"];
+fn cycle_options() -> Vec<&'static str> {
+    CYCLE_MONTHS.iter().map(|(name, _)| *name).chain(std::iter::once(ONCE)).collect()
+}
 
 /// 给页面描述挂一次性提示（KTD2：文案由插件提供，前端在 action 响应里弹一次）。
 fn with_toast(mut page: Value, kind: &str, text: &str) -> Value {
@@ -590,11 +599,12 @@ fn build_page(allow_fetch: bool) -> Value {
     let mut cfg = Config::load();
     ensure_imported(&mut cfg);
     let today = today();
+    // KTD3：拉取只发生在页面打开且无缓存时。动作路径（保存）不隐式拉——
+    // 否则每次保存都要同步等一次网络往返。已有缓存也不拉，陈旧由 tick 兜底。
     let mut fx = load_fx();
-    if fx.is_none() && allow_fetch {
-        // KTD3：拉取只发生在页面打开且无缓存时。动作路径（保存/切币种）不拉——
-        // 否则每次保存都要同步等一次网络往返。已有缓存也不拉，陈旧由 tick 兜底。
-        refresh_fx(&cfg);
+    if fx.is_none() && allow_fetch && refresh_fx(&cfg) {
+        // refresh_fx 返回 true 才刚写过缓存，此时重读是必然命中；失败时那次
+        // data_get 是白跑一趟的宿主边界穿越。
         fx = load_fx();
     }
     let failure = load_fx_status();
@@ -717,7 +727,7 @@ fn build_page(allow_fetch: bool) -> Value {
             {"name": "name", "label": "节点名", "type": "text"},
             {"name": "price", "label": "价格", "type": "number"},
             {"name": "currency", "label": "币种", "type": "select", "options": CURRENCIES},
-            {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": CYCLE_OPTIONS},
+            {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": cycle_options()},
             {"name": "expires_at", "label": "到期日", "type": "date"},
         ],
         "rows": all,

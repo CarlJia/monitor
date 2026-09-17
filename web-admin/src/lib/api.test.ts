@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { changes, formPayload, GIB, httpErrorText, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
+import { changes, formPayload, GIB, httpErrorText, inputType, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
 import type { PluginFieldDecl } from "./api.ts"
 import { dispatchResultText, money } from "./format.ts"
 
@@ -118,6 +118,13 @@ assert.deepEqual(loose([null, 5, { label: "无名字" }, { name: "" }, { name: "
 assert.deepEqual(loose([{ name: " name ", label: "名称" }]), [
   { name: "name", label: "名称", type: "text", options: [] },
 ])
+
+// 旧式声明按字段名猜控件的那条启发式：价格类给数字框、`at` 结尾给日期框，
+// 其余文本。它只认这几个词，所以插件该显式写 type（见上面的回退用例）。
+assert.equal(inputType("price"), "number")
+assert.equal(inputType("unit_cost"), "number")
+assert.equal(inputType("expires_at"), "date")
+assert.equal(inputType("currency"), "text")
 
 const form = normalizeFields([
   { name: "name", label: "节点名", type: "text" },

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { ArrowLeft, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
+  asText,
   formPayload,
   normalizeFields,
   pluginAction,
@@ -29,7 +30,7 @@ function cell(value: unknown): string {
  * 文案就不弹（空白 toast 读起来像「出错了却没原因」）。
  */
 function fireToast(t: PluginToast) {
-  const text = typeof t.text === "string" ? t.text : ""
+  const text = asText(t.text)
   if (text.trim() === "") return
   // 不用动态属性索引：写法上就只有这四个方法，认不出的 kind 落到 success。
   switch (toastKind(t.kind)) {
@@ -49,8 +50,10 @@ function FormBlock({ block, busy, onSubmit }: {
 }) {
   const [drafts, setDrafts] = useState<Record<number, Record<string, string>>>({})
   const rows = (block.rows ?? []) as Record<string, unknown>[]
-  // 声明归一到渲染形状：列头文案、控件类型、下拉选项都在这里定下来。
-  const fields = normalizeFields(block.fields)
+  // 声明归一到渲染形状：列头文案、控件类型、下拉选项都在这里定下来。草稿每敲
+  // 一次键就重渲染一次 FormBlock，但 `block.fields` 是页面状态里的稳定引用
+  // （新页面对象换来的是整块重挂载，key=pageKey），归一化没有重跑的理由。
+  const fields = useMemo(() => normalizeFields(block.fields), [block.fields])
   // 在途时行内控件一并禁用：响应回来会重挂载表单清空草稿，这几秒里允许编辑
   // 等于允许用户白改一场。
   const busyNow = busy !== null

@@ -24,7 +24,15 @@ fn today() -> NaiveDate {
     DateTime::from_timestamp(NOW, 0).unwrap().date_naive()
 }
 
+/// 构建产物在同一进程内只编译一次：并行跑的各条测试都调 `build_wasm`，不缓存
+/// 就会全部堵在 `target/smoke` 的构建锁上，一遍遍地等同一个结果。
+static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
 fn build_wasm() -> Vec<u8> {
+    WASM.get_or_init(build_wasm_uncached).clone()
+}
+
+fn build_wasm_uncached() -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let target_dir = format!("{manifest_dir}/target/smoke");
     let out = Command::new("cargo")
@@ -546,9 +554,10 @@ fn cached_page_appends_last_refresh_failure() {
     );
 }
 
-/// KTD3：动作路径不拉汇率——保存不阻塞在网络往返上。
+/// KTD3：保存这条路不拉汇率——保存不阻塞在网络往返上（切币种与手动刷新
+/// 各自显式拉一次，见 set_currency / refresh_fx_toasts_success_and_failure）。
 #[test]
-fn on_action_never_fetches_fx() {
+fn save_node_action_does_not_fetch_fx() {
     let engine = engine();
     let wasm = build_wasm();
     let host = Host::default(); // 拉了会失败，正好用计数断言"没拉"
@@ -565,7 +574,7 @@ fn on_action_never_fetches_fx() {
     ))
     .unwrap();
 
-    assert_eq!(http_calls(&store), 0, "action 路径不该拉汇率");
+    assert_eq!(http_calls(&store), 0, "保存这条路径不该拉汇率");
     assert_eq!(toast_of(&resp), ("success".into(), "已保存".into()));
     // 没缓存时页面照样给出「尚未成功拉取过」的 warning（现有语义不变）。
     let notices = notice_texts(&resp);

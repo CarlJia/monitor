@@ -271,7 +271,7 @@ export type PluginField = {
 }
 
 /** 取一个可能是任何东西的 JSON 值为字符串；不是字符串就取空串。 */
-function asText(value: unknown): string {
+export function asText(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
@@ -342,10 +342,22 @@ export function formPayload(
   return payload
 }
 
+/**
+ * 提示的四种 `kind`：既是运行时校验的名单，也是 `ToastKind` 的类型来源——
+ * 两处各写一遍就会有一处先过期。
+ */
+export const TOAST_KINDS = ["success", "error", "info", "warning"] as const
+
+export type ToastKind = typeof TOAST_KINDS[number]
+
 /** 响应携带的提示条：文案由插件给，面板替它弹一次（KTD2）。 */
 export type PluginToast = {
-  /** 断言不是保证：插件写错时按 `success` 处理，见 `toastKind`。 */
-  kind?: "success" | "error" | "info" | "warning"
+  /**
+   * 运行时的值什么都可能是：它来自插件写的 JSON，`api()` 不做校验，所以这里
+   * 的类型是文档不是保证。使用处一律经 `toastKind` 收窄（缺省或认不出的回退
+   * `success`）。
+   */
+  kind?: string
   text: string
 }
 
@@ -353,8 +365,8 @@ export type PluginToast = {
  * 提示的 `kind` → 前端该调哪一个 toast；缺省或认不出的都回退到 `success`
  * （协议只声明了四种，写错的提示宁可当成功也不该静默丢掉）。
  */
-export function toastKind(kind?: string): "success" | "error" | "info" | "warning" {
-  return kind === "success" || kind === "error" || kind === "info" || kind === "warning" ? kind : "success"
+export function toastKind(kind?: string): ToastKind {
+  return (TOAST_KINDS as readonly string[]).includes(kind ?? "") ? (kind as ToastKind) : "success"
 }
 
 /** 插件面板页面的 JSON UI 描述（U5/KTD5）。前端按词汇表渲染。 */
