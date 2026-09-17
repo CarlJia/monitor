@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
-import { ArrowLeft, RefreshCw } from "lucide-react"
+import { useEffect, useState } from "react"
+import { ArrowLeft, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -18,6 +18,7 @@ import {
   type PluginBlock,
   type PluginPage as PluginPageData,
   type PluginToast,
+  type ToastKind,
 } from "@/lib/api"
 
 /** 把任意 JSON 值渲染成可读字符串：null/undefined 视作空，数字/布尔照常。 */
@@ -26,19 +27,26 @@ function cell(value: unknown): string {
 }
 
 /**
- * 触发插件随 action 响应带回来的提示。`kind` 缺省或认不出按成功处理；没有
- * 文案就不弹（空白 toast 读起来像「出错了却没原因」）。
+ * `ToastKind` → 该调哪一个 toast。写成 `Record<ToastKind, …>` 是刻意的：
+ * 往 `TOAST_KINDS` 里加第五种 kind 时这里会编译不过，而不是被 `switch` 的
+ * `default` 静默当成成功。
+ */
+const TOAST_FN: Record<ToastKind, (m: string) => void> = {
+  success: toast.success,
+  error: toast.error,
+  warning: toast.warning,
+  info: toast.info,
+}
+
+/**
+ * 触发插件随 action 响应带回来的提示。`kind` 缺省或认不出按成功处理
+ * （`toastKind` 已收窄，认不出的落到 `success`）；没有文案就不弹（空白
+ * toast 读起来像「出错了却没原因」）。
  */
 function fireToast(t: PluginToast) {
   const text = asText(t.text)
   if (text.trim() === "") return
-  // 不用动态属性索引：写法上就只有这四个方法，认不出的 kind 落到 success。
-  switch (toastKind(t.kind)) {
-    case "error": return toast.error(text)
-    case "warning": return toast.warning(text)
-    case "info": return toast.info(text)
-    default: return toast.success(text)
-  }
+  TOAST_FN[toastKind(t.kind)](text)
 }
 
 // form 块：每行一组可编辑字段 + 单行保存。草稿按行索引存，页面刷新后
@@ -50,10 +58,7 @@ function FormBlock({ block, busy, onSubmit }: {
 }) {
   const [drafts, setDrafts] = useState<Record<number, Record<string, string>>>({})
   const rows = (block.rows ?? []) as Record<string, unknown>[]
-  // 声明归一到渲染形状：列头文案、控件类型、下拉选项都在这里定下来。草稿每敲
-  // 一次键就重渲染一次 FormBlock，但 `block.fields` 是页面状态里的稳定引用
-  // （新页面对象换来的是整块重挂载，key=pageKey），归一化没有重跑的理由。
-  const fields = useMemo(() => normalizeFields(block.fields), [block.fields])
+  const fields = normalizeFields(block.fields)
   // 在途时行内控件一并禁用：响应回来会重挂载表单清空草稿，这几秒里允许编辑
   // 等于允许用户白改一场。
   const busyNow = busy !== null
@@ -93,8 +98,10 @@ function FormBlock({ block, busy, onSubmit }: {
                 const initial = cell(row[f.name])
                 // 行里的值可能不在 options 里（插件改过选项集合，老数据还在）：
                 // 补一项进去。否则 Radix 的触发器会显示空白，操作者看不出当前
-                // 值是什么——正是这次改版要消掉的「看不见」。
-                const extra = shown !== "" && !f.options.includes(shown) ? shown : null
+                // 值是什么——正是这次改版要消掉的「看不见」。比对的是选项的
+                // `value`（提交载荷里的值），补的那项值与文案都是这串原值：
+                // 它没有声明过的文案可用，至少别让当前值消失。
+                const extra = shown !== "" && !f.options.some((o) => o.value === shown) ? shown : null
                 return (
                   <TableCell key={f.name}>
                     {f.type === "select" ? (
@@ -107,7 +114,10 @@ function FormBlock({ block, busy, onSubmit }: {
                           <SelectValue placeholder={initial} />
                         </SelectTrigger>
                         <SelectContent>
-                          {f.options.map((opt) => <SelectItem key={opt} value={opt}>{opt}</SelectItem>)}
+                          {/* 显示 label（人话），提交 value（协议里的标识）。 */}
+                          {f.options.map((opt) => (
+                            <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                          ))}
                           {extra !== null && <SelectItem key={extra} value={extra}>{extra}</SelectItem>}
                         </SelectContent>
                       </Select>
@@ -194,7 +204,18 @@ export function PluginPageView({ id, onBack }: { id: number; onBack: () => void 
       </Card>
     )
   }
-  if (!page) return <p className="text-sm text-muted-foreground">加载中…</p>
+  // 首次加载可能几秒：插件可以在 `render_page` 里顺手做一次性工作（财务插件
+  // 就是在这里拉汇率的），这段时间里只给一句「加载中…」会被读成卡死——多给
+  // 一句为什么慢，操作者才知道该等而不是去点刷新。
+  if (!page) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" aria-hidden />
+        <p className="text-sm text-muted-foreground">加载中…</p>
+        <p className="text-xs text-muted-foreground">首次打开可能需要几秒获取汇率</p>
+      </div>
+    )
+  }
 
   const isTable = (rows: unknown) => Array.isArray(rows) && (rows.length === 0 || Array.isArray(rows[0]))
   const blocks = page.blocks ?? []

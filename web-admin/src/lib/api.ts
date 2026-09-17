@@ -245,6 +245,22 @@ export const deletePluginKv = (id: number, key: string) =>
 export const listPluginKv = (id: number) => api<PluginKv[]>(`/plugins/${id}/kv`)
 
 /**
+ * 下拉选项的两种写法：
+ * - 裸字符串：既是提交值也是显示文案；
+ * - 对象：`value` 进提交载荷，`label` 只给人看（缺省或全空白用 `value`）。
+ *
+ * 计费周期这类值是英文标识、文案是中文的字段靠对象形态，币种这类两者相同的
+ * 继续写裸字符串。
+ */
+export type PluginOptionDecl = string | {
+  value: string
+  label?: string
+}
+
+/** 归一化后的选项：渲染看 `label`，提交只认 `value`。 */
+export type PluginOption = { value: string; label: string }
+
+/**
  * form 块的一项字段声明（KTD1）。两种形态并存：
  * - 旧式：纯字符串，只给字段名，控件类型交给下面的启发式猜（向后兼容）；
  * - 新式：对象，可带显示用标签、控件类型与下拉选项。
@@ -256,18 +272,26 @@ export type PluginFieldDecl = string | {
   label?: string
   /** 控件类型；缺省或认不出时回退到按字段名的启发式。 */
   type?: string
-  /** 仅 `type: "select"` 用得上。 */
-  options?: string[]
+  /** 仅 `type: "select"` 用得上；裸字符串或 `{value, label}` 都接受。 */
+  options?: PluginOptionDecl[]
 }
+
+/**
+ * 字段的控件类型名单：既是运行时校验的名单，也是 `FieldType` 的类型来源——
+ * 两处各写一遍就会有一处先过期。
+ */
+export const FIELD_TYPES = ["text", "number", "date"] as const
+
+export type FieldType = typeof FIELD_TYPES[number]
 
 /** 归一化后的字段声明：渲染与取值都只看它。 */
 export type PluginField = {
   name: string
   /** 列头文案，已兜底成非空。 */
   label: string
-  type: "text" | "number" | "date" | "select"
+  type: FieldType | "select"
   /** 仅 `select` 非空。 */
-  options: string[]
+  options: PluginOption[]
 }
 
 /** 取一个可能是任何东西的 JSON 值为字符串；不是字符串就取空串。 */
@@ -281,10 +305,31 @@ export function asText(value: unknown): string {
  * 名字不合这套规则就会拿到错误的控件（比如把价格叫 `fee` 只会是文本框），
  * 所以新式声明应当显式写 `type`。
  */
-export function inputType(field: string): "text" | "number" | "date" {
+export function inputType(field: string): FieldType {
   if (/price|cost|amount/i.test(field)) return "number"
   if (/at$/.test(field)) return "date"
   return "text"
+}
+
+/**
+ * 选项声明（裸字符串或 `{value, label}`）→ 渲染用的 `{value, label}`。
+ * `value` 先去空白再判空，不是非空字符串的条目丢掉——下拉里没有值可提交的项
+ * 渲染出来就是一格死选项，而只有空白的值渲染出来是一格看不见的选项，两者都
+ * 该丢。`label` 缺省或只剩空白时回退到 `value`：显示标识总比显示空白好。
+ */
+function normalizeOptions(raw: unknown): PluginOption[] {
+  if (!Array.isArray(raw)) return []
+  const options: PluginOption[] = []
+  for (const entry of raw as unknown[]) {
+    // 裸字符串：值即文案。
+    const obj = typeof entry === "string" ? { value: entry } : entry
+    if (typeof obj !== "object" || obj === null) continue
+    const decl = obj as Record<string, unknown>
+    const value = asText(decl.value).trim()
+    if (value === "") continue
+    options.push({ value, label: asText(decl.label).trim() || value })
+  }
+  return options
 }
 
 /**
@@ -292,27 +337,34 @@ export function inputType(field: string): "text" | "number" | "date" {
  * 声明里认不出的 `type` 同样回退——插件写错一个词不该把整列渲染成废控件。
  *
  * `fields` 来自插件写的 JSON：类型是断言不是保证。这里按垃圾输入防御，
- * null、数字、缺 name 的条目一律丢掉，而不是渲染一格空控件或把页面炸掉。
+ * 容器不是数组、null、数字、缺 name 的条目一律丢掉，而不是渲染一格空控件
+ * 或把页面炸掉（`{}` 与数字连迭代都过不去，字符串则会被逐字符拆成字段）。
  */
 export function normalizeFields(decls?: PluginFieldDecl[]): PluginField[] {
   const fields: PluginField[] = []
-  for (const raw of (decls ?? []) as unknown[]) {
+  if (!Array.isArray(decls)) return []
+  for (const raw of decls as unknown[]) {
     const obj = typeof raw === "string" ? { name: raw } : raw
     if (typeof obj !== "object" || obj === null) continue
     const decl = obj as Record<string, unknown>
     const name = asText(decl.name).trim()
     if (name === "") continue
-    const options = Array.isArray(decl.options) ? decl.options.filter((o) => typeof o === "string") : []
+    const options = normalizeOptions(decl.options)
     // 声明值两边可能带空白,先修掉再比对——插件手写 JSON 时很容易多一个空格。
     const declared = asText(decl.type).trim()
     // `select` 没给可选项时也回退：一个没有选项的下拉是死控件（既不能改也
     // 不能清），按字段名猜至少还能操作。
     const type = declared === "select" && options.length > 0 ? "select"
-      : declared === "text" || declared === "number" || declared === "date" ? declared
+      : isFieldType(declared) ? declared
       : inputType(name)
     fields.push({ name, label: asText(decl.label).trim() || name, type, options })
   }
   return fields
+}
+
+/** `declared` 是否是 `FIELD_TYPES` 里的一员（收窄用，名单只有一份）。 */
+function isFieldType(declared: string): declared is FieldType {
+  return (FIELD_TYPES as readonly string[]).includes(declared)
 }
 
 /**

@@ -197,7 +197,8 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
        {"name": "name", "label": "节点名", "type": "text"},
        {"name": "price", "label": "价格", "type": "number"},
        {"name": "currency", "label": "币种", "type": "select", "options": ["CNY","USD"]},
-       {"name": "billing_cycle", "label": "计费周期", "type": "select", "options": ["monthly","once"]},
+       {"name": "billing_cycle", "label": "计费周期", "type": "select",
+        "options": [{"value":"monthly","label":"月付"},{"value":"once","label":"一次性"}]},
        {"name": "expires_at", "label": "到期日", "type": "date"}
      ],
      "rows": [{"id":1,"name":"edge-1","price":12.5,"currency":"USD",
@@ -207,9 +208,10 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 ```
 
 支持的 `type`：`notice`（`kind: warning` 高亮，其余中性背景）、`stat`
-（`items: [{label,value}]`）、`select`（提交 `{action, value}`）、
-`table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，提交
-`{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
+（`items: [{label,value}]`）、`select`（提交 `{action, value}`；这个级别的
+`options` 仍是字符串数组，显示即提交，值本身需要中文文案时改用 `form` 行里的
+`select` 字段）、`table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，
+提交 `{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
 
 顶层可选的 `toast` 是**操作回执**：`{"kind": …, "text": …}`，面板在
 `on_action` 的响应到达时弹一次，文案由插件给（宿主不替插件编文案）。`kind`
@@ -224,7 +226,10 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 "fields": ["name", "price", "currency", "billing_cycle", "expires_at"]
 "fields": [{"name": "price", "label": "价格", "type": "number"},
            {"name": "currency", "label": "币种", "type": "select",
-            "options": ["CNY", "USD"]}]
+            "options": ["CNY", "USD"]},
+           {"name": "billing_cycle", "label": "计费周期", "type": "select",
+            "options": [{"value": "monthly", "label": "月付"},
+                        {"value": "once", "label": "一次性"}]}]
 ```
 
 - `name`（必填）是提交载荷里的键，也是取值时的键；没有名字的条目会被丢弃。
@@ -233,13 +238,25 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 - `type` 取 `text` / `number` / `date` / `select`。**声明优先**：写了
   `type: "number"` 的字段即使名字叫 `fee` 也会渲染成数字输入框、并按数字
   提交。
-- `select` 需要一并给 `options`（字符串数组），面板渲染成下拉，选中值写进该
-  行草稿、随该行的「保存」一起提交。**没给 `options` 的 `select` 会回退**到
-  下面的字段名启发式——一个没有可选项的下拉是死控件，既改不了也清不掉。
+- `select` 需要一并给 `options`，面板渲染成下拉，选中值写进该行草稿、随该行
+  的「保存」一起提交。**没给 `options` 的 `select` 会回退**到下面的字段名
+  启发式——一个没有可选项的下拉是死控件，既改不了也清不掉。
+- `options` 里每一项可以是**裸字符串**（既是提交值也是显示文案），也可以是
+  **`{"value": …, "label": …}` 对象**：面板显示 `label`、提交 `value`。值本身
+  不是人话的字段（`monthly` / `once` / 币种代码）用它把标识与文案分开——
+  `label` 缺省或全是空白时回退成 `value`，`value` 不是非空字符串的项直接
+  丢掉（渲染出来要么是死选项要么是看不见的选项）。**提交的永远是 `value`**，
+  面板不会把 `label` 写回载荷。
 - `type` 缺省或认不出（比如写成 `currency`、`int`）同样回退到字段名启发式:
   插件写错一个词不该让整列变成不能用的控件。
 
 `label` 是给操作者看的，`name` 才是协议；两者不一致时以 `name` 为准。
+
+`select` 表达不了"清空/未设置"：`options` 里没有空值项，Radix 的触发器也不会
+把选择退回去，所以下拉**只能改、不能清**。需要让操作员清掉某个字段的插件
+（比如把计费周期恢复成未填写）应当把该字段声明成文本字段——文本框清空提交
+空串是明确表达的。这是刻意的收窄：加一个空选项会让"选中空值"和"还没选过"
+在下拉里长得一模一样。
 
 旧式字段名启发式（`fields` 没给 `type` 时）仍是**协议的一部分**（不是实现
 细节）：名字里含 `price`/`cost`/`amount`（不分大小写）用数字输入框，以 `at`
