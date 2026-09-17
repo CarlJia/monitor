@@ -184,34 +184,41 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
   "blocks": [
     {"type": "notice", "kind": "warning", "text": "汇率不可用……"},
     {"type": "stat", "items": [
-      {"label": "年化续费总成本（USD）", "value": "128.40"}
+      {"label": "展示币种", "select": {"value": "CNY", "action": "set_currency",
+        "options": [{"value":"CNY","label":"¥ CNY"},{"value":"USD","label":"$ USD"}]}},
+      {"label": "年化续费总成本", "value": "¥128.40"},
+      {"label": "剩余总价值", "value": "¥64.20"}
     ]},
-    {"type": "select", "name": "target_currency", "label": "展示币种",
+    {"type": "select", "name": "view", "label": "视图",
      "value": "USD", "options": ["USD","CNY","EUR"],
-     "action": "set_currency"},
+     "action": "set_view"},
     {"type": "table", "title": "7 天内到期（3）",
      "columns": ["节点", "到期日", "剩余天数"],
      "rows": [["edge-1","2026-10-01",3]]},
     {"type": "form", "title": "节点财务数据", "action": "save_node",
      "fields": [
        {"name": "name", "label": "节点名", "type": "text"},
-       {"name": "price", "label": "价格", "type": "number"},
-       {"name": "currency", "label": "币种", "type": "select", "options": ["CNY","USD"]},
+       {"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
+       {"name": "currency", "label": "币种", "type": "select",
+        "options": [{"value":"CNY","label":"¥ CNY"},{"value":"USD","label":"$ USD"}]},
        {"name": "billing_cycle", "label": "计费周期", "type": "select",
-        "options": [{"value":"monthly","label":"月付"},{"value":"once","label":"一次性"}]},
+        "options": [{"value":"yearly","label":"年付"},{"value":"free","label":"免费"}]},
        {"name": "expires_at", "label": "到期日", "type": "date"}
      ],
-     "rows": [{"id":1,"name":"edge-1","price":12.5,"currency":"USD",
-               "billing_cycle":"monthly","expires_at":"2027-01-01"}]}
+     "rows": [{"id":1,"name":"edge-1","price":12.5,"price_symbol":"$","currency":"USD",
+               "billing_cycle":"yearly","expires_at":"2027-01-01"}]}
   ]
 }
 ```
 
 支持的 `type`：`notice`（`kind: warning` 高亮，其余中性背景）、`stat`
-（`items: [{label,value}]`）、`select`（提交 `{action, value}`；这个级别的
-`options` 仍是字符串数组，显示即提交，值本身需要中文文案时改用 `form` 行里的
-`select` 字段）、`table`（`rows: unknown[][]`）、`form`（`rows: {id, ...fields}`，
-提交 `{action, id, ...fields}`）。未知 `type` 被前端静默忽略，不报错。
+（`items: [{label,value}]`；某一格写成 `{label, select}` 就是**标签 + 下拉**
+的格子，`select` 形如 `{value, action, options}`——财务插件用它把「展示币种」
+与两个金额排在同一行；格子数决定列数，1–4 格各自等宽分栏）、`select`
+（提交 `{action, value}`；`options` 与 form 字段同规则，裸字符串或
+`{value, label}` 都收）、`table`（`rows: unknown[][]`）、`form`（`rows:
+{id, ...fields}`，提交 `{action, id, ...fields}`）。未知 `type` 被前端静默
+忽略，不报错。
 
 顶层可选的 `toast` 是**操作回执**：`{"kind": …, "text": …}`，面板在
 `on_action` 的响应到达时弹一次，文案由插件给（宿主不替插件编文案）。`kind`
@@ -224,9 +231,9 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 
 ```json
 "fields": ["name", "price", "currency", "billing_cycle", "expires_at"]
-"fields": [{"name": "price", "label": "价格", "type": "number"},
+"fields": [{"name": "price", "label": "价格", "type": "money", "prefix_key": "price_symbol"},
            {"name": "currency", "label": "币种", "type": "select",
-            "options": ["CNY", "USD"]},
+            "options": [{"value": "CNY", "label": "¥ CNY"}]},
            {"name": "billing_cycle", "label": "计费周期", "type": "select",
             "options": [{"value": "monthly", "label": "月付"},
                         {"value": "once", "label": "一次性"}]}]
@@ -235,9 +242,15 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 - `name`（必填）是提交载荷里的键，也是取值时的键；没有名字的条目会被丢弃。
 - `label` 是编辑表的列头文案，缺省（或全是空白）时用字段名——旧式声明因此
   照旧显示字段标识，新式声明才能显示「节点名」这类中文表头。
-- `type` 取 `text` / `number` / `date` / `select`。**声明优先**：写了
-  `type: "number"` 的字段即使名字叫 `fee` 也会渲染成数字输入框、并按数字
+- `type` 取 `text` / `number` / `date` / `money` / `select`。**声明优先**：
+  写了 `type: "number"` 的字段即使名字叫 `fee` 也会渲染成数字输入框、并按数字
   提交。
+- `money` 是数字的**展示形态**：右对齐、两位小数，提交时仍按数字处理（面板
+  不会把「1200.00」当字符串发回去）。是不是钱由声明说了算，面板不按字段名猜。
+- `prefix_key` 让一列的值前面显示**同一行**里另一个键的文本：它不在字段声明
+  里，所以只当前缀、不多出一列。财务插件用它把币种符号摆在价格前
+  （`prefix_key: "price_symbol"`）——符号怎么算归插件，面板不认识币种代码。
+  缺省或全是空白表示没有前缀。
 - `select` 需要一并给 `options`，面板渲染成下拉，选中值写进该行草稿、随该行
   的「保存」一起提交。**没给 `options` 的 `select` 会回退**到下面的字段名
   启发式——一个没有可选项的下拉是死控件，既改不了也清不掉。
