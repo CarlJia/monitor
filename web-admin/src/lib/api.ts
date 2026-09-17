@@ -188,8 +188,15 @@ export type PluginKv = { key: string; value: string }
 export async function uploadPlugin(file: File): Promise<{
   id: number
   plugin_id: string
+  /** 这个包里 manifest 声明的版本。 */
+  version: string
   status: string
   last_error: string | null
+  /**
+   * true 表示这次**替换**了同 `plugin_id` 的旧包（上传的版本比已装的高），而
+   * 不是首次安装。两种都得由操作员点开关启用，但提示文案不同。
+   */
+  replaced: boolean
 }> {
   const form = new FormData()
   form.append("plugin", file)

@@ -372,8 +372,12 @@ export function Plugins({ go }: { go: (to: string) => void }) {
     try {
       const installed = await uploadPlugin(file)
       // 上传即入库但默认停用（KTD10）：预检失败也一样入库，行上的红徽标会
-      // 给出原因，所以这里只引导去点开关，不报错。
-      toast.success("插件已上传，请点击开关启用", { description: installed.plugin_id })
+      // 给出原因，所以这里只引导去点开关，不报错。同名包版本更高时走的是
+      // **替换**：行与插件数据都保留，但同样回到停用，要点开关才会装载新包。
+      toast.success(
+        installed.replaced ? "插件已更新，请点击开关启用新版本" : "插件已上传，请点击开关启用",
+        { description: `${installed.plugin_id} · v${installed.version}` },
+      )
       load()
     } catch (e) {
       // 400 的响应体就是后端那句中文原因；413 与网络错误在 uploadPlugin 里

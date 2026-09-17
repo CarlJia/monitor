@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::db::Db;
 use crate::notification_bus::Event;
+use crate::plugin::is_newer_version;
 
 /// One stored plugin: its manifest, wasm bytes and lifecycle flags.
 #[derive(Serialize, Debug, Clone)]
@@ -53,9 +54,8 @@ impl Db {
     const PLUGIN_COLUMNS_SUMMARY: &str = "id, plugin_id, name, version, manifest_json, x'' AS wasm_blob,
                     wasm_sha256, enabled, status, last_error, uploaded_at";
 
-    /// Stores an uploaded plugin and returns the row as it now stands. A
-    /// `plugin_id` collision surfaces as an error the caller turns into a 400
-    /// rather than a silent clobber of the previous upload.
+    /// 直接建一行插件（测试与工具用）。`plugin_id` 已被占用时报错而不是覆盖：
+    /// 上传路径走 [`Self::install_plugin_package`]，那里才按版本决定要不要替换。
     pub fn create_plugin(
         &self,
         plugin_id: &str,
@@ -65,29 +65,68 @@ impl Db {
         wasm_blob: &[u8],
         wasm_sha256: &str,
     ) -> Result<PluginRow> {
-        let now = Utc::now().timestamp();
         let conn = self.conn();
-        conn.execute(
-            "INSERT INTO plugin (plugin_id, name, version, manifest_json, wasm_blob,
-                                 wasm_sha256, enabled, status, uploaded_at)
-             VALUES (?1,?2,?3,?4,?5,?6,0,'disabled',?7)",
-            params![plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256, now],
-        )
-        .with_context(|| format!("plugin {plugin_id} is already uploaded"))?;
-        let id = conn.last_insert_rowid();
-        Ok(PluginRow {
-            id,
-            plugin_id: plugin_id.into(),
-            name: name.into(),
-            version: version.into(),
-            manifest_json: manifest_json.into(),
-            wasm_blob: wasm_blob.into(),
-            wasm_sha256: wasm_sha256.into(),
-            enabled: false,
-            status: "disabled".into(),
-            last_error: None,
-            uploaded_at: now,
-        })
+        insert_plugin_row(&conn, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256)
+            .with_context(|| format!("plugin {plugin_id} is already uploaded"))
+    }
+
+    /// 安装上传的包：同 `plugin_id` 已装过时，**只有版本更高**才就地替换。
+    ///
+    /// 替换只换 manifest、模块与版本，行 id、kv 与 `plugin_data` 一概不动——
+    /// 插件的数据按 plugin_id 存在别处，换一个包不该顺手清空它（finance-stats
+    /// 的全部财务记录就在那儿，而面板上的删除会连数据一起删）。生命周期拨回
+    /// 「已停用」：新包要操作员重新启用才会装载，与首次上传同一条路（KTD10），
+    /// 也就不会留着一份跑在内存里的旧模块。
+    ///
+    /// 版本没提高就报错而不是替换：改高 `plugin.toml` 的 version 是明确的一步，
+    /// 比让一个手滑的（或忘了改版本号的）包盖掉线上那份好查。读版本与写包在
+    /// 同一事务里，两个并发上传不会都通过版本检查。
+    ///
+    /// 返回 `(行, 是否替换)`：面板据此把提示从「已上传」换成「已更新到 v…」。
+    pub fn install_plugin_package(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        version: &str,
+        manifest_json: &str,
+        wasm_blob: &[u8],
+        wasm_sha256: &str,
+    ) -> Result<(PluginRow, bool)> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let installed: Option<(i64, String)> = tx
+            .query_row("SELECT id, version FROM plugin WHERE plugin_id=?1", [plugin_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+
+        let Some((id, installed_version)) = installed else {
+            let row =
+                insert_plugin_row(&tx, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256)?;
+            tx.commit()?;
+            return Ok((row, false));
+        };
+
+        if !is_newer_version(version, &installed_version) {
+            anyhow::bail!(
+                "插件 {plugin_id} 已装版本 {installed_version}，这次上传的是 {version}；\
+                 同一 plugin_id 只有版本更高才能替换：把 plugin.toml 的 version 改高后重新打包"
+            );
+        }
+        tx.execute(
+            "UPDATE plugin SET name=?2, version=?3, manifest_json=?4, wasm_blob=?5,
+                    wasm_sha256=?6, enabled=0, status='disabled', last_error=NULL, uploaded_at=?7
+             WHERE id=?1",
+            params![id, name, version, manifest_json, wasm_blob, wasm_sha256, now],
+        )?;
+        let row = tx.query_row(
+            &format!("SELECT {} FROM plugin WHERE id=?1", Self::PLUGIN_COLUMNS),
+            [id],
+            row_to_plugin,
+        )?;
+        tx.commit()?;
+        Ok((row, true))
     }
 
     pub fn list_plugins(&self) -> Result<Vec<PluginRow>> {
@@ -486,6 +525,31 @@ pub(crate) fn like_escaped(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
+/// 写一行新插件并把整行读回来。列清单只有这一份：`create_plugin`（测试直接
+/// 建行）与 `install_plugin_package`（上传路径）都走它，加列时不会只改一处。
+/// 初值固定为「已停用、无错误」——与首次上传的语义一致（KTD10）。
+fn insert_plugin_row(
+    conn: &rusqlite::Connection,
+    plugin_id: &str,
+    name: &str,
+    version: &str,
+    manifest_json: &str,
+    wasm_blob: &[u8],
+    wasm_sha256: &str,
+) -> rusqlite::Result<PluginRow> {
+    conn.execute(
+        "INSERT INTO plugin (plugin_id, name, version, manifest_json, wasm_blob,
+                             wasm_sha256, enabled, status, uploaded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,0,'disabled',?7)",
+        params![plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256, Utc::now().timestamp()],
+    )?;
+    conn.query_row(
+        &format!("SELECT {} FROM plugin WHERE id=?1", Db::PLUGIN_COLUMNS),
+        [conn.last_insert_rowid()],
+        row_to_plugin,
+    )
+}
+
 /// Column order matches every plugin SELECT, which spell out their columns
 /// rather than relying on `SELECT *`: the summary view substitutes an empty
 /// blob for the column it leaves out.
@@ -560,6 +624,56 @@ mod tests {
         db.delete_plugin(second.id).unwrap();
         assert!(db.get_plugin(second.id).unwrap().is_none());
         assert!(db.delete_plugin(second.id).is_err(), "deleting a removed plugin must not report success");
+    }
+
+    /// 上传路径的同 plugin_id 升级：版本更高才就地替换——行 id、kv 与
+    /// plugin_data 全留，只换包的内容与版本，并拨回停用；版本没提高则拒且不落库。
+    #[test]
+    fn a_higher_version_replaces_in_place_and_keeps_the_data() {
+        let db = db();
+        let (first, replaced) =
+            db.install_plugin_package("mailer", "Mailer", "1.0.0", "{\"a\":1}", b"m1", "sha1").unwrap();
+        assert!(!replaced, "首次安装不是替换");
+        assert_eq!((first.id, first.status.as_str()), (1, "disabled"));
+
+        // 插件自己的数据与 kv：替换必须原样留着（这是升级不丢数据的那条保证）。
+        db.plugin_data_put("mailer", "node:1", "42").unwrap();
+        db.set("plugin.mailer:bot_token", "secret").unwrap();
+        db.set_plugin_enabled(first.id, true).unwrap();
+
+        let (second, replaced) =
+            db.install_plugin_package("mailer", "Mailer", "1.1.0", "{\"a\":2}", b"m2", "sha2").unwrap();
+        assert!(replaced, "版本更高就是替换");
+        assert_eq!(second.id, first.id, "替换不换行 id");
+        assert_eq!(
+            (second.version.as_str(), second.manifest_json.as_str(), second.wasm_sha256.as_str()),
+            ("1.1.0", "{\"a\":2}", "sha2")
+        );
+        assert_eq!(second.wasm_blob, b"m2", "模块字节换成新的");
+        assert!(!second.enabled && second.status == "disabled", "替换后回到停用，等操作员重新启用");
+        assert_eq!(db.plugin_data_get("mailer", "node:1").unwrap().as_deref(), Some("42"), "插件数据留着");
+        assert_eq!(db.get("plugin.mailer:bot_token").as_deref(), Some("secret"), "kv 留着");
+
+        for stale in ["1.1.0", "1.0.0", "0.9"] {
+            let refused = db
+                .install_plugin_package("mailer", "Mailer", stale, "{}", b"m3", "sha3")
+                .expect_err("版本没提高不该替换");
+            assert!(refused.to_string().contains("只有版本更高"), "{refused}");
+        }
+        let kept = db.get_plugin(first.id).unwrap().unwrap();
+        assert_eq!(
+            (kept.version.as_str(), kept.wasm_sha256.as_str()),
+            ("1.1.0", "sha2"),
+            "被拒的包一行都不写"
+        );
+        assert_eq!(db.list_plugins().unwrap().len(), 1, "替换不新增行");
+
+        // 另一个 plugin_id 仍是新增。
+        let (other, replaced) =
+            db.install_plugin_package("webhook", "Webhook", "0.1", "{}", b"m4", "sha4").unwrap();
+        assert!(!replaced);
+        assert_ne!(other.id, first.id);
+        assert_eq!(db.list_plugins().unwrap().len(), 2);
     }
 
     /// 删除插件是行与 kv 行一条事务:两端一起消失,行不在时整体报错而不
