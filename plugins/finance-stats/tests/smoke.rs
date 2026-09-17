@@ -62,6 +62,9 @@ struct Host {
     nodes: Mutex<Vec<(i64, String, bool)>>,
     /// http_get 的应答体；None 表示请求失败（返回 -4）。
     http_body: Mutex<Option<String>>,
+    /// 覆盖 http_get 的返回码：Some 时直接返回该码，不看 http_body。
+    /// 用来驱动分类表里那些桩宿主本来产不出的码（-5 非 2xx、未登记码等）。
+    http_error: Mutex<Option<i32>>,
     /// http_get 的调用次数——用来断言"该拉的拉了、不该拉的一次都没拉"。
     http_calls: Mutex<u32>,
     /// 最近一次 resp_alloc 拿到的缓冲指针与容量（与生产宿主一致）。
@@ -140,6 +143,12 @@ fn instantiate(engine: &Engine, wasm: &[u8], host: Host) -> (Store<Host>, wasmti
                 *caller.data().http_calls.lock().unwrap() += 1;
                 if !url.starts_with("https://") {
                     return -2;
+                }
+                // 指定的错误码优先于应答体：-5（非 2xx）这类码要看宿主的状态
+                // 分支，桩宿主用一个响应体表达不了。
+                let overridden = *caller.data().http_error.lock().unwrap();
+                if let Some(code) = overridden {
+                    return code;
                 }
                 let body = caller.data().http_body.lock().unwrap().clone();
                 let Some(body) = body else { return -4 };
@@ -654,6 +663,34 @@ fn failure_reasons_are_classified_and_recorded_everywhere() {
         st["reason"].as_str().unwrap().contains("rates"),
         "缺 rates 要有自己的文案：{st}"
     );
+
+    // 非 2xx（宿主错误码 -5）：生产里由 host_funcs 的响应状态分支产生，
+    // 桩宿主靠 http_error 覆盖出来。
+    let host = Host::default();
+    *host.http_error.lock().unwrap() = Some(-5);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    tick(&mut store, &instance);
+    let st: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    assert!(
+        st["reason"].as_str().unwrap().contains("非 2xx"),
+        "-5 应描述成非 2xx 响应：{st}"
+    );
+
+    // 未登记的错误码（-7 是 emit_event 的，不该出现在 http 分类里）：兜底
+    // 文案要原样带上码值，操作员才有线索去查。
+    let host = Host::default();
+    *host.http_error.lock().unwrap() = Some(-7);
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    tick(&mut store, &instance);
+    let st: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    assert!(
+        st["reason"].as_str().unwrap().contains("宿主返回错误码 -7"),
+        "未登记的码要走兜底并带上码值：{st}"
+    );
 }
 
 /// 页面钩子的开销随机器数线性增长,而宿主给的预算是每次调用固定的(见仓库
@@ -940,9 +977,48 @@ fn refresh_fx_toasts_success_and_failure() {
     .unwrap();
     let (kind, text) = toast_of(&bad);
     assert_eq!(kind, "error", "刷新失败应给 error 提示");
-    assert!(text.contains("失败"), "文案应说明失败：{text}");
+    assert!(text.contains("汇率刷新失败"), "文案应说明失败：{text}");
+    // 没缓存：文案要与页面的「尚未成功拉取过汇率，统计暂缺」一致，不能说沿用缓存。
+    assert!(text.contains("尚未成功拉取过汇率"), "无缓存时文案应说明统计暂缺：{text}");
+    assert!(!text.contains("沿用"), "无缓存时不该谎称沿用旧缓存：{text}");
+    // 失败原因取自插件刚落盘的记录——不硬编码原因文本，但仍能挡住「把原因丢掉」。
+    let persisted: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    let reason = persisted["reason"].as_str().unwrap();
+    assert!(text.contains(reason), "文案应带上落盘的失败原因 {reason:?}：{text}");
     assert!(
         !store.data().data.lock().unwrap().contains_key("fx"),
         "失败的刷新不应写入汇率缓存"
     );
+}
+
+/// R5/KTD4：refresh_fx 失败但**有**旧缓存时，toast 说明统计沿用缓存并给出
+/// 原因，而不是像无缓存那样说统计暂缺。
+#[test]
+fn refresh_fx_failure_toast_mentions_cache_and_reason() {
+    let engine = engine();
+    let wasm = build_wasm();
+    let host = Host::default(); // http_body 保持 None → 拉取失败
+    let (mut store, instance) = instantiate(&engine, &wasm, host);
+    seed(&store, "config", r#"{"target_currency":"CNY","threshold_days":7,"imported":true}"#);
+    seed(&store, "fx", &fx_record("CNY", NOW - 86_400));
+
+    let resp: serde_json::Value = serde_json::from_str(&call_json(
+        &mut store,
+        &instance,
+        "on_action",
+        r#"{"action":"refresh_fx"}"#,
+    ))
+    .unwrap();
+
+    let (kind, text) = toast_of(&resp);
+    assert_eq!(kind, "error", "刷新失败应给 error 提示");
+    assert!(text.contains("沿用最近一次缓存"), "有缓存时文案应说明沿用缓存：{text}");
+    assert!(!text.contains("统计暂缺"), "有缓存时不该说统计暂缺：{text}");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&store.data().data.lock().unwrap()["fx_status"]).unwrap();
+    let reason = persisted["reason"].as_str().unwrap();
+    assert!(text.contains(reason), "文案应带上落盘的失败原因 {reason:?}：{text}");
+    // 旧缓存仍在，统计照旧有依据。
+    assert_eq!(store.data().data.lock().unwrap()["fx"], fx_record("CNY", NOW - 86_400));
 }

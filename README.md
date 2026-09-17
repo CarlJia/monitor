@@ -171,6 +171,10 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 写入字节数。`on_action` 也是同样的协议：body 是 `{action, ...}` 的 JSON，
 返回新页面描述（操作完成后整页重渲染）。
 
+`render_page` 允许带一次性副作用（例如尚无缓存时顺手拉一次汇率），但它在
+每次打开页面和每次刷新时都会被调用，所以这类工作必须**幂等且有界**——面板
+与页面上的刷新按钮会反复调它，副作用不能累积、也不能随调用次数增长。
+
 返回 JSON 形如：
 
 ```json
@@ -254,7 +258,7 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 | 限制 | 值 | 说明 |
 |---|---|---|
 | fuel（事件派发） | 默认 1,000,000 指令/调用 | setting `plugin.fuel_limit` 可调；耗尽即中断（死循环被截断） |
-| fuel（数据面钩子） | 默认 20,000,000 指令/调用 | setting `plugin.hook_fuel_limit` 可调；`on_tick`/`render_page`/`on_action`/`on_cleanup` 用这一档——它们读插件自己的数据，开销随数据规模增长（财务插件的页面要列出全部节点：实测空页面 44 万 fuel、每台机器再 5.4 万，tick 是 67 万 + 每台 2.4 万），按有界事件载荷定的派发那档不够用 |
+| fuel（数据面钩子） | 默认 20,000,000 指令/调用 | setting `plugin.hook_fuel_limit` 可调；`on_tick`/`render_page`/`on_action`/`on_cleanup` 用这一档——它们的开销随插件自己的数据规模增长，`render_page` 还可能带一次性副作用（如拉一次汇率，见「面板页面协议」），按有界事件载荷定的派发那档不够用；财务插件的页面要列出全部节点：实测空页面 44 万 fuel、每台机器再 5.4 万，tick 是 67 万 + 每台 2.4 万 |
 | 墙钟 | 默认 5 秒/调用 | setting `plugin.timeout_ms` 可调 |
 | kv 值 | 8 KiB | `host_kv_set` 与面板 KV 编辑器同限 |
 | plugin_data 行 | 256 KiB | `host_data_put` 单行上限；超出返回 -6 |

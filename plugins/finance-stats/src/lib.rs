@@ -424,6 +424,21 @@ fn load_fx() -> Option<Fx> {
     data_get("fx").and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// `refresh_fx` 失败时的 toast 文案。以真实状态为准，与页面提示条同源：
+/// 有没有旧缓存决定「统计沿用缓存」还是「统计暂缺」，原因取插件刚记下的那份
+/// （失败路径必然写了 `fx_status`）。两者都拿不到时退回一句不带细节的失败
+/// 提示，不编造缓存状态。
+fn refresh_fx_failure_toast() -> String {
+    let reason = load_fx_status().map(|st| st.reason);
+    match (load_fx().is_some(), reason) {
+        (true, Some(reason)) => format!("汇率刷新失败，统计沿用最近一次缓存：{reason}"),
+        (false, Some(reason)) => {
+            format!("汇率刷新失败：{reason}（尚未成功拉取过汇率，统计暂缺）")
+        }
+        (_, None) => "汇率刷新失败".to_owned(),
+    }
+}
+
 /// 把一个金额从 `from` 币种换算到目标币种。汇率表以目标币种为 base，
 /// `rates[from]` 是「1 目标币 = 多少 from」，故换算为除法。缺汇率返回 None。
 fn convert(fx: &Fx, amount: f64, from: &str) -> Option<f64> {
@@ -756,12 +771,13 @@ fn handle_action(input: &str) -> Value {
         "refresh_fx" => {
             let cfg = Config::load();
             // 拉取结果决定提示文案：失败时不谎报成功，用户才知道统计为什么没动。
+            // 失败文案与同一次响应里的页面提示条同源（有没有缓存、刚记下的原因）。
             let (kind, text) = if refresh_fx(&cfg) {
-                ("success", "汇率已刷新")
+                ("success", "汇率已刷新".to_owned())
             } else {
-                ("error", "汇率刷新失败，统计沿用最近一次缓存")
+                ("error", refresh_fx_failure_toast())
             };
-            with_toast(build_page(false), kind, text)
+            with_toast(build_page(false), kind, &text)
         }
         "save_node" => {
             let Some(id) = req.get("id").and_then(|v| v.as_i64()) else {
