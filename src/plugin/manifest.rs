@@ -176,6 +176,32 @@ impl Manifest {
     }
 }
 
+/// 这个包能否替换已装的那份：只有**版本更高**才允许。
+///
+/// 按点分段、逐段当数字比大小（`1.10` > `1.9`），缺的段按 0（`1.2` 与
+/// `1.2.0` 是同一个版本，不算升级）。认不出的写法（某段没有数字前缀）一律
+/// 当 0，于是「比不出高下」的两次上传等同版本、一并拒绝——宁可让作者把版本
+/// 号写清楚，也不让一个手滑的包默默盖掉线上那份（数据在，代码换了，最难查）。
+pub fn is_newer_version(candidate: &str, installed: &str) -> bool {
+    version_segments(candidate) > version_segments(installed)
+}
+
+/// 版本 → 可比较的数字段。尾部多余的 0 去掉，让 `1.2` 与 `1.2.0` 相等。
+fn version_segments(version: &str) -> Vec<u64> {
+    let mut segments: Vec<u64> = version
+        .split('.')
+        .map(|segment| {
+            let digits: String = segment.trim().chars().take_while(char::is_ascii_digit).collect();
+            // 溢出与「没有数字」都落到 0：这一段比不出大小，就不许它撑起一次升级。
+            digits.parse().unwrap_or(0)
+        })
+        .collect();
+    while segments.len() > 1 && segments.last() == Some(&0) {
+        segments.pop();
+    }
+    segments
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -312,5 +338,26 @@ mod tests {
     #[test]
     fn a_broken_manifest_is_not_toml() {
         assert!(Manifest::parse("plugin_id = ").is_err());
+    }
+
+    #[test]
+    fn only_a_higher_version_may_replace() {
+        // 逐段数字比大小，不是字符串比大小。
+        assert!(is_newer_version("1.10.0", "1.9.0"));
+        assert!(is_newer_version("2.0.0", "1.99.99"));
+        assert!(is_newer_version("1.2.1", "1.2"));
+        // 缺段按 0：1.2 与 1.2.0 是同一个版本，不是升级。
+        assert!(!is_newer_version("1.2", "1.2.0"));
+        assert!(!is_newer_version("1.2.0", "1.2"));
+        // 同版本与降级都换不动。
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("0.9.0", "1.0.0"));
+        // 认不出的写法（无数字前缀、空串）当 0 处理：比不出高下就不许替换。
+        assert!(!is_newer_version("", "1.0.0"));
+        assert!(!is_newer_version("abc", "1.0.0"));
+        assert!(!is_newer_version("1.0.0-rc2", "1.0.0"), "后缀段按数字前缀比，同段不算升级");
+        // 反过来，已装版本比不出数字时，正常写的版本就算升级——那种行本来也
+        // 只可能是手工塞进去的。
+        assert!(is_newer_version("1.0.0", "abc"));
     }
 }

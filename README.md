@@ -290,16 +290,21 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 2. 上传：面板「插件」页，或 `POST /api/plugins`（multipart 字段 `plugin`）。
    上传时做预热校验（manifest 合法性、模块能编译、导出契约齐全），失败原因
    写进插件状态供面板查看；上传后默认**不启用**；
-3. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因）；
-4. 测试：`POST /api/plugins/{id}/test` 构造一条合成的 `plugin_expiry_soon`
+3. 升级：同一个 `plugin_id` 再次上传即就地替换，但**只有版本更高才换**
+   （`plugin.toml` 的 `version` 按点分段比数字，`1.10` > `1.9`；同版本与降级
+   一律 400）。替换保留行 id、`kv` 与 `plugin_data`，并把插件拨回**停用**，
+   重新启用才会装载新包——面板上的删除会连插件数据一起删，所以升级不要走
+   「先删再传」；
+4. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因）；
+5. 测试：`POST /api/plugins/{id}/test` 构造一条合成的 `plugin_expiry_soon`
    事件，走与真实派发完全相同的执行路径。派发前先按 manifest 的 `[[kv]]`
    预检必填项，缺项（行不存在或值为空）直接 400 点名缺哪一项，而不是让插件
    回来一个 `other:2` 让操作员猜；
-5. 页面：`GET /api/plugins/{id}/page` 调 `render_page` 拿 JSON 描述；
+6. 页面：`GET /api/plugins/{id}/page` 调 `render_page` 拿 JSON 描述；
    面板里的交互走 `POST /api/plugins/{id}/action` 调 `on_action`；
-6. 清理：`POST /api/plugins/{id}/cleanup` 调 `on_cleanup`——清理逻辑
+7. 清理：`POST /api/plugins/{id}/cleanup` 调 `on_cleanup`——清理逻辑
    完全在插件手里，宿主只转发调用与回收统计；
-7. 日志：`GET /api/plugins/{id}/logs` 返回最近 100 条派发结果（进程内环形
+8. 日志：`GET /api/plugins/{id}/logs` 返回最近 100 条派发结果（进程内环形
    缓冲，重启后为空；长期审计在 notification_log）。每条另带 `detail`：插件
    自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
    在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
@@ -313,7 +318,7 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 ### 已知约束
 
 - **失败不会自动禁用**：连续失败的插件不会被自动停用，需操作员手动
-  disable，或修复后删除再重新 upload；
+  disable，或修复后上传一个版本更高的包（见「上传与生命周期」第 3 条）；
 - **不做签名校验**：hub 不验证 wasm 的来源，任何人拿到管理员会话即可上传
   任意插件（插件能读自己的 kv、向任意**公网** https 地址发 POST/GET、能发
   `plugin_*` 事件）。私有/保留网段被 SSRF 防线挡下（见错误码 -9），但插件

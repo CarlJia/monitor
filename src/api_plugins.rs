@@ -84,8 +84,12 @@ fn loaded_manifest(app: &App, id: i64) -> Result<Manifest, Response> {
 /// 收字节(上限 [`MAX_PLUGIN`])在异步侧完成;解包、校验、编译与写库整体
 /// 挪进 spawn_blocking——wasm 编译是百毫秒级的 CPU 工作,不该占着调度线程。
 /// 一个包要么整体验证通过,要么什么都不写:写库发生在解包、manifest 校验
-/// 与重复检查全部通过之后,而编译(预热校验)失败也照常入库——作者需要
+/// 与版本检查全部通过之后,而编译(预热校验)失败也照常入库——作者需要
 /// 在面板上看到原因,而不是被迫从日志里找(KTD10:上传后默认不启用)。
+///
+/// 同 `plugin_id` 再次上传是**升级**:版本更高才替换,行 id、kv 与
+/// `plugin_data` 原样保留(删除接口会连数据一起删,所以升级不能走「删了再传」),
+/// 替换后回到停用态。版本没提高则 400,已装的那份一行都不动。
 pub async fn upload_plugin(_: Admin, State(app): State<Shared>, mut multipart: Multipart) -> Response {
     // 找名为 plugin 的文件字段,边收边计数:上限检查不等包收完,多出的第一
     // 个字节就被拒绝,不用把 8 MiB 都吃进内存再丢弃。
@@ -177,7 +181,9 @@ fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
     };
     let last_error = plugin::load(&app.engine, &candidate).err().map(|e| format!("{e:#}"));
 
-    let row = app.db.create_plugin(
+    // 同 plugin_id 的上传按版本判断：更高才替换（保行 id、kv 与 plugin_data），
+    // 不高则报错。首次安装与升级在这里没有分岔，由 db 那侧一并判定。
+    let (row, replaced) = app.db.install_plugin_package(
         &manifest.plugin_id,
         &manifest.name,
         &manifest.version,
@@ -185,14 +191,21 @@ fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
         wasm,
         &wasm_sha256,
     )?;
+    if replaced {
+        // 换掉的可能是正跑在内存里的那一份：旧实例必须当场下线，否则面板写着
+        // 「已停用」而旧模块还在收 tick 与事件。新包等操作员重新启用才装载。
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).disable_plugin(row.id);
+    }
     if let Some(error) = &last_error {
         app.db.set_plugin_status(row.id, "disabled", Some(error))?;
     }
     Ok(json!({
         "id": row.id,
         "plugin_id": row.plugin_id,
+        "version": manifest.version,
         "status": "disabled",
         "last_error": last_error,
+        "replaced": replaced,
     }))
 }
 
@@ -682,8 +695,13 @@ mod tests {
     use crate::plugin::MINIMAL_WAT;
 
     fn plugin_manifest(plugin_id: &str, abi_version: i64) -> String {
+        plugin_manifest_at(plugin_id, abi_version, "1.0.0")
+    }
+
+    /// 同上，但指定版本：升级路径的测试要造出更高/更低的版本。
+    fn plugin_manifest_at(plugin_id: &str, abi_version: i64, version: &str) -> String {
         format!(
-            "plugin_id = \"{plugin_id}\"\nname = \"Test Plugin\"\nversion = \"1.0.0\"\n\
+            "plugin_id = \"{plugin_id}\"\nname = \"Test Plugin\"\nversion = \"{version}\"\n\
              abi_version = {abi_version}\nsubscribes = [\"agent_offline\", \"plugin_expiry_soon\"]\n"
         )
     }
@@ -952,24 +970,64 @@ mod tests {
         assert!(app.db.list_plugins().unwrap().is_empty(), "被拒的包一行都不写");
     }
 
-    /// 重复的 plugin_id 是覆盖不是升级:UNIQUE 约束在写库时拒绝(db 的
-    /// create_plugin 就是为此报的错),保留原行。
+    /// 同 plugin_id 的上传按版本走：**更高**版本就地替换——行 id 不变，kv 与
+    /// plugin_data 原样保留，跑在内存里的旧实例当场下线并回到停用；版本没提高
+    /// 则 400，已装的那份一行都不动。面板上的删除会连数据一起删，所以升级不能
+    /// 靠「删了再传」。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_duplicate_plugin_id_is_refused() {
+    async fn a_higher_version_replaces_in_place_and_keeps_the_plugin_data() {
         let app = plugin_app();
+        let plugin_id = "com.example.a";
+        let installed = upload(&app, plugin_archive(&plugin_manifest_at(plugin_id, 2, "1.0.0"))).await;
+        assert_eq!(installed.status(), StatusCode::OK);
         assert_eq!(
-            upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await.status(),
-            StatusCode::OK
+            body_of(installed).await,
+            json!({"id": 1, "plugin_id": plugin_id, "version": "1.0.0", "status": "disabled",
+                    "last_error": null, "replaced": false}),
+            "首次安装：replaced=false"
         );
-        let second = upload(&app, plugin_archive(&plugin_manifest("com.example.a", 2))).await;
-        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let row = app.db.list_plugins().unwrap().remove(0);
+
+        // 启用它，再写入 kv 与插件数据——替换必须把这两样都留着。
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(row.id)).await.status(), StatusCode::OK);
+        app.db.plugin_data_put(plugin_id, "node:1", "42").unwrap();
+        app.db.set(&format!("plugin.{plugin_id}:bot_token"), "secret").unwrap();
+
+        // 版本没提高：拒绝，且已装的那份不动。
+        for stale in ["1.0.0", "0.9"] {
+            let refused = upload(&app, plugin_archive(&plugin_manifest_at(plugin_id, 2, stale))).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{stale}");
+            let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("只有版本更高"), "响应该说清怎么升:{text}");
+        }
+        assert_eq!(app.db.list_plugins().unwrap()[0].version, "1.0.0", "被拒的上传不落库");
+
+        // 版本更高：替换。
+        let upgraded = upload(&app, plugin_archive(&plugin_manifest_at(plugin_id, 2, "2.0.0"))).await;
+        assert_eq!(upgraded.status(), StatusCode::OK);
+        let body = body_of(upgraded).await;
+        assert_eq!((body["replaced"].as_bool(), body["version"].as_str()), (Some(true), Some("2.0.0")));
+
+        let rows = app.db.list_plugins().unwrap();
+        assert_eq!(rows.len(), 1, "替换不新增行");
+        let after = &rows[0];
+        assert_eq!((after.id, after.version.as_str()), (row.id, "2.0.0"), "行 id 不变，版本换了");
+        assert!(!after.enabled && after.status == "disabled", "替换后回到停用");
         assert!(
-            String::from_utf8_lossy(&bytes).contains("already uploaded"),
-            "应说明如何处理:{}",
-            String::from_utf8_lossy(&bytes)
+            !app.plugins.read().unwrap_or_else(|e| e.into_inner()).is_loaded(row.id),
+            "跑着的旧实例必须当场下线，否则面板写着停用而旧模块还在收事件"
         );
-        assert_eq!(app.db.list_plugins().unwrap().len(), 1, "旧版本原样保留");
+        assert_eq!(
+            app.db.plugin_data_get(plugin_id, "node:1").unwrap().as_deref(),
+            Some("42"),
+            "插件数据留着"
+        );
+        assert_eq!(
+            app.db.get(&format!("plugin.{plugin_id}:bot_token")).as_deref(),
+            Some("secret"),
+            "kv 留着"
+        );
     }
 
     /// 编译不过的包也入库:status=disabled、原因在 last_error,作者在面板上
