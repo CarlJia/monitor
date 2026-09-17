@@ -23,6 +23,9 @@ const DIST = resolve(import.meta.dirname, "..", "dist")
 const BUDGET = Number(process.env.CLS_BUDGET ?? 0.05)
 const SETTLE_MS = 600
 const MARKER_TIMEOUT_MS = 5000
+// Chrome 公布调试地址的等待上限。正常在 1s 内，留宽是因为 CI runner 上冷启动
+// 受邻居影响能慢一个数量级，而这条路径已经不再有「猜错端口」那种假失败。
+const LAUNCH_TIMEOUT_MS = 30000
 
 // 一张 1x1 的 PNG，供主题预览图端点使用。图本身不重要，重要的是它在 <img> 的
 // onLoad 里才被显示出来——那条路径会撑开卡片。
@@ -166,19 +169,6 @@ function startServer() {
   })
 }
 
-// Chrome 的调试端口也要一个空闲的。占用探测与真正监听之间理论上存在竞争，对
-// 测试而言无所谓：真的撞上只表现为启动失败，不会得到错误的测量结果。
-function freePort() {
-  return new Promise((ok, fail) => {
-    const probe = http.createServer()
-    probe.on("error", fail)
-    probe.listen(0, "127.0.0.1", () => {
-      const { port } = probe.address()
-      probe.close(() => ok(port))
-    })
-  })
-}
-
 // ---- Chrome via CDP ----
 // 固定路径之外再扫一遍 PATH：各发行版与 CI 镜像把 Chrome 放哪都可能，猜错路径
 // 的代价是 CI 直接失败，多扫一遍就没有这个风险。
@@ -203,6 +193,12 @@ function findChrome() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Chrome 把真正可用的调试地址公布在 stderr 里。**必须用它，不能自己猜**：
+// Chrome 在指定的 IPv4 端口上 bind 失败时既不报错也不退出，而是悄悄退到 ::1
+// 上继续监听（2026-09-17 CI 偶发失败就是这条路径——轮询 127.0.0.1 的脚本永远
+// 等不到，只拿到一句没有上下文的 "fetch failed"）。
+const devToolsUrl = (stderr) => stderr.match(/DevTools listening on (ws:\/\/\S+)/)?.[1]
 
 // 注入到每个文档：把 layout-shift 累加进 window.__cls，并留下每次抖动的归属，
 // 失败时能直接指出是哪一块在动。
@@ -229,27 +225,37 @@ new PerformanceObserver((list) => {
 `
 
 async function measure(chrome, base, profile) {
-  const port = await freePort()
+  // 端口交给 Chrome 自己挑（0 = 内核分配），它取到哪个就报哪个：抢占与协议族
+  // 都不再是我们的问题。
   const child = spawn(chrome, [
-    "--headless=new", `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
+    "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`,
     "--no-first-run", "--no-default-browser-check", "--disable-gpu",
     ...(process.env.CI ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
     "--window-size=1280,900", "about:blank",
-  ], { stdio: "ignore" })
+  ], { stdio: ["ignore", "ignore", "pipe"] })
 
-  let wsUrl, lastError
-  for (let i = 0; i < 100 && !wsUrl; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/json/version`)
-      wsUrl = (await r.json()).webSocketDebuggerUrl
-    } catch (e) {
-      lastError = e
-    }
-    if (!wsUrl) await sleep(150)
+  // stderr 收着而不是 ignore：Chrome 起不来时的原因（bind 失败、缺库、崩溃）
+  // 全在里面，丢掉它就只能报一句指向不明的 "fetch failed"。听 close 不听 exit：
+  // exit 不保证 stdio 已排空，而这里要的恰好是尾部那几行。
+  let stderr = ""
+  let exitReason = null
+  child.stderr.setEncoding("utf8")
+  child.stderr.on("data", (d) => { stderr += d })
+  child.on("close", (code, signal) => { exitReason = signal ? `信号 ${signal}` : `退出码 ${code}` })
+
+  // 进程已退出就不必再等满超时——那只会把一个明确的失败拖成 30 秒。
+  const deadline = Date.now() + LAUNCH_TIMEOUT_MS
+  let wsUrl
+  while (!wsUrl && !exitReason && Date.now() < deadline) {
+    await sleep(100)
+    wsUrl = devToolsUrl(stderr)
   }
   if (!wsUrl) {
     child.kill("SIGKILL")
-    throw new Error(`Chrome 未在预期时间内于端口 ${port} 启动（${chrome}）：${lastError}`)
+    throw new Error(
+      `Chrome 未在 ${LAUNCH_TIMEOUT_MS / 1000}s 内公布调试地址（${chrome}）` +
+      `，${exitReason ?? "进程仍在运行"}\n--- Chrome stderr ---\n${stderr.trim() || "(空)"}`,
+    )
   }
 
   const ws = new WebSocket(wsUrl)
