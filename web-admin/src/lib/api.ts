@@ -91,9 +91,12 @@ export function trafficCorrection(
 
 /** Private, carrier-grade NAT, loopback or link-local: unreachable from outside the machine's own network. */
 function isLocalV4(ip: string): boolean {
-  const [a, b] = ip.split(".").map(Number)
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168) ||
-    (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254)
+  const [a, b, c] = ip.split(".").map(Number)
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 172 && b >= 16 && b < 32) ||
+    (a === 192 && (b === 168 || (b === 0 && c === 0))) ||
+    (a === 100 && b >= 64 && b < 128) || (a === 169 && b === 254) ||
+    (a === 198 && (b & 0xfe) === 18)
 }
 
 /**
