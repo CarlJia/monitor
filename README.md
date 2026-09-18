@@ -23,10 +23,19 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 hub 支持用 Rust 编写的 WASM 通知插件：节点到期、agent 掉线/恢复等事件会
 派发给所有订阅了该事件的已启用插件，插件在沙箱（wasmtime）里运行，只能通过
 14 个宿主函数与外界交互——日志、时钟、键值存储、受限的 https 请求、节点只读
-查询、事件发出以及自有的 key/value 数据存储。仓库内置两个完整可编译的参考
-实现：[`plugins/tg-notify`](plugins/tg-notify)（Telegram 通知，订阅
-宿主事件）和 [`plugins/finance-stats`](plugins/finance-stats)（财务统计，
-自己发事件 + 面板页面 + 自清理）。
+查询、事件发出以及自有的 key/value 数据存储。两个完整可编译的参考实现
+——[`tg-notify`](https://github.com/CarlJia/monitor-hub-plugins/tree/main/tg-notify)
+（Telegram 通知，订阅宿主事件）和
+[`finance-stats`](https://github.com/CarlJia/monitor-hub-plugins/tree/main/finance-stats)
+（财务统计，自己发事件 + 面板页面 + 自清理）——在**独立仓库**
+[`monitor-hub-plugins`](https://github.com/CarlJia/monitor-hub-plugins)。
+
+> **插件源码已迁出本仓。** 本仓保留宿主实现（`src/plugin/`）与下面的 ABI
+> 文档；插件的源码、构建、测试、`create-plugin` 脚手架 skill 与发布都在
+> [`monitor-hub-plugins`](https://github.com/CarlJia/monitor-hub-plugins)。
+> 插件产物从该仓的
+> [GitHub Releases](https://github.com/CarlJia/monitor-hub-plugins/releases)
+> 下载。本仓的 `release.yml` / `ci.yml` 不再构建插件。
 
 > **升级到 2.0.0 的破坏性变更**：ABI v1（`abi_version = 1`）已停用，仅 v2
 > ——已安装的 v1 插件**不再加载**，需对着 v2 重编并重新上传。同时：节点 JSON
@@ -38,14 +47,16 @@ hub 支持用 Rust 编写的 WASM 通知插件：节点到期、agent 掉线/恢
 ### 快速开始
 
 ```sh
-cd plugins/tg-notify
+git clone https://github.com/CarlJia/monitor-hub-plugins   # 插件源码在新仓
+cd monitor-hub-plugins/tg-notify
 rustup target add wasm32-unknown-unknown   # 一次性
 ./build.sh                                  # 产出 plugin.tar.gz
 cargo test                                  # 桩宿主冒烟测试
 ```
 
-把它当模板复制一份，改 `plugin_id` 为你自己的反向域（如
-`io.github.<用户名>.my-notify`）即可。
+新插件用 `monitor-hub-plugins` 里的 `create-plugin` skill 起骨架，或把
+`tg-notify` 当模板复制一份、改 `plugin_id` 为你自己的反向域（如
+`io.github.<用户名>.my-notify`）。
 
 ### plugin.toml（manifest）
 
