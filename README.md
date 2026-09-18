@@ -35,7 +35,7 @@ hub 支持用 Rust 编写的 WASM 通知插件：节点到期、agent 掉线/恢
 > [`monitor-hub-plugins`](https://github.com/CarlJia/monitor-hub-plugins)。
 > 插件产物从该仓的
 > [GitHub Releases](https://github.com/CarlJia/monitor-hub-plugins/releases)
-> 下载。本仓的 `release.yml` / `ci.yml` 不再构建插件。
+> 下载。本仓 `ci.yml` 不再构建插件（插件的 CI 与发布都在新仓）。
 
 > **升级到 2.0.0 的破坏性变更**：ABI v1（`abi_version = 1`）已停用，仅 v2
 > ——已安装的 v1 插件**不再加载**，需对着 v2 重编并重新上传。同时：节点 JSON
