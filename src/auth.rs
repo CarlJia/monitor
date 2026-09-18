@@ -404,10 +404,8 @@ pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     // The edge-written value, when the edge is Cloudflare. Presumes the origin
     // is reachable only through Cloudflare: a caller reaching it directly can
     // supply this header itself.
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
+    if let Some(ip) =
+        headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok())
     {
         return ip;
     }
@@ -623,7 +621,11 @@ mod tests {
 
         // Through Cloudflare into the local proxy, whichever it is.
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(&cf("198.51.100.9", "162.158.179.205"), ip(peer)).to_string(), "198.51.100.9", "{peer}");
+            assert_eq!(
+                client_ip(&cf("198.51.100.9", "162.158.179.205"), ip(peer)).to_string(),
+                "198.51.100.9",
+                "{peer}"
+            );
         }
 
         // Directly from the internet this header is caller-supplied too, so the
