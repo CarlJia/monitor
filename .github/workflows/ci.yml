@@ -96,7 +96,9 @@ jobs:
           plugins=$(gh api repos/CarlJia/monitor-hub-plugins/contents --jq '.[] | select(.type=="dir") | .name')
           test -n "$plugins" || { echo "::error::could not list plugin repo contents"; exit 1; }
           for p in $plugins; do
-            toml=$(fetch "$p/plugin.toml"); rc=$?
+            # `if` guards the command substitution so a non-zero fetch return
+            # does not trip `set -e` before rc is captured.
+            if toml=$(fetch "$p/plugin.toml"); then rc=0; else rc=$?; fi
             [ $rc -eq 2 ] && continue                 # no plugin.toml -> not a plugin dir
             [ $rc -eq 0 ] || { fail=1; continue; }     # transient error -> fail closed
             declared=$(printf '%s' "$toml" | grep -oE '^abi_version *= *[0-9]+' | grep -oE '[0-9]+$' || true)
@@ -115,8 +117,7 @@ jobs:
           # remote manifest is an error, not a pass.
           want=$(grep -oE 'FINANCE_PLUGIN_ID: &str = "[^"]+"' src/db.rs | sed -E 's/.*"([^"]+)".*/\1/')
           test -n "$want" || { echo "::error file=src/db.rs::could not read FINANCE_PLUGIN_ID from src/db.rs"; exit 1; }
-          fintoml=$(fetch "finance-stats/plugin.toml"); rc=$?
-          if [ $rc -ne 0 ]; then
+          if fintoml=$(fetch "finance-stats/plugin.toml"); then :; else
             echo "::error::could not fetch finance-stats/plugin.toml to verify plugin_id"; exit 1
           fi
           fin=$(printf '%s' "$fintoml" | grep -oE '^plugin_id *= *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
