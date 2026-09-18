@@ -56,3 +56,50 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # Plugin sources moved to CarlJia/monitor-hub-plugins, so a host-side ABI
+  # change here (ABI_VERSION bump, or a plugin_id rename on the far side) no
+  # longer shows up in this repo's tests — it would merge green and break the
+  # published plugins. This gate restores the producer-side signal without a
+  # token: it reads THIS PR's ABI_VERSION and compares it against every
+  # published plugin's declared abi_version, and pins the one plugin_id this
+  # repo hard-depends on (the finance plugin gates an irreversible column-drop
+  # migration in src/db.rs). A coordinated ABI bump must land the plugin repo
+  # update first, or this job stays red until it does — that is the intended
+  # coupling, not a flake.
+  plugin-abi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check published plugins against this PR's ABI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' src/plugin/manifest.rs | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::could not read ABI_VERSION from src/plugin/manifest.rs"; exit 1; }
+          echo "this PR's ABI_VERSION: $abi"
+          fail=0
+          # Roster derived from the plugin repo's top-level plugin dirs.
+          plugins=$(gh api repos/CarlJia/monitor-hub-plugins/contents --jq '.[] | select(.type=="dir") | .name')
+          for p in $plugins; do
+            toml=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/$p/plugin.toml" --jq .content 2>/dev/null | base64 -d 2>/dev/null) || continue
+            printf '%s' "$toml" | grep -q '^abi_version' || continue   # not a plugin dir
+            declared=$(printf '%s' "$toml" | grep -oE '^abi_version *= *[0-9]+' | grep -oE '[0-9]+$')
+            if [ "$declared" != "$abi" ]; then
+              echo "::error::published plugin $p declares abi_version=$declared, this PR sets ABI_VERSION=$abi — bump the plugin repo first"
+              fail=1
+            else
+              echo "$p: abi_version=$declared OK"
+            fi
+          done
+          # The finance plugin_id gates the irreversible v6 column-drop in src/db.rs.
+          fin=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/finance-stats/plugin.toml" --jq .content 2>/dev/null | base64 -d 2>/dev/null | grep -oE '^plugin_id *= *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
+          want=$(grep -oE 'FINANCE_PLUGIN_ID: &str = "[^"]+"' src/db.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -n "$want" ] && [ "$fin" != "$want" ]; then
+            echo "::error file=src/db.rs::finance plugin_id drift: plugin repo has '$fin', src/db.rs FINANCE_PLUGIN_ID is '$want' — the v6 migration gate would silently never complete"
+            fail=1
+          else
+            echo "finance plugin_id: $fin OK"
+          fi
+          exit $fail

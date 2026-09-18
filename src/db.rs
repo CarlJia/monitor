@@ -179,6 +179,11 @@ const RETIRED_NODE_COLUMNS: [&str; 4] = ["price", "currency", "billing_cycle", "
 
 /// 财务插件的 plugin_id。删列闸门只认它写下的 `node:` 记录——闸门读的是该
 /// 插件的私有 key 布局,不能因为别的插件恰好用了同一前缀就打开。
+///
+/// 跨仓不变量:这个值同时是财务插件在 CarlJia/monitor-hub-plugins 里
+/// `finance-stats/plugin.toml` 的 `plugin_id`。任一侧改动都会让下面的 v6
+/// 删列门控永远完成不了(imported==0 → 保留旧列下次重试),且两仓的 cargo
+/// 测试都不会红。ci.yml 的 `plugin-abi` job 断言两侧一致,改此值前先同步插件仓。
 const FINANCE_PLUGIN_ID: &str = "io.github.monitor.finance-stats";
 
 /// Adds a column older databases lack. A duplicate column indicates the
