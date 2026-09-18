@@ -391,9 +391,25 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
 /// A second trusted proxy in front of the local one places its own address at
 /// the tail instead. No single value in this header identifies the client, so
 /// such a deployment must have its edge write the client address.
+///
+/// Cloudflare fronts many of these deployments and does exactly that, in
+/// `CF-Connecting-IP`. That header is read first, so the panel names the client
+/// rather than the CF edge and a throttled caller is identified by its own
+/// address. It is honoured under the same condition as the header below -- peer
+/// local -- so a caller that reaches the hub directly is still ignored.
 pub fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     if !behind_local_proxy(peer) {
         return peer;
+    }
+    // The edge-written value, when the edge is Cloudflare. Presumes the origin
+    // is reachable only through Cloudflare: a caller reaching it directly can
+    // supply this header itself.
+    if let Some(ip) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return ip;
     }
     headers
         .get("x-forwarded-for")
@@ -589,5 +605,35 @@ mod tests {
         assert_eq!(client_ip(&forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
         assert_eq!(client_ip(&HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+    }
+
+    /// Cloudflare, when proxying, writes the client address into a header of its
+    /// own; the tail of X-Forwarded-For is the CF edge the local proxy observed
+    /// instead. That edge-written value is what the note above asks for, and
+    /// behind the local proxy it names the client.
+    #[test]
+    fn the_cloudflare_header_names_the_client_behind_the_local_proxy() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let cf = |client: &str, edge: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("cf-connecting-ip", client.parse().unwrap());
+            h.insert("x-forwarded-for", format!("{client}, {edge}").parse().unwrap());
+            h
+        };
+
+        // Through Cloudflare into the local proxy, whichever it is.
+        for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
+            assert_eq!(client_ip(&cf("198.51.100.9", "162.158.179.205"), ip(peer)).to_string(), "198.51.100.9", "{peer}");
+        }
+
+        // Directly from the internet this header is caller-supplied too, so the
+        // peer remains the only value that cannot be fabricated.
+        assert_eq!(client_ip(&cf("198.51.100.9", "162.158.179.205"), ip("8.8.8.8")), ip("8.8.8.8"));
+
+        // No CF header: the fallback is unchanged, and names the edge rather
+        // than the client.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.9, 162.158.179.205".parse().unwrap());
+        assert_eq!(client_ip(&h, ip("127.0.0.1")).to_string(), "162.158.179.205");
     }
 }
