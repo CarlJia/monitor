@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { asText, changes, formPayload, GIB, httpErrorText, inputType, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
+import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
 import type { PluginFieldDecl } from "./api.ts"
 import { dispatchResultText, money } from "./format.ts"
 
@@ -233,4 +233,18 @@ assert.equal(toastKind(undefined), "success")
 assert.equal(toastKind("warn"), "success")
 assert.equal(toastKind(""), "success")
 
-console.log("partial edits, traffic corrections, provisioning, page-vocabulary and dispatch-result checks passed")
+// NAT: the public address the connection arrived from leads the private interface.
+assert.deepEqual(addresses({ ip: "203.0.113.7", ipv4: "10.10.2.250", ipv6: "2001:db8::1" }), ["203.0.113.7", "10.10.2.250", "2001:db8::1"])
+assert.deepEqual(addresses({ ip: "203.0.113.7", ipv4: "100.64.0.9" }), ["203.0.113.7", "100.64.0.9"])
+// Hub on the same network, or on the same machine: the connection says nothing more.
+assert.deepEqual(addresses({ ip: "192.168.1.2", ipv4: "192.168.1.5" }), ["192.168.1.5"])
+assert.deepEqual(addresses({ ip: "127.0.0.1", ipv4: "172.16.0.5" }), ["172.16.0.5"])
+// A public interface, or a connection over IPv6, stays as reported.
+assert.deepEqual(addresses({ ip: "198.51.100.1", ipv4: "203.0.113.7" }), ["203.0.113.7"])
+assert.deepEqual(addresses({ ip: "2001:db8::2", ipv4: "10.0.0.2", ipv6: "2001:db8::2" }), ["10.0.0.2", "2001:db8::2"])
+assert.deepEqual(addresses({ ip: "203.0.113.7" }), ["203.0.113.7"])
+// Without a recorded connection the list holds only what the agent reported.
+assert.deepEqual(addresses({ ipv4: "10.0.0.2" }), ["10.0.0.2"])
+assert.deepEqual(addresses({}), [])
+
+console.log("partial edits, traffic corrections, provisioning, page-vocabulary, address and dispatch-result checks passed")

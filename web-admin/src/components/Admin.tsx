@@ -14,7 +14,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
-  api, changes, GIB, provisioningSite, trafficCorrection, upload,
+  addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload,
   type Node, type PingTask, type PluginUsage,
 } from "@/lib/api"
 import { bytes, FOREVER, monthUsage, uptime } from "@/lib/format"
@@ -53,10 +53,7 @@ function copy(text: string) {
 // Every address a node has, each click-to-copy: pasting one into an ssh command
 // is why they are shown.
 function Addresses({ node }: { node: Node }) {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  // `ip` is merely where the agent's connection originated: the fallback for an
-  // agent too old to report its own interfaces.
-  const list = reported.length ? reported : ([node.ip].filter(Boolean) as string[])
+  const list = addresses(node)
   if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
   return (
     <div className="flex flex-col items-start gap-y-0.5">
