@@ -57,28 +57,74 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # 插件是独立 crate(不在根 workspace 里),check 里那条 `cargo test` 覆盖不到它们——
-  # 而它们正是宿主到期/财务行为的替代覆盖所在。拆成独立 job 与 check 并行：各自缓存
-  # 自己的 target/(互不干扰),check 也无需等这两段编译串行跑完。
-  plugins:
+  # Plugin sources moved to CarlJia/monitor-hub-plugins, so a host-side ABI
+  # change here (ABI_VERSION bump, or a plugin_id rename on the far side) no
+  # longer shows up in this repo's tests — it would merge green and break the
+  # published plugins. This gate restores the producer-side signal without a
+  # token: it reads THIS PR's ABI_VERSION and compares it against every
+  # published plugin's declared abi_version, and pins the one plugin_id this
+  # repo hard-depends on (the finance plugin gates an irreversible column-drop
+  # migration in src/db.rs). A coordinated ABI bump must land the plugin repo
+  # update first, or this job stays red until it does — that is the intended
+  # coupling, not a flake.
+  plugin-abi:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      matrix:
-        plugin: [tg-notify, finance-stats]
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: Check published plugins against this PR's ABI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' src/plugin/manifest.rs | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::could not read ABI_VERSION from src/plugin/manifest.rs"; exit 1; }
+          echo "this PR's ABI_VERSION: $abi"
+          fail=0
 
-      - uses: dtolnay/rust-toolchain@stable
+          # Fetch one file from the plugin repo. Distinguish a real 404 (dir has
+          # no plugin.toml -> legitimate skip) from any other failure (transient
+          # gh/network error -> fail closed, never a silent skip).
+          fetch() { # $1 = repo path; prints decoded content, returns 0/404-as-2/other-as-1
+            local out rc
+            out=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/$1" --jq .content 2>/tmp/gherr); rc=$?
+            if [ $rc -eq 0 ]; then printf '%s' "$out" | base64 -d; return 0; fi
+            grep -qi 'Not Found\|404' /tmp/gherr && return 2
+            echo "::error::gh api failed for $1: $(tr -d '\n' </tmp/gherr)" >&2; return 1
+          }
 
-      # 两个 matrix 实例的 job 名相同,靠 plugin 名分池,否则会互相覆盖缓存。
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.plugin }}
-          workspaces: "plugins/${{ matrix.plugin }} -> target"
+          # Roster derived from the plugin repo's top-level plugin dirs.
+          plugins=$(gh api repos/CarlJia/monitor-hub-plugins/contents --jq '.[] | select(.type=="dir") | .name')
+          test -n "$plugins" || { echo "::error::could not list plugin repo contents"; exit 1; }
+          for p in $plugins; do
+            # `if` guards the command substitution so a non-zero fetch return
+            # does not trip `set -e` before rc is captured.
+            if toml=$(fetch "$p/plugin.toml"); then rc=0; else rc=$?; fi
+            [ $rc -eq 2 ] && continue                 # no plugin.toml -> not a plugin dir
+            [ $rc -eq 0 ] || { fail=1; continue; }     # transient error -> fail closed
+            declared=$(printf '%s' "$toml" | grep -oE '^abi_version *= *[0-9]+' | grep -oE '[0-9]+$' || true)
+            if [ -z "$declared" ]; then
+              echo "::error::published plugin $p has no numeric abi_version"; fail=1
+            elif [ "$declared" != "$abi" ]; then
+              echo "::error::published plugin $p declares abi_version=$declared, this PR sets ABI_VERSION=$abi — bump the plugin repo first"
+              fail=1
+            else
+              echo "$p: abi_version=$declared OK"
+            fi
+          done
 
-      # 冒烟测试会嵌套构建 wasm32 产物,所以目标也要装。
-      - run: rustup target add wasm32-unknown-unknown
-
-      - run: cargo test
-        working-directory: plugins/${{ matrix.plugin }}
+          # The finance plugin_id gates the irreversible v6 column-drop in src/db.rs.
+          # Both anchors fail CLOSED: an unreadable local constant or an unfetchable
+          # remote manifest is an error, not a pass.
+          want=$(grep -oE 'FINANCE_PLUGIN_ID: &str = "[^"]+"' src/db.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          test -n "$want" || { echo "::error file=src/db.rs::could not read FINANCE_PLUGIN_ID from src/db.rs"; exit 1; }
+          if fintoml=$(fetch "finance-stats/plugin.toml"); then :; else
+            echo "::error::could not fetch finance-stats/plugin.toml to verify plugin_id"; exit 1
+          fi
+          fin=$(printf '%s' "$fintoml" | grep -oE '^plugin_id *= *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$fin" != "$want" ]; then
+            echo "::error file=src/db.rs::finance plugin_id drift: plugin repo has '$fin', src/db.rs FINANCE_PLUGIN_ID is '$want' — the v6 migration gate would silently never complete"
+            fail=1
+          else
+            echo "finance plugin_id: $fin OK"
+          fi
+          exit $fail
