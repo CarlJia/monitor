@@ -80,23 +80,47 @@ jobs:
           test -n "$abi" || { echo "::error::could not read ABI_VERSION from src/plugin/manifest.rs"; exit 1; }
           echo "this PR's ABI_VERSION: $abi"
           fail=0
+
+          # Fetch one file from the plugin repo. Distinguish a real 404 (dir has
+          # no plugin.toml -> legitimate skip) from any other failure (transient
+          # gh/network error -> fail closed, never a silent skip).
+          fetch() { # $1 = repo path; prints decoded content, returns 0/404-as-2/other-as-1
+            local out rc
+            out=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/$1" --jq .content 2>/tmp/gherr); rc=$?
+            if [ $rc -eq 0 ]; then printf '%s' "$out" | base64 -d; return 0; fi
+            grep -qi 'Not Found\|404' /tmp/gherr && return 2
+            echo "::error::gh api failed for $1: $(tr -d '\n' </tmp/gherr)" >&2; return 1
+          }
+
           # Roster derived from the plugin repo's top-level plugin dirs.
           plugins=$(gh api repos/CarlJia/monitor-hub-plugins/contents --jq '.[] | select(.type=="dir") | .name')
+          test -n "$plugins" || { echo "::error::could not list plugin repo contents"; exit 1; }
           for p in $plugins; do
-            toml=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/$p/plugin.toml" --jq .content 2>/dev/null | base64 -d 2>/dev/null) || continue
-            printf '%s' "$toml" | grep -q '^abi_version' || continue   # not a plugin dir
-            declared=$(printf '%s' "$toml" | grep -oE '^abi_version *= *[0-9]+' | grep -oE '[0-9]+$')
-            if [ "$declared" != "$abi" ]; then
+            toml=$(fetch "$p/plugin.toml"); rc=$?
+            [ $rc -eq 2 ] && continue                 # no plugin.toml -> not a plugin dir
+            [ $rc -eq 0 ] || { fail=1; continue; }     # transient error -> fail closed
+            declared=$(printf '%s' "$toml" | grep -oE '^abi_version *= *[0-9]+' | grep -oE '[0-9]+$' || true)
+            if [ -z "$declared" ]; then
+              echo "::error::published plugin $p has no numeric abi_version"; fail=1
+            elif [ "$declared" != "$abi" ]; then
               echo "::error::published plugin $p declares abi_version=$declared, this PR sets ABI_VERSION=$abi — bump the plugin repo first"
               fail=1
             else
               echo "$p: abi_version=$declared OK"
             fi
           done
+
           # The finance plugin_id gates the irreversible v6 column-drop in src/db.rs.
-          fin=$(gh api "repos/CarlJia/monitor-hub-plugins/contents/finance-stats/plugin.toml" --jq .content 2>/dev/null | base64 -d 2>/dev/null | grep -oE '^plugin_id *= *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
+          # Both anchors fail CLOSED: an unreadable local constant or an unfetchable
+          # remote manifest is an error, not a pass.
           want=$(grep -oE 'FINANCE_PLUGIN_ID: &str = "[^"]+"' src/db.rs | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -n "$want" ] && [ "$fin" != "$want" ]; then
+          test -n "$want" || { echo "::error file=src/db.rs::could not read FINANCE_PLUGIN_ID from src/db.rs"; exit 1; }
+          fintoml=$(fetch "finance-stats/plugin.toml"); rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::could not fetch finance-stats/plugin.toml to verify plugin_id"; exit 1
+          fi
+          fin=$(printf '%s' "$fintoml" | grep -oE '^plugin_id *= *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$fin" != "$want" ]; then
             echo "::error file=src/db.rs::finance plugin_id drift: plugin repo has '$fin', src/db.rs FINANCE_PLUGIN_ID is '$want' — the v6 migration gate would silently never complete"
             fail=1
           else
