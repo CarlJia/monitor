@@ -84,6 +84,9 @@ jobs:
           [ $fail -eq 0 ] && echo "OK: contract major $cv == crate ABI $cabi == host ABI $abi"
           exit $fail
       - run: cargo test -p monitor-plugin-contract
+      # The `check` job's clippy uses --all-targets on the default members only,
+      # so it does not cover this crate; lint it here.
+      - run: cargo clippy -p monitor-plugin-contract --all-targets -- -D warnings
 
   # Plugin sources moved to CarlJia/monitor-hub-plugins, so a host-side ABI
   # change here (ABI_VERSION bump, or a plugin_id rename on the far side) no
