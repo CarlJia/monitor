@@ -20,8 +20,10 @@ pub const ABI_VERSION: i64 = 2;
 /// 的宿主事件名仍会被拒:静默接受会让拼写错误无声失效,显式契约尽早暴露错误。
 pub const KNOWN_EVENT_NAMES: [&str; 2] = Event::KNOWN;
 
-/// `plugin_` 前缀:插件发出的事件名的强制前缀(KTD6)。
-pub const PLUGIN_EVENT_PREFIX: &str = "plugin_";
+/// `plugin_` 前缀:插件发出的事件名的强制前缀(KTD6)。宿主函数 `emit_event`
+/// 用同一个常数判(它的实现在 `monitor-plugin-contract` 里),所以定义在契约
+/// crate,这里只 re-export:manifest 校验与宿主函数不可能各认一个前缀。
+pub use monitor_plugin_contract::constants::PLUGIN_EVENT_PREFIX;
 
 /// `[[kv]]` 的条数上限。64 项已远超真实插件(tg-notify 只声明 2 项);这条挡的
 /// 不是错误配置,而是「64 KiB 的 manifest 塞进上千个声明」——那些声明会被插件

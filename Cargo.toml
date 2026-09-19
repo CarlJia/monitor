@@ -41,6 +41,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
 # 插件 manifest(TOML)解析。默认 features 已含 serde 支持。
 toml = "1"
+# 插件宿主契约:13 个宿主函数的唯一实现在这个独立 crate 里(插件仓 release 时
+# 也能 link 它跑真宿主 instantiate)。本 crate 只实现它的 trait,不反向依赖。
+monitor-plugin-contract = { path = "crates/monitor-plugin-contract" }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"
@@ -52,6 +55,12 @@ wat = "1"
 # 插件上传测试要经 router 整调(oneshot),验证 main 的分层挂载;
 # dev-dependencies 不进发布产物。
 tower = { version = "0.5", features = ["util"] }
+
+# members 不含 ".":根包由它自己的 [package] 声明,workspace 根包自带成员资格,
+# 列进去反而会与 [package] 重复声明。default-members 因此是根包,cargo build /
+# cargo test 在仓根的行为与没有 workspace 时一致。
+[workspace]
+members = ["crates/monitor-plugin-contract"]
 
 [profile.release]
 codegen-units = 1

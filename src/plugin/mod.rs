@@ -3,7 +3,7 @@
 //! - [`manifest::Manifest::parse`] 校验 manifest(R7),
 //! - [`host::load`] 把 db 行变成 [`host::LoadedPlugin`](R6 的前半段:编译 + 导出契约检查),
 //! - [`host::call_on_event`] 每次事件新建 Store、注入宿主函数、以 fuel 限额调用插件,
-//! - 6 个宿主函数(R8),
+//! - 13 个宿主函数(R8)——实现在 `monitor-plugin-contract` crate 里,
 //! - [`Registry`] 启动预加载 enabled 插件(R10)、按 manifest.subscribes 派发
 //!   (R5)、以超时/fuel 隔离每个插件(R9)、维护 dispatch_log 环形缓冲(R16)
 //!   并回写 notification_log(R14)。
@@ -13,7 +13,7 @@
 //!
 //! - [`manifest`] — Manifest 结构与校验(R7);
 //! - [`host`] — 引擎、加载、调用骨架与事件派发入口(R6/R9);
-//! - [`host_funcs`] — 14 个宿主函数(R8);
+//! - [`host_funcs`] — 宿主函数面的真宿主一侧(SSRF 预检、插件 http 骨架、`host_linker`);
 //! - [`log`] — 一次调用里的插件日志汇集点(R16 的 `detail`);
 //! - [`registry`] — 注册表、派发、隔离与回写(U4)。
 //!
@@ -27,8 +27,10 @@
 //! | `on_event` | `(ptr: i32, len: i32) -> i32` | 事件入口;入参指向 JSON 载荷,返回 0 表示成功,非 0 是插件自定义错误码 |
 //! | `__alloc` | `(cap: i32) -> i32` | 分配器;宿主写载荷前通过它拿缓冲(`host_resp_alloc` 同样回调它) |
 //!
-//! 模块从 `"host"` 模块导入宿主函数(名字与返回值见 [`host`] 里各函数的文档;错误码统一为负数,
-//! 成功时 kv_get/http_post 返回写入的字节数,其余返回 0)。
+//! 模块从 `"host"` 模块导入 13 个宿主函数:签名、返回值与错误码的唯一实现在
+//! `monitor-plugin-contract` crate(`monitor_plugin_contract::host_linker` 与
+//! `error_codes`),本仓的宿主只把 trait 实现委托回 `Arc<App>`。错误码统一为负数,
+//! 成功时 kv_get/http_post/http_get 返回写入的字节数,其余返回 0。
 //!
 //! 事件载荷是 [`crate::notification_bus::Event`] 的 JSON,形如
 //! `{"type":"expiry_soon","node_id":7,...}`——按字段名反序列化、容忍新增字段。

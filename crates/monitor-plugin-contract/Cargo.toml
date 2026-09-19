@@ -1,0 +1,25 @@
+[package]
+name = "monitor-plugin-contract"
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+description = "monitor 的宿主函数契约:13 个宿主函数的唯一实现,host 与 plugin 共用"
+repository = "https://github.com/monitor-probe/monitor"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 与 monitor 主 crate 同一份 chrono 配置:`host_now` 要 `Utc::now()`,即 clock。
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+tracing = "0.1"
+# 与 monitor 主 crate 严格同版本、同 features:泛型 `Linker<S>` 的行为依赖同一个
+# wasmtime 实例(两处 features 不同会导致同一份代码编译出两种语义)。
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+
+[dev-dependencies]
+# 契约测试现场编译 WAT fixture,与 monitor 主 crate 的插件测试同一个套路。
+wat = "1"
