@@ -10,13 +10,14 @@ use axum::Json;
 use chrono::{Local, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::notification_bus::{self, Event};
 use crate::plugin;
 use crate::{agent_ws, App, Shared};
 
@@ -621,6 +622,29 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     }))
 }
 
+/// Announces a node's creation on the bus. Reads the identity back rather than
+/// taking it from the request: `created_at` is stamped by `create_node`, and a
+/// subscriber that cannot tell one machine from another cannot handle the id
+/// reuse case at all — so a row we cannot read back is a node we do not
+/// announce.
+fn announce_node_added(app: &App, node_id: i64) {
+    match app.db.node_identity(node_id) {
+        Ok(Some((name, created_at))) => announce(app, Event::NodeAdded { node_id, name, created_at }),
+        Ok(None) => {}
+        Err(e) => warn!(node = node_id, "读节点身份失败,不上报 node_added: {e:#}"),
+    }
+}
+
+/// A bus failure is logged and swallowed: the node change itself succeeded, and
+/// an audit row that could not be written must not turn that into an error
+/// response. Subscribers reconcile on their own tick, so a missed event costs
+/// latency, not correctness.
+fn announce(app: &App, event: Event) {
+    if let Err(e) = notification_bus::emit(app, &event) {
+        warn!(node = event.node_id(), "上报 {} 失败: {e:#}", event.type_name());
+    }
+}
+
 pub async fn create_node(
     _: Admin,
     State(app): State<Shared>,
@@ -644,6 +668,7 @@ pub async fn create_node(
         // so adding and deploying require no reissue in between.
         Ok(id) => {
             invalidate_snapshot(&app);
+            announce_node_added(&app, id);
             Json(json!({"id": id})).into_response()
         }
         Err(e) => fail(e),
@@ -730,9 +755,10 @@ pub async fn agent_register(
     };
     let token = random_token();
     match app.db.create_node(&node, &token) {
-        Ok(_) => {
+        Ok(id) => {
             app.registrations.clear(ip);
             invalidate_snapshot(&app);
+            announce_node_added(&app, id);
             token.into_response()
         }
         Err(e) => fail(e),
@@ -812,9 +838,22 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // next node created, which would then appear online on another node's
     // metrics. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // Read the identity before the row goes. Subscribers need `created_at` to
+    // tell this machine's deletion from a node created later that inherits the
+    // id — the two events can reach them out of order.
+    let identity = match app.db.node_identity(id) {
+        Ok(identity) => identity,
+        Err(e) => {
+            warn!(node = id, "读节点身份失败,删除后不上报 node_deleted: {e:#}");
+            None
+        }
+    };
     match app.db.delete_node(id) {
         Ok(()) => {
             invalidate_snapshot(&app);
+            if let Some((name, created_at)) = identity {
+                announce(&app, Event::NodeDeleted { node_id: id, name, created_at });
+            }
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => fail(e),
@@ -2187,6 +2226,111 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
         assert_eq!(nodes[0]["metrics"], Value::Null, "and it has nobody else's metrics");
+    }
+
+    /// 新增节点要在总线上报一次 `node_added`，身份取节点自己的 `created_at`：
+    /// SQLite 会把删掉的 id 交给下一个新建的节点，订阅者只有靠这一对
+    /// `(id, created_at)` 才能把「同一台机器」与「同一个 id」分开。
+    #[tokio::test]
+    async fn creating_a_node_announces_it_with_its_own_created_at() {
+        let app = std::sync::Arc::new(app());
+        let added: Node = serde_json::from_value(json!({"name": "edge-1"})).unwrap();
+        assert_eq!(
+            create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(added))).await.status(),
+            StatusCode::OK
+        );
+
+        let id = app.db.nodes().unwrap()[0].id;
+        let (_, created_at) = app.db.node_identity(id).unwrap().unwrap();
+        assert!(
+            app.db.notification_log_row(id, "node_added", created_at).unwrap().is_some(),
+            "node_added 要按节点自己的创建时间落账"
+        );
+    }
+
+    /// 面板新增节点 → 总线 → 订阅者 `on_event`：这条链的两半各有测试（这里断言
+    /// 落账、registry 直接派发），但没有一条把它们接起来——取消播报、写错事件名
+    /// 或漏了订阅过滤都不会红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_node_reaches_a_subscriber() {
+        let app = std::sync::Arc::new(app());
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
+        crate::plugin::test_util::install(
+            &app,
+            "com.test.watcher",
+            &["node_added"],
+            crate::plugin::test_util::compile(crate::plugin::KV_CALLED_WAT),
+        );
+
+        let added: Node = serde_json::from_value(json!({"name": "edge-1"})).unwrap();
+        assert_eq!(
+            create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(added))).await.status(),
+            StatusCode::OK
+        );
+        // 派发是 fire-and-forget：轮询到插件写回自己的 kv 为止。
+        let mut reached = false;
+        for _ in 0..400 {
+            if app.db.get("plugin.com.test.watcher:called").as_deref() == Some("1") {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(reached, "面板新增的节点要经通知总线到达订阅者");
+    }
+
+    /// 删除节点也要上报，身份取**删之前**那台机器的：删除之后行已经没了，而
+    /// 这个 id 可能已经被下一台机器接手。
+    #[tokio::test]
+    async fn deleting_a_node_announces_the_identity_it_had() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "edge-1", true);
+        let (_, created_at) = app.db.node_identity(id).unwrap().unwrap();
+
+        assert_eq!(delete_node(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        assert!(app.db.node_identity(id).unwrap().is_none(), "行确实删了");
+        assert!(
+            app.db.notification_log_row(id, "node_deleted", created_at).unwrap().is_some(),
+            "node_deleted 要按被删掉的那台机器的创建时间落账"
+        );
+    }
+
+    /// id 被复用：新机器的 `node_added` 不会被旧机器残留的去重行吞掉。删除本身会
+    /// 清掉该 id 的通知行（见 `Db::delete_node`），这条测试把「旧机器确实留下过一
+    /// 行」与「复用后照样通报」接在一起——两台都经处理器创建，行才真的存在过。
+    #[tokio::test]
+    async fn a_reused_id_announces_its_new_machine() {
+        let app = std::sync::Arc::new(app());
+        let first: Node = serde_json::from_value(json!({"name": "old"})).unwrap();
+        assert_eq!(
+            create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(first))).await.status(),
+            StatusCode::OK
+        );
+        let old = app.db.nodes().unwrap()[0].id;
+        let (_, old_created_at) = app.db.node_identity(old).unwrap().unwrap();
+        assert!(
+            app.db.notification_log_row(old, "node_added", old_created_at).unwrap().is_some(),
+            "旧机器的通报先落过账"
+        );
+
+        assert_eq!(delete_node(Admin, State(app.clone()), Path(old)).await.status(), StatusCode::OK);
+        assert!(
+            app.db.notification_log_row(old, "node_added", old_created_at).unwrap().is_none(),
+            "删除会把该 id 的通知行一起清掉"
+        );
+
+        let second: Node = serde_json::from_value(json!({"name": "fresh"})).unwrap();
+        assert_eq!(
+            create_node(Admin, State(app.clone()), domain_headers(), Ok(Json(second))).await.status(),
+            StatusCode::OK
+        );
+        let fresh = app.db.nodes().unwrap()[0].id;
+        assert_eq!(fresh, old, "fixture 只有在 id 真被复用时才有意义");
+        let (_, created_at) = app.db.node_identity(fresh).unwrap().unwrap();
+        assert!(
+            app.db.notification_log_row(fresh, "node_added", created_at).unwrap().is_some(),
+            "复用该 id 的新机器照样通报"
+        );
     }
 
     /// Both writers enforce the same limits. The create path formerly accepted a

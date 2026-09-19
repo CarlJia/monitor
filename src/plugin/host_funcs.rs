@@ -551,10 +551,13 @@ pub(super) fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginStat
 
     // host_nodes_query(out_ptr, out_cap) -> i32:
     //   只读节点基础信息(R1/KTD2):返回 JSON 数组
-    //   `[{"id":1,"name":"edge-1","online":true},...]`,写回 out,返回字节数。
-    //   只回 id/name/online:财务字段(price/currency/...)自 v2 起归财务插件的
-    //   plugin_data,这个函数读不到它们,也不该读——插件首次启用时只按 id 建
-    //   空白记录,旧值需在插件页面重录。
+    //   `[{"id":1,"name":"edge-1","online":true,"created_at":1700000000},...]`,
+    //   写回 out,返回字节数。
+    //   只回 id/name/online/created_at:财务字段(price/currency/...)自 v2 起归
+    //   财务插件的 plugin_data,这个函数读不到它们,也不该读——插件按 id 建空白
+    //   记录,旧值需在插件页面重录。`created_at` 是节点的身份:SQLite 会把已删
+    //   节点的 id 交给下一个新建的节点,订阅者靠这一对 (id, created_at) 把
+    //   「同一台机器」与「同一个 id」分开。
     linker.func_wrap(
         "host",
         "nodes_query",
@@ -567,7 +570,7 @@ pub(super) fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginStat
             let app = caller.data().app.clone();
             let online: std::collections::HashSet<i64> =
                 app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-            let nodes = match app.db.nodes() {
+            let nodes = match app.db.node_basics() {
                 Ok(nodes) => nodes,
                 Err(e) => {
                     warn!(plugin = %plugin_id, "host_nodes_query 读节点失败: {e:#}");
@@ -576,11 +579,12 @@ pub(super) fn host_linker(engine: &wasmtime::Engine) -> Result<Linker<PluginStat
             };
             let arr: Vec<serde_json::Value> = nodes
                 .iter()
-                .map(|n| {
+                .map(|(id, name, created_at)| {
                     serde_json::json!({
-                        "id": n.id,
-                        "name": n.name,
-                        "online": online.contains(&n.id),
+                        "id": id,
+                        "name": name,
+                        "online": online.contains(id),
+                        "created_at": created_at,
                     })
                 })
                 .collect();
@@ -965,7 +969,9 @@ mod tests {
 
     // ---- nodes_query(U3) ----
 
-    /// nodes_query 返回 id/name/online 的 JSON 数组,在线状态与 agents 一致。
+    /// nodes_query 返回 id/name/online/created_at 的 JSON 数组,在线状态与 agents
+    /// 一致。`created_at` 是插件的机器身份(宿主 id 会被 SQLite 复用),它必须随
+    /// 每一行回到 guest 缓冲里——那是这个函数的 ABI 面之一。
     #[test]
     fn nodes_query_reports_online_state() {
         let engine = engine();
@@ -1005,6 +1011,15 @@ mod tests {
         assert_eq!(by_id(online)["name"], serde_json::json!("edge-up"));
         assert_eq!(by_id(online)["online"], serde_json::json!(true), "有会话的节点在线");
         assert_eq!(by_id(offline)["online"], serde_json::json!(false), "没有会话的节点离线");
+        // 身份字段逐台与库里的值对齐:插件靠它认出「同一个 id 换了机器」。
+        for id in [online, offline] {
+            let from_db = app.db.node_identity(id).unwrap().unwrap().1;
+            assert_eq!(
+                by_id(id)["created_at"],
+                serde_json::json!(from_db),
+                "节点 {id} 的 created_at 要回给 guest"
+            );
+        }
     }
 
     // ---- http_get(U3) ----
