@@ -104,3 +104,18 @@ impl ContractHttp for MockHttp {
         }
     }
 }
+
+/// `Arc<T>` 也是 `ContractHttp`:让用例留住一份句柄去断言调用现场
+/// (`with_http` 取 `Box<dyn ContractHttp>`,裸放一个 `MockHttp` 进去就拿不回来
+/// 看 `calls()` 了——门的价值一半在"插件**真的发了**那个请求")。
+impl<T: ContractHttp + ?Sized> ContractHttp for std::sync::Arc<T> {
+    fn request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Option<Vec<u8>>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, i32> {
+        (**self).request(method, url, body, deadline)
+    }
+}

@@ -3,6 +3,12 @@
 
 use std::time::Duration;
 
+/// 本 crate 实现的宿主 ABI 版本。宿主 `src/plugin/manifest.rs` 的 `ABI_VERSION`
+/// 必须等于它(monitor `ci.yml` 的 `contract` job 断言),插件仓的契约门也断言
+/// 「拉到的契约 ABI_VERSION == 本插件 `plugin.toml` 声明的 `abi_version`」——
+/// 这样「宿主面变了但没 bump / 没打新 tag」导致拉到旧契约时,门会红而不是验错对象。
+pub const ABI_VERSION: i64 = 2;
+
 /// 每次调用的默认 fuel 限额(KTD6)。dispatch 每次读 setting
 /// `plugin.fuel_limit` 覆写,缺省回落到这里。
 pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;

@@ -59,6 +59,7 @@ pub mod host_linker;
 pub mod http;
 pub mod kv;
 
+pub use constants::ABI_VERSION;
 pub use contract_state::ContractState;
 pub use host::{HasScratch, Host, HttpMethod, NodeInfo};
 pub use host_linker::linker;
