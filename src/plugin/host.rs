@@ -216,10 +216,10 @@ impl Host for PluginState {
     fn nodes_query(&self) -> Result<Vec<NodeInfo>, ()> {
         let online: HashSet<i64> =
             self.app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        match self.app.db.nodes() {
+        match self.app.db.node_basics() {
             Ok(nodes) => Ok(nodes
-                .iter()
-                .map(|n| NodeInfo { id: n.id, name: n.name.clone(), online: online.contains(&n.id) })
+                .into_iter()
+                .map(|(id, name, created_at)| NodeInfo { id, name, online: online.contains(&id), created_at })
                 .collect()),
             Err(e) => {
                 warn!(plugin = %self.plugin_id, "host_nodes_query 读节点失败: {e:#}");

@@ -33,7 +33,10 @@
 //! 成功时 kv_get/http_post/http_get 返回写入的字节数,其余返回 0。
 //!
 //! 事件载荷是 [`crate::notification_bus::Event`] 的 JSON,形如
-//! `{"type":"expiry_soon","node_id":7,...}`——按字段名反序列化、容忍新增字段。
+//! `{"type":"agent_offline","node_id":5,...}`——按字段名反序列化、容忍新增字段。
+//! 宿主自身的事件名是 [`crate::notification_bus::Event::KNOWN`] 这一组;其中
+//! `node_added` / `node_deleted` 带节点自己的 `created_at`,插件据此把「同一台
+//! 机器」与「同一个 id」分开(SQLite 会复用已删节点的 id)。
 //!
 //! 资源模型(A8):引擎进程唯一(见 [`host::new_engine`]),`LoadedPlugin` 只缓存 manifest
 //! 与 `Module`(均 Send+Sync);实例与 Store 每次调用重建——fuel 记在 Store 上,
@@ -58,4 +61,4 @@ pub use registry::Registry;
 pub(crate) mod test_util;
 
 #[cfg(test)]
-pub(crate) use test_util::MINIMAL_WAT;
+pub(crate) use test_util::{KV_CALLED_WAT, KV_TICK_WAT, MINIMAL_WAT};

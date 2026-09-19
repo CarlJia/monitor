@@ -17,15 +17,19 @@ pub enum HttpMethod {
     Post,
 }
 
-/// `nodes_query` 回给插件的一行:只有 id/name/online 三个字段。
+/// `nodes_query` 回给插件的一行:只有 id/name/online/created_at 四个字段。
 ///
 /// 财务字段(price/currency/...)自 v2 起归财务插件的 plugin_data,宿主不认
 /// 它们,也不该认。
+///
+/// `created_at` 是节点的身份:SQLite 会把已删节点的 id 交给下一个新建的节点,
+/// 订阅者靠这一对 (id, created_at) 把「同一台机器」与「同一个 id」分开。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
     pub id: i64,
     pub name: String,
     pub online: bool,
+    pub created_at: i64,
 }
 
 /// 10 个碰宿主数据面的操作(13 个宿主函数里除 `log`/`now`/`resp_alloc` 外

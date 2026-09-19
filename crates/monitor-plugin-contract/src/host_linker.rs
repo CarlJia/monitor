@@ -359,10 +359,13 @@ pub fn linker<S: Host + HasScratch + 'static>(engine: &wasmtime::Engine) -> Resu
 
     // host_nodes_query(out_ptr, out_cap) -> i32:
     //   只读节点基础信息(R1/KTD2):返回 JSON 数组
-    //   `[{"id":1,"name":"edge-1","online":true},...]`,写回 out,返回字节数。
-    //   只回 id/name/online:财务字段(price/currency/...)自 v2 起归财务插件的
-    //   plugin_data,这个函数读不到它们,也不该读——插件首次启用时只按 id 建
-    //   空白记录,旧值需在插件页面重录。
+    //   `[{"id":1,"name":"edge-1","online":true,"created_at":1700000000},...]`,
+    //   写回 out,返回字节数。
+    //   只回 id/name/online/created_at:财务字段(price/currency/...)自 v2 起归
+    //   财务插件的 plugin_data,这个函数读不到它们,也不该读——插件按 id 建空白
+    //   记录,旧值需在插件页面重录。`created_at` 是节点的身份:SQLite 会把已删
+    //   节点的 id 交给下一个新建的节点,订阅者靠这一对 (id, created_at) 把
+    //   「同一台机器」与「同一个 id」分开。
     linker.func_wrap(
         "host",
         "nodes_query",
@@ -383,6 +386,7 @@ pub fn linker<S: Host + HasScratch + 'static>(engine: &wasmtime::Engine) -> Resu
                         "id": n.id,
                         "name": n.name,
                         "online": n.online,
+                        "created_at": n.created_at,
                     })
                 })
                 .collect();

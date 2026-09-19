@@ -355,7 +355,9 @@ mod tests {
 
     // ---- nodes_query(U3) ----
 
-    /// nodes_query 返回 id/name/online 的 JSON 数组,在线状态与 agents 一致。
+    /// nodes_query 返回 id/name/online/created_at 的 JSON 数组,在线状态与 agents
+    /// 一致。`created_at` 是插件的机器身份(宿主 id 会被 SQLite 复用),它必须随
+    /// 每一行回到 guest 缓冲里——那是这个函数的 ABI 面之一。
     #[test]
     fn nodes_query_reports_online_state() {
         let engine = engine();
@@ -395,6 +397,15 @@ mod tests {
         assert_eq!(by_id(online)["name"], serde_json::json!("edge-up"));
         assert_eq!(by_id(online)["online"], serde_json::json!(true), "有会话的节点在线");
         assert_eq!(by_id(offline)["online"], serde_json::json!(false), "没有会话的节点离线");
+        // 身份字段逐台与库里的值对齐:插件靠它认出「同一个 id 换了机器」。
+        for id in [online, offline] {
+            let from_db = app.db.node_identity(id).unwrap().unwrap().1;
+            assert_eq!(
+                by_id(id)["created_at"],
+                serde_json::json!(from_db),
+                "节点 {id} 的 created_at 要回给 guest"
+            );
+        }
     }
 
     // ---- http_get(U3) ----

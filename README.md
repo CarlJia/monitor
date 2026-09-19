@@ -84,9 +84,9 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 | `plugin_id` | 非空、不含 `:`（它是 kv 命名空间 `plugin.<plugin_id>:<key>` 的分隔符）；重复的 `plugin_id` 上传被拒，升级需先删除旧版 |
 | `name` / `version` | 非空 |
 | `abi_version` | 必须为 `2` |
-| `subscribes` | 订阅的宿主事件列表，最多 32 条；v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
+| `subscribes` | 订阅的宿主事件列表，最多 32 条。宿主自身的事件名有白名单——`agent_offline` / `agent_online` / `node_added` / `node_deleted`，其余必须是 `plugin_` 前缀，写错在上传时即被拒。`node_added` / `node_deleted` 是较新的宿主事件：宿主未升级时插件会因白名单校验而加载失败，**发布顺序是先宿主后插件**（`abi_version` 仍为 2）。v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
 | `wasm_entry` | 可选，缺省 `plugin.wasm`：包内 wasm 入口文件名 |
-| `[tick]` | 存在则每小时调度一次 `on_tick` |
+| `[tick]` | 存在则每小时调度一次 `on_tick`（面板**启用**插件成功后立刻另跑一次） |
 | `[page]` | 存在则面板里出现「页面」入口；`title` 必填 |
 | `[cleanup]` | 存在则面板里出现「清理」按钮，调 `on_cleanup` |
 | `[[kv]]` | 可选、可重复，最多 64 项。key 非空、不含 `:`、不超 128 字节、不重复、首尾无空白（形状规则由 `plugin::kv_key_problem` 单点判定，面板的 kv 写入同一份）；`required` 的含义只是「点『测试』前应该有值」，**宿主在真实派发里从不检查它**——后台事件旁边没有操作员，一个 400 也无处可给 |
@@ -113,7 +113,7 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 
 | 导出 | 触发时机 |
 |---|---|
-| `on_tick()` | manifest 声明 `[tick]` 时，宿主每小时调一次 |
+| `on_tick()` | manifest 声明 `[tick]` 时，宿主每小时调一次；面板启用插件成功后也会立刻调一次（插件停用期间发生的变更靠这次对齐）。两次调用可能**并发**——插件做读-改-写要自己考虑这点 |
 | `render_page(ptr, len) -> i32` | manifest 声明 `[page]` 时，面板打开页面时调用，返回值为写入响应缓冲的字节数 |
 | `on_action(ptr, len) -> i32` | manifest 声明 `[page]` 时，面板里的交互（按钮/表单提交）调用；与 `render_page` 一样的返回协议 |
 | `on_cleanup(ptr, len) -> i32` | manifest 声明 `[cleanup]` 时，面板里的「清理」按钮调用 |
@@ -134,7 +134,7 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 | `host_http_get` | `(url_ptr, url_len, resp_ptr, resp_cap) -> i32` | 固定 GET；同样见错误码表 |
 | `host_kv_get` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | 写入 `out` 的字节数；**0 = 无值或空**；-1 越界/非法 UTF-8；-8 读库失败（与 0 分开，插件才能区分「没配」与「库坏了」） |
 | `host_kv_set` | `(key_ptr, key_len, val_ptr, val_len) -> i32` | 0 成功；-1 越界/值超 8 KiB；-2 写库失败 |
-| `host_nodes_query` | `(out_ptr, out_cap) -> i32` | 把全部节点的精简快照（id/name/online）写进缓冲；返回字节数、-1 越界或 -6 放不下。仅供只读查询 |
+| `host_nodes_query` | `(out_ptr, out_cap) -> i32` | 把全部节点的精简快照（id/name/online/created_at）写进缓冲；返回字节数、-1 越界或 -6 放不下。仅供只读查询 |
 | `host_emit_event` | `(name_ptr, name_len, payload_ptr, payload_len) -> i32` | 0 成功；-1 越界、-7 事件名不以 `plugin_` 开头、-8 内部错误。事件会经通知派发路径送达订阅者 |
 | `host_data_put` | `(key_ptr, key_len, val_ptr, val_len) -> i32` | 写一行；value 上限 256 KiB、单插件总占用上限 16 MiB；超限 -6 |
 | `host_data_get` | `(key_ptr, key_len, out_ptr, out_cap) -> i32` | 取一行；0 表示无此 key；-1 越界/非 UTF-8 |
@@ -169,12 +169,22 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
 ```json
 {"type":"agent_offline","node_id":5,"name":"edge-1","observed_at":100,"last_seen_at":90}
 {"type":"agent_online","node_id":5,"name":"edge-1","observed_at":300}
+{"type":"node_added","node_id":5,"name":"edge-1","created_at":100}
+{"type":"node_deleted","node_id":5,"name":"edge-1","created_at":100}
 {"type":"plugin_expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}
 ```
 
-宿主事件只有 `agent_offline` / `agent_online` 两种 `type`，加上任意
-`plugin_<作者选>` 由插件经 `host_emit_event` 发出。面板只识别
+宿主事件有 `agent_offline` / `agent_online` / `node_added` / `node_deleted` 四种
+`type`，加上任意 `plugin_<作者选>` 由插件经 `host_emit_event` 发出。面板只识别
 `agent_*` 与 `plugin_*` 前缀的事件。
+
+`node_added` / `node_deleted` 通报节点行的增删（面板新增、自动注册、删除；整库还原不发这两个事件）。
+`created_at` 是节点自己的创建时间戳（**秒级**），与事件发出的时间不是一回事：宿主 id 会被
+SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id），订阅者靠这一对
+`(node_id, created_at)` 把「同一台机器」与「同一个 id」分开。它是**对账用的提示**，不是唯一标识
+——同一秒内删掉再新建、且 id 恰好被复用，两台机器会得到相同的身份。所以订阅者该拿它做
+校验而不是做删除的依据：对不上就当没发生过，等下一轮 `nodes_query` 对账（宿主的删除会先清掉
+该 id 的通知行，复用 id 的新机器不会因此被抑制）。两个事件是异步派发的，可能乱序到达。
 
 ### 面板页面协议（manifest 声明 `[page]` 时）
 
@@ -319,7 +329,8 @@ hint = "向 @BotFather 申请"            # 一句话填写提示；可省
    一律 400）。替换保留行 id、`kv` 与 `plugin_data`，并把插件拨回**停用**，
    重新启用才会装载新包——面板上的删除会连插件数据一起删，所以升级不要走
    「先删再传」；
-4. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因）；
+4. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因；成功后宿主
+   立刻为该插件跑一次 `on_tick`，不阻塞这次响应）；
 5. 测试：`POST /api/plugins/{id}/test` 构造一条合成的 `plugin_expiry_soon`
    事件，走与真实派发完全相同的执行路径。派发前先按 manifest 的 `[[kv]]`
    预检必填项，缺项（行不存在或值为空）直接 400 点名缺哪一项，而不是让插件

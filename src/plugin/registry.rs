@@ -297,35 +297,29 @@ impl Registry {
         let fuel = setting_u64(app, SETTING_HOOK_FUEL_LIMIT, DEFAULT_HOOK_FUEL_LIMIT);
         let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
         for plugin in plugins {
-            let plugin_id = plugin.manifest.plugin_id.clone();
-            let started = std::time::Instant::now();
-            // 每轮一个 sink:跨轮共用会把上一个插件的日志混进这一轮的 detail。
-            let logs = new_log_sink();
-            let result = match call_hook(&engine, &app_arc, &plugin, "on_tick", fuel, timeout_ms, &logs) {
-                Ok(0) => RESULT_SUCCESS.to_owned(),
-                Ok(code) => format!("other:{code}"),
-                Err(e) => {
-                    let whole = format!("{e:#}");
-                    warn!(plugin = %plugin_id, "on_tick 失败: {whole}");
-                    if whole.to_lowercase().contains("fuel") {
-                        "fuel_exhausted".to_owned()
-                    } else {
-                        format!("host_error:{}", truncate(&whole, DETAIL_MAX))
-                    }
-                }
-            };
-            push_entry(
-                &dispatch_log,
-                DispatchEntry {
-                    at: Utc::now().timestamp(),
-                    plugin_id,
-                    event_type: "tick".into(),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    result,
-                    detail: render_log(&logs, DETAIL_MAX),
-                },
-            );
+            run_tick(&engine, &app_arc, &dispatch_log, plugin, fuel, timeout_ms);
         }
+    }
+
+    /// 单个插件的 tick：面板启用插件成功后立刻跑一次（见 `api_plugins::enable_plugin`），
+    /// 让插件在启用那一刻就对齐一遍宿主状态——插件禁用期间发生的变更不会派发给
+    /// 它，只能靠这次和它自己的定时 tick 补上。
+    ///
+    /// 与 [`Registry::dispatch_ticks`] 同一套 fuel/超时隔离与 dispatch_log 落账，
+    /// 同样只在取快照时借一次读锁。插件没声明 `tick` 就什么都不做。
+    pub fn dispatch_tick_one(app: &App, plugin_row_id: i64) {
+        let (engine, dispatch_log, app_arc, plugin) = {
+            let reg = app.plugins.read().unwrap_or_else(|e| e.into_inner());
+            let Some(app_arc) = reg.app.upgrade() else { return };
+            let Some(plugin) = reg.loaded.get(&plugin_row_id).cloned() else { return };
+            (reg.engine.clone(), reg.dispatch_log.clone(), app_arc, plugin)
+        };
+        if !plugin.manifest.tick {
+            return;
+        }
+        let fuel = setting_u64(app, SETTING_HOOK_FUEL_LIMIT, DEFAULT_HOOK_FUEL_LIMIT);
+        let timeout_ms = setting_u64(app, SETTING_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+        run_tick(&engine, &app_arc, &dispatch_log, plugin, fuel, timeout_ms);
     }
 
     /// 调用一个插件的「入参 JSON、返回 JSON」导出(`render_page`/`on_action`/
@@ -409,6 +403,45 @@ async fn run_one(
     }
 }
 
+/// 跑一个插件的 `on_tick` 并把结果落进 dispatch log。每轮一个日志 sink——
+/// 跨轮共用会把上一个插件的日志混进这一轮的 detail。
+fn run_tick(
+    engine: &wasmtime::Engine,
+    app: &Arc<App>,
+    dispatch_log: &Arc<Mutex<VecDeque<DispatchEntry>>>,
+    plugin: LoadedPlugin,
+    fuel: u64,
+    timeout_ms: u64,
+) {
+    let plugin_id = plugin.manifest.plugin_id.clone();
+    let started = std::time::Instant::now();
+    let logs = new_log_sink();
+    let result = match call_hook(engine, app, &plugin, "on_tick", fuel, timeout_ms, &logs) {
+        Ok(0) => RESULT_SUCCESS.to_owned(),
+        Ok(code) => format!("other:{code}"),
+        Err(e) => {
+            let whole = format!("{e:#}");
+            warn!(plugin = %plugin_id, "on_tick 失败: {whole}");
+            if whole.to_lowercase().contains("fuel") {
+                "fuel_exhausted".to_owned()
+            } else {
+                format!("host_error:{}", truncate(&whole, DETAIL_MAX))
+            }
+        }
+    };
+    push_entry(
+        dispatch_log,
+        DispatchEntry {
+            at: Utc::now().timestamp(),
+            plugin_id,
+            event_type: "tick".into(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            result,
+            detail: render_log(&logs, DETAIL_MAX),
+        },
+    );
+}
+
 /// 记一条派发结果,环形淘汰最旧(KTD12)。
 fn push_entry(log: &Arc<Mutex<VecDeque<DispatchEntry>>>, entry: DispatchEntry) {
     let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,24 +492,14 @@ fn setting_u64(app: &App, key: &str, default: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::db::Db;
-    use crate::plugin::test_util::{compile, expiry_event, insert, install, runtime_app, MINIMAL_WAT};
+    use crate::plugin::test_util::{
+        compile, expiry_event, insert, install, runtime_app, KV_CALLED_WAT, KV_TICK_WAT, MINIMAL_WAT,
+    };
 
     // ---- Registry(U4):路由、隔离、预加载、dispatch_log、回写 ----
     //
     // 派发依赖 block_in_place,它只在多线程 runtime 上可用——#[tokio::test]
     // 缺省是 current_thread,必须显式声明 flavor。
-
-    /// on_event 往自己的 kv 命名空间写 called=1:被调没被调,db 里见。
-    const KV_CALLED_WAT: &str = r#"
-(module
-  (import "host" "kv_set" (func $kv_set (param i32 i32 i32 i32) (result i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 1024) "called")
-  (data (i32.const 2048) "1")
-  (func (export "__alloc") (param $cap i32) (result i32) (i32.const 8192))
-  (func (export "on_event") (param i32 i32) (result i32)
-    (drop (call $kv_set (i32.const 1024) (i32.const 6) (i32.const 2048) (i32.const 1)))
-    (i32.const 0)))"#;
 
     /// 死循环模块:配合小的 fuel 验证 fuel_exhausted,配合大 fuel 与小超时验证
     /// timeout——两个截断路径都需要一个不会自己停的插件。
@@ -587,6 +610,78 @@ mod tests {
         .await;
         assert_eq!(entries[0].result, "fuel_exhausted");
         assert_eq!(entries[0].plugin_id, "com.test.spin");
+    }
+
+    /// db 行 + Registry 加载,manifest 带 `tick = true`。
+    fn install_tick_plugin(app: &App, plugin_id: &str) -> i64 {
+        let manifest = format!(
+            "plugin_id = \"{plugin_id}\"\nname = \"{plugin_id}\"\nversion = \"1.0.0\"\n\
+             abi_version = 2\nsubscribes = []\ntick = true"
+        );
+        let row = app
+            .db
+            .create_plugin(plugin_id, plugin_id, "1.0.0", &manifest, &compile(KV_TICK_WAT), "")
+            .unwrap();
+        app.db.set_plugin_enabled(row.id, true).unwrap();
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(app, row.id).unwrap();
+        row.id
+    }
+
+    /// 节点生命周期事件按 manifest 的订阅派发,与其它事件同一套过滤。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_events_are_dispatched_to_their_subscribers() {
+        let app = runtime_app();
+        install(&app, "com.test.a", &["node_added", "node_deleted"], compile(KV_CALLED_WAT));
+        install(&app, "com.test.b", &["agent_offline"], compile(KV_CALLED_WAT));
+        let added = Event::NodeAdded { node_id: 5, name: "edge-1".into(), created_at: 100 };
+        let deleted = Event::NodeDeleted { node_id: 5, name: "edge-1".into(), created_at: 100 };
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&added);
+        app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch(&deleted);
+
+        let entries = until(|| {
+            let s = snapshot(&app);
+            (s.len() == 2).then_some(s)
+        })
+        .await;
+        for entry in &entries {
+            assert_eq!(entry.plugin_id, "com.test.a", "只有订阅了节点事件的插件该收到:{entry:?}");
+        }
+        // 两个事件各自派发一次,顺序不作断言:派发是 fire-and-forget,两个插件的
+        // 任务谁先跑完由调度决定(README 也写明这两个事件可能乱序到达)。
+        let types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            types.contains(&"node_added") && types.contains(&"node_deleted"),
+            "两个事件都该派发:{entries:?}"
+        );
+        assert_eq!(app.db.get("plugin.com.test.a:called").as_deref(), Some("1"), "订阅者真的跑过了");
+        assert_eq!(app.db.get("plugin.com.test.b:called"), None, "没订阅的插件不该被调用");
+    }
+
+    /// 启用即 tick(dispatch_tick_one)只打指定的那个插件——别的插件的定时
+    /// tick 不该被这次调用带着跑。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_tick_one_runs_only_the_named_plugin() {
+        let app = runtime_app();
+        let a = install_tick_plugin(&app, "com.test.tick.a");
+        let _b = install_tick_plugin(&app, "com.test.tick.b");
+
+        Registry::dispatch_tick_one(&app, a);
+        let entries = snapshot(&app);
+        assert_eq!(entries.len(), 1, "只落一条 tick 记录:{entries:?}");
+        assert_eq!(entries[0].plugin_id, "com.test.tick.a");
+        assert_eq!(entries[0].event_type, "tick");
+        assert_eq!(app.db.get("plugin.com.test.tick.a:called").as_deref(), Some("1"));
+        assert_eq!(app.db.get("plugin.com.test.tick.b:called"), None, "B 没被 tick");
+    }
+
+    /// 没声明 `tick` 的插件:启用即 tick 对它是空操作,不留日志。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_tick_one_skips_plugins_without_tick() {
+        let app = runtime_app();
+        let id = install(&app, "com.test.notick", &["agent_offline"], compile(KV_TICK_WAT));
+        Registry::dispatch_tick_one(&app, id);
+        assert!(snapshot(&app).is_empty(), "没声明 tick 的插件不该被调用");
+        assert_eq!(app.db.get("plugin.com.test.notick:called"), None);
     }
 
     /// ABI v2 的数据面钩子(`on_tick` 与 `render_page`)读的是

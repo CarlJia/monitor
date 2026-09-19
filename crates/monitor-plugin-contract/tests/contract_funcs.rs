@@ -413,13 +413,15 @@ fn http_refuses_plain_http_and_non_post_before_sending() {
 // nodes_query
 // ---------------------------------------------------------------------------
 
-/// nodes_query 返回 id/name/online 的 JSON 数组,在线状态与在线集合一致。
+/// nodes_query 返回 id/name/online/created_at 的 JSON 数组,在线状态与在线集合
+/// 一致。`created_at` 是插件的机器身份(宿主 id 会被 SQLite 复用),它必须随
+/// 每一行回到 guest 缓冲里——那是这个函数的 ABI 面之一。
 #[test]
 fn nodes_query_reports_online_state() {
     let wat = module("(call $nodes_query (i32.const 4096) (i32.const 4096))", "", 1);
     let state = ContractState::for_test(PLUGIN_ID);
-    state.nodes().add_node(1, "edge-up");
-    state.nodes().add_node(2, "edge-down");
+    state.nodes().add_node(1, "edge-up", 1_700_000_001);
+    state.nodes().add_node(2, "edge-down", 1_700_000_002);
     state.nodes().set_online(1, true);
     let (mut store, instance) = spawn(state, &wat);
     let n = drive(&mut store, &instance);
@@ -429,8 +431,8 @@ fn nodes_query_reports_online_state() {
     assert_eq!(
         arr,
         serde_json::json!([
-            {"id": 1, "name": "edge-up", "online": true},
-            {"id": 2, "name": "edge-down", "online": false},
+            {"id": 1, "name": "edge-up", "online": true, "created_at": 1_700_000_001},
+            {"id": 2, "name": "edge-down", "online": false, "created_at": 1_700_000_002},
         ])
     );
 }

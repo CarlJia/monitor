@@ -101,9 +101,13 @@ impl ContractKv {
 
 /// 内存节点表 + 在线集合。`online` 由在线集合推出,与真宿主
 /// (`app.agents` 的会话 keys)同一套语义。
+///
+/// `created_at` 由用例显式给出而不是内部生成:它是节点的身份字段,用例要能造出
+/// "同一个 id 换了 created_at"(SQLite 复用已删节点的 id)这种局面来验证它确实
+/// 随每一行回了 guest。
 #[derive(Default)]
 pub struct ContractNodes {
-    nodes: Mutex<HashMap<i64, String>>,
+    nodes: Mutex<HashMap<i64, (String, i64)>>,
     online: Mutex<Vec<i64>>,
 }
 
@@ -112,9 +116,9 @@ impl ContractNodes {
         Self::default()
     }
 
-    /// 播一台节点(默认离线)。
-    pub fn add_node(&self, id: i64, name: &str) {
-        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, name.to_owned());
+    /// 播一台节点(默认离线)。`created_at` 是它的身份,见类型注释。
+    pub fn add_node(&self, id: i64, name: &str, created_at: i64) {
+        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (name.to_owned(), created_at));
     }
 
     /// 置一台节点的在线状态。
@@ -132,7 +136,12 @@ impl ContractNodes {
         let online = self.online.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<NodeInfo> = nodes
             .iter()
-            .map(|(&id, name)| NodeInfo { id, name: name.clone(), online: online.contains(&id) })
+            .map(|(&id, (name, created_at))| NodeInfo {
+                id,
+                name: name.clone(),
+                online: online.contains(&id),
+                created_at: *created_at,
+            })
             .collect();
         out.sort_by_key(|n| n.id);
         out
@@ -187,12 +196,31 @@ mod tests {
     #[test]
     fn nodes_report_their_online_state() {
         let nodes = ContractNodes::new();
-        nodes.add_node(2, "edge-down");
-        nodes.add_node(1, "edge-up");
+        nodes.add_node(2, "edge-down", 1_700_000_002);
+        nodes.add_node(1, "edge-up", 1_700_000_001);
         nodes.set_online(1, true);
         let list = nodes.list();
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0], NodeInfo { id: 1, name: "edge-up".into(), online: true });
-        assert_eq!(list[1], NodeInfo { id: 2, name: "edge-down".into(), online: false });
+        assert_eq!(
+            list[0],
+            NodeInfo { id: 1, name: "edge-up".into(), online: true, created_at: 1_700_000_001 }
+        );
+        assert_eq!(
+            list[1],
+            NodeInfo { id: 2, name: "edge-down".into(), online: false, created_at: 1_700_000_002 }
+        );
+    }
+
+    /// `add_node` 对同一个 id 是覆盖写:重播一台节点可以把 created_at 换掉,
+    /// 这正是真宿主里"SQLite 把已删节点的 id 交给新节点"的复现方式。
+    #[test]
+    fn re_adding_the_same_id_replaces_its_identity() {
+        let nodes = ContractNodes::new();
+        nodes.add_node(1, "old-machine", 1_700_000_001);
+        nodes.add_node(1, "new-machine", 1_800_000_001);
+        assert_eq!(
+            nodes.list(),
+            vec![NodeInfo { id: 1, name: "new-machine".into(), online: false, created_at: 1_800_000_001 }]
+        );
     }
 }
