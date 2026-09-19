@@ -70,17 +70,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Version sync (contract major == ABI_VERSION)
+      - name: Version sync (contract major == ABI_VERSION; crate ABI == host ABI)
         run: |
           abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' src/plugin/manifest.rs | grep -oE '[0-9]+$')
-          test -n "$abi" || { echo "::error::could not read ABI_VERSION"; exit 1; }
+          test -n "$abi" || { echo "::error::could not read host ABI_VERSION"; exit 1; }
           cv=$(grep -m1 '^version' crates/monitor-plugin-contract/Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)
+          cabi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' crates/monitor-plugin-contract/src/constants.rs | grep -oE '[0-9]+$')
           test -n "$cv" || { echo "::error::could not read contract version"; exit 1; }
-          if [ "$cv" != "$abi" ]; then
-            echo "::error::contract major ($cv) != ABI_VERSION ($abi) — bump crates/monitor-plugin-contract/Cargo.toml with the ABI change"
-            exit 1
-          fi
-          echo "contract major $cv == ABI_VERSION $abi OK"
+          test -n "$cabi" || { echo "::error::could not read the crate's ABI_VERSION const"; exit 1; }
+          fail=0
+          [ "$cv" = "$abi" ]   || { echo "::error::contract major ($cv) != host ABI_VERSION ($abi) — bump crates/monitor-plugin-contract/Cargo.toml with the ABI change"; fail=1; }
+          [ "$cabi" = "$abi" ] || { echo "::error::crate ABI_VERSION ($cabi) != host ABI_VERSION ($abi) — they must stay equal or plugin releases validate the wrong host"; fail=1; }
+          [ $fail -eq 0 ] && echo "OK: contract major $cv == crate ABI $cabi == host ABI $abi"
+          exit $fail
       - run: cargo test -p monitor-plugin-contract
 
   # Plugin sources moved to CarlJia/monitor-hub-plugins, so a host-side ABI

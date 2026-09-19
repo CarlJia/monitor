@@ -107,7 +107,10 @@ impl ContractKv {
 /// 随每一行回了 guest。
 #[derive(Default)]
 pub struct ContractNodes {
-    nodes: Mutex<HashMap<i64, (String, i64)>>,
+    /// id -> (sort, name, created_at)。`sort` 是面板里可拖拽的顺序字段,真宿主
+    /// 按 `ORDER BY sort, id` 返回;`created_at` 是节点的身份字段(见类型注释)。
+    /// 替身必须同口径,否则插件依赖顺序 / 身份时验不出。
+    nodes: Mutex<HashMap<i64, (i64, String, i64)>>,
     online: Mutex<Vec<i64>>,
 }
 
@@ -116,9 +119,20 @@ impl ContractNodes {
         Self::default()
     }
 
-    /// 播一台节点(默认离线)。`created_at` 是它的身份,见类型注释。
+    /// 播一台节点(默认离线)。`created_at` 是它的身份;`sort` 默认取 id
+    /// (不设即等价于按 id 排)。
     pub fn add_node(&self, id: i64, name: &str, created_at: i64) {
-        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (name.to_owned(), created_at));
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (id, name.to_owned(), created_at));
+    }
+
+    /// 设一台节点的 `sort`(真宿主 `node.sort`,面板可拖拽调整)。
+    pub fn set_sort(&self, id: i64, sort: i64) {
+        if let Some(entry) = self.nodes.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+            entry.0 = sort;
+        }
     }
 
     /// 置一台节点的在线状态。
@@ -130,21 +144,24 @@ impl ContractNodes {
         }
     }
 
-    /// 全部节点,按 id 排序。
+    /// 全部节点,按 `(sort, id)` 排序——与真宿主 `SELECT * FROM node ORDER BY sort, id`
+    /// 一致。
     pub fn list(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         let online = self.online.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<NodeInfo> = nodes
+        let mut out: Vec<(i64, i64, NodeInfo)> = nodes
             .iter()
-            .map(|(&id, (name, created_at))| NodeInfo {
-                id,
-                name: name.clone(),
-                online: online.contains(&id),
-                created_at: *created_at,
+            .map(|(&id, (sort, name, created_at))| {
+                (*sort, id, NodeInfo {
+                    id,
+                    name: name.clone(),
+                    online: online.contains(&id),
+                    created_at: *created_at,
+                })
             })
             .collect();
-        out.sort_by_key(|n| n.id);
-        out
+        out.sort_by_key(|(sort, id, _)| (*sort, *id));
+        out.into_iter().map(|(_, _, n)| n).collect()
     }
 }
 
@@ -222,5 +239,18 @@ mod tests {
             nodes.list(),
             vec![NodeInfo { id: 1, name: "new-machine".into(), online: false, created_at: 1_800_000_001 }]
         );
+    }
+
+    /// 顺序按 `(sort, id)`,与真宿主 `ORDER BY sort, id` 一致——`sort` 可打乱 id 序。
+    #[test]
+    fn nodes_are_ordered_by_sort_then_id() {
+        let nodes = ContractNodes::new();
+        nodes.add_node(1, "a", 1);
+        nodes.add_node(2, "b", 2);
+        nodes.add_node(3, "c", 3);
+        nodes.set_sort(1, 9); // a 排到最后
+        nodes.set_sort(3, -1); // c 排到最前
+        let ids: Vec<i64> = nodes.list().into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
     }
 }
