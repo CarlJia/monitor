@@ -49,11 +49,20 @@ export type Node = {
   month_start: string
   /** Panel only. */
   hostname?: string
-  /** ISO 3166-1 alpha-2, derived from the address the agent connects from. */
+  /** ISO 3166-1 alpha-2, derived from the node's address. */
   country: string
   ip?: string
   ipv4?: string
   ipv6?: string
+  /**
+   * Panel only. Where this node's last connection arrived from, as the hub
+   * observed it, or empty for a node that has not connected since the hub
+   * started keeping it. The panel prefers an address the node reported about
+   * itself and falls back to this one; `ip` is not an input to that choice —
+   * it holds the address the country lookup keys on, which may be one the node
+   * reported about itself.
+   */
+  observed_ip?: string
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
@@ -101,19 +110,58 @@ function isLocalV4(ip: string): boolean {
 }
 
 /**
- * The addresses shown for a node. The agent reports its interfaces; `ip` is
- * where its connection arrived from, which the hub canonicalizes to dotted form
- * for IPv4. Behind NAT the interface holds only a private IPv4 while the
- * connection arrives from the public one, so that address leads. `ip` alone is
- * also the fallback for an agent too old to report its interfaces.
+ * Not globally routable. Only 2000::/3 is, so the complement is local — and the
+ * documentation/reserved ranges inside it are excluded too, mirroring the way
+ * `isLocalV4` excludes the v4 test nets instead of treating every dotted
+ * quad as reachable.
  */
-export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  const { ip } = node
-  if (!ip) return reported
-  if (node.ipv4 && isLocalV4(node.ipv4) && ip.includes(".") && !isLocalV4(ip)) return [ip, ...reported]
-  return reported.length ? reported : [ip]
+function isLocalV6(ip: string): boolean {
+  const lower = ip.toLowerCase()
+  for (const reserved of ["2001:db8:", "2001:2:", "2001:0:"]) {
+    if (lower === reserved.slice(0, -1) || lower.startsWith(reserved)) return true
+  }
+  const head = Number.parseInt(lower.split(":")[0] ?? "", 16)
+  return !Number.isFinite(head) || (head & 0xe000) !== 0x2000
 }
+
+/**
+ * The addresses shown for a node, split by family: IPv4 on one line, IPv6 on
+ * the next. Within a family the reachable address leads and a private one
+ * follows, because pasting either into an ssh command is why they are shown.
+ *
+ * The reachable address is the one the node reported about itself when it has
+ * one — it is not affected by whatever proxy or CDN fronts the hub — and the
+ * address the hub observed the node's connection from otherwise. A node behind
+ * NAT reports only its private interface, so the observed address is the only
+ * evidence of where it can be reached; `ip` is not consulted, being the geo
+ * address the country lookup keys on rather than an observation.
+ *
+ * Only a globally routable observed address is adopted: a private, loopback,
+ * link-local or CGNAT one would be the proxy the hub sits behind, printed as if
+ * it were the node's own.
+ */
+export function addresses(node: Pick<Node, "observed_ip" | "ipv4" | "ipv6">): AddressLines {
+  const own = { v4: node.ipv4, v6: node.ipv6 }
+  const local = { v4: isLocalV4, v6: isLocalV6 }
+  const observed = node.observed_ip ?? ""
+  const observedFamily = observed.includes(":") ? "v6" : observed.includes(".") ? "v4" : ""
+
+  const lines: AddressLines = { v4: [], v6: [] }
+  for (const family of ["v4", "v6"] as const) {
+    const mine = own[family]
+    const isLocal = local[family]
+    const fromReport = mine && !isLocal(mine) ? mine : ""
+    const fromObserved =
+      !fromReport && family === observedFamily && observed && !isLocal(observed) ? observed : ""
+    const reachable = fromReport || fromObserved
+    if (reachable) lines[family].push(reachable)
+    if (mine && isLocal(mine)) lines[family].push(mine)
+  }
+  return lines
+}
+
+/** One line per address family, each holding reachable addresses before private ones. */
+export type AddressLines = { v4: string[]; v6: string[] }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {

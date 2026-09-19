@@ -233,21 +233,55 @@ assert.equal(toastKind(undefined), "success")
 assert.equal(toastKind("warn"), "success")
 assert.equal(toastKind(""), "success")
 
-// NAT: the public address the connection arrived from leads the private interface.
-assert.deepEqual(addresses({ ip: "8.8.8.8", ipv4: "10.10.2.250", ipv6: "2001:db8::1" }), ["8.8.8.8", "10.10.2.250", "2001:db8::1"])
-assert.deepEqual(addresses({ ip: "8.8.8.8", ipv4: "100.64.0.9" }), ["8.8.8.8", "100.64.0.9"])
-// Hub on the same network, or on the same machine: the connection says nothing more.
-assert.deepEqual(addresses({ ip: "192.168.1.2", ipv4: "192.168.1.5" }), ["192.168.1.5"])
-assert.deepEqual(addresses({ ip: "127.0.0.1", ipv4: "172.16.0.5" }), ["172.16.0.5"])
-// IANA special-purpose ranges (TEST-NET-2/3, reserved) are now correctly local;
-// 203.0.113.7 / 198.51.100.5 no longer count as a "public" connection source.
-assert.deepEqual(addresses({ ip: "203.0.113.7", ipv4: "10.10.2.250" }), ["10.10.2.250"])
-assert.deepEqual(addresses({ ip: "198.51.100.1", ipv4: "198.51.100.5" }), ["198.51.100.5"])
-// A public interface, or a connection over IPv6, stays as reported.
-assert.deepEqual(addresses({ ip: "198.51.100.1", ipv4: "203.0.113.7" }), ["203.0.113.7"])
-assert.deepEqual(addresses({ ip: "2001:db8::2", ipv4: "10.0.0.2", ipv6: "2001:db8::2" }), ["10.0.0.2", "2001:db8::2"])
-// Without a recorded connection the list holds only what the agent reported.
-assert.deepEqual(addresses({ ipv4: "10.0.0.2" }), ["10.0.0.2"])
-assert.deepEqual(addresses({}), [])
+// 面板按地址族择优:每族先给可达地址(agent 自报的公网优先,它没报才用 hub
+// 观察到的),再把 agent 自报的内网地址排在后面。ip 不是输入——它存的是
+// country 失效判断所依据的地理地址,可能本来就是节点自报的地址。
+const pub6 = "2001:b030:112d:71f::45"
+
+// AE1:内网 v4 + 公网 v6,连接从公网 v4 来。
+assert.deepEqual(addresses({ observed_ip: "8.8.8.8", ipv4: "192.168.1.25", ipv6: pub6 }), {
+  v4: ["8.8.8.8", "192.168.1.25"],
+  v6: [pub6],
+})
+// AE2:只有内网 v4,观察值是公网 v4 —— 第二行为空,不渲染。
+assert.deepEqual(addresses({ observed_ip: "8.8.8.8", ipv4: "192.168.1.25" }), {
+  v4: ["8.8.8.8", "192.168.1.25"],
+  v6: [],
+})
+// AE3:自有公网 v6,观察值也是 v6 —— 该族已有自报公网,观察值不采用。
+assert.deepEqual(addresses({ observed_ip: pub6, ipv4: "192.168.1.25", ipv6: pub6 }), {
+  v4: ["192.168.1.25"],
+  v6: [pub6],
+})
+// AE4:非公网的观察值一律忽略——CGNAT、TEST-NET、以及 v6 的文档段。
+assert.deepEqual(addresses({ observed_ip: "100.64.0.9", ipv4: "192.168.1.25" }), {
+  v4: ["192.168.1.25"],
+  v6: [],
+})
+assert.deepEqual(addresses({ observed_ip: "203.0.113.7", ipv4: "192.168.1.25" }), {
+  v4: ["192.168.1.25"],
+  v6: [],
+})
+assert.deepEqual(addresses({ observed_ip: "2001:db8::2", ipv4: "192.168.1.25" }), {
+  v4: ["192.168.1.25"],
+  v6: [],
+})
+// 自报的公网 v4 优先于观察值。
+assert.deepEqual(addresses({ observed_ip: "8.8.8.8", ipv4: "9.9.9.9" }), { v4: ["9.9.9.9"], v6: [] })
+// 观察值是 v6 时只进 v6 那一格,不影响 v4 那一格。
+assert.deepEqual(addresses({ observed_ip: pub6, ipv4: "9.9.9.9" }), { v4: ["9.9.9.9"], v6: [pub6] })
+// 自报的内网地址始终保留,排在可达地址之后。
+assert.deepEqual(addresses({ ipv4: "192.168.1.25", ipv6: "fe80::1" }), {
+  v4: ["192.168.1.25"],
+  v6: ["fe80::1"],
+})
+// 观察值为空(升级后尚未握手)时,只用节点自报的地址。
+assert.deepEqual(addresses({ observed_ip: "", ipv4: "192.168.1.25" }), { v4: ["192.168.1.25"], v6: [] })
+// ip 不再是输入:即便 API 仍然返回它,面板也不显示它。这是有意的行为变化
+// ——代价是升级前就离线、之后不再重连的节点在面板上只剩自报地址。
+const withLegacyIp = { ip: "8.8.8.8", ipv4: "10.0.0.2" }
+assert.deepEqual(addresses(withLegacyIp), { v4: ["10.0.0.2"], v6: [] })
+// 两族都空时两行都空,调用方渲染整列占位符。
+assert.deepEqual(addresses({}), { v4: [], v6: [] })
 
 console.log("partial edits, traffic corrections, provisioning, page-vocabulary, address and dispatch-result checks passed")
