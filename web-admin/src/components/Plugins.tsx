@@ -23,10 +23,15 @@ import { ConfirmDialog } from "./ConfirmDialog"
 // 事件类型的徽标配色：与状态页的状态色同义——离线红、上线绿、到期橙。
 // key 是 ABI 的事件名，label 是日志筛选复选框上的人话。v2 起宿主自身的到期
 // 检测退役，到期提醒由财务插件经 emit_event 发出，事件名带 plugin_ 前缀。
+// 这张表还决定派发日志默认显示哪些事件（筛选框与行内徽标都从它派生），所以
+// 宿主新增的事件名要一并补在这里，否则它们被默认过滤掉、操作员看不到派发过。
 const EVENT_BADGES: Record<string, { label: string; className: string }> = {
   plugin_expiry_soon: { label: "到期提醒", className: "bg-orange-500/15 text-orange-700 dark:text-orange-400" },
   agent_offline: { label: "离线告警", className: "bg-red-500/15 text-red-700 dark:text-red-400" },
   agent_online: { label: "上线恢复", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
+  node_added: { label: "新增节点", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
+  node_deleted: { label: "删除节点", className: "bg-red-500/15 text-red-700 dark:text-red-400" },
+  tick: { label: "定时任务", className: "bg-slate-500/15 text-slate-700 dark:text-slate-400" },
 }
 
 // 启用绿 / 手动停用灰 / 加载失败红。失败判定先于 enabled：后端回滚 enabled 前，

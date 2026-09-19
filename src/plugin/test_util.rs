@@ -23,6 +23,31 @@ pub(crate) const MINIMAL_WAT: &str = r#"
     (local.get $ptr))
   (func (export "on_event") (param i32 i32) (result i32) (i32.const 0)))"#;
 
+/// on_event 往自己的 kv 命名空间写 called=1:被派发没被派发,db 里见。
+pub(crate) const KV_CALLED_WAT: &str = r#"
+(module
+  (import "host" "kv_set" (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "called")
+  (data (i32.const 2048) "1")
+  (func (export "__alloc") (param $cap i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32)
+    (drop (call $kv_set (i32.const 1024) (i32.const 6) (i32.const 2048) (i32.const 1)))
+    (i32.const 0)))"#;
+
+/// on_tick 往自己的 kv 命名空间写 called=1:被 tick 没被 tick,db 里见。
+pub(crate) const KV_TICK_WAT: &str = r#"
+(module
+  (import "host" "kv_set" (func $kv_set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "called")
+  (data (i32.const 2048) "1")
+  (func (export "__alloc") (param $cap i32) (result i32) (i32.const 8192))
+  (func (export "on_event") (param i32 i32) (result i32) (i32.const 0))
+  (func (export "on_tick") (result i32)
+    (drop (call $kv_set (i32.const 1024) (i32.const 6) (i32.const 2048) (i32.const 1)))
+    (i32.const 0)))"#;
+
 /// 通过 manifest 校验的标准测试 manifest(v2):订阅一个宿主事件与一个插件事件。
 pub(crate) const MANIFEST: &str = r#"
 plugin_id = "com.example.test"

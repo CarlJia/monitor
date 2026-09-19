@@ -735,6 +735,32 @@ impl Db {
             .optional()?)
     }
 
+    /// `(id, name, created_at)` for every node — the projection the
+    /// `nodes_query` host function sends to WASM guests. Deliberately not
+    /// [`Node`]: a guest gets identity and display name only, never the token it
+    /// authenticates with or the rest of a node's configuration.
+    pub fn node_basics(&self) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name, created_at FROM node ORDER BY sort, id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A node's `(name, created_at)` — what the notification bus needs to
+    /// announce a lifecycle change. One row, one query.
+    ///
+    /// `created_at` is half of a node's identity: it survives SQLite handing a
+    /// deleted node's id to the next node created, so a subscriber can tell
+    /// "this machine is gone" from "this id now belongs to another machine".
+    pub fn node_identity(&self, id: i64) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT name, created_at FROM node WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
     /// Creates a node and returns its id.
     ///
     /// Both rows or neither: `accumulate` reads the `traffic` row on every

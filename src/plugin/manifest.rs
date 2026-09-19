@@ -18,7 +18,7 @@ pub const ABI_VERSION: i64 = 2;
 /// 插件事件名(具体名不做白名单——事件由各插件运行时经 `emit_event` 发出,
 /// 宿主无法预知全集,校验只查前缀与非空后缀)。manifest 声明订阅未来才有
 /// 的宿主事件名仍会被拒:静默接受会让拼写错误无声失效,显式契约尽早暴露错误。
-pub const KNOWN_EVENT_NAMES: [&str; 2] = Event::KNOWN;
+pub const KNOWN_EVENT_NAMES: [&str; Event::KNOWN.len()] = Event::KNOWN;
 
 /// `plugin_` 前缀:插件发出的事件名的强制前缀(KTD6)。
 pub const PLUGIN_EVENT_PREFIX: &str = "plugin_";
@@ -28,7 +28,7 @@ pub const PLUGIN_EVENT_PREFIX: &str = "plugin_";
 /// 列表、每次「测试」的必填预检和配置对话框各自放大一遍。
 const KV_DECL_MAX: usize = 64;
 
-/// `subscribes` 的条数上限。v2 的宿主事件只有两个,其余靠 `plugin_` 前缀自由
+/// `subscribes` 的条数上限。v2 的宿主事件只有四个,其余靠 `plugin_` 前缀自由
 /// 命名;32 条同样远超需要,挡的是同一类放大(每次派发都要逐条比对)。
 const SUBSCRIBE_MAX: usize = 32;
 

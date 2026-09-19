@@ -337,8 +337,28 @@ pub async fn enable_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i
     if let Err(e) = app.db.set_plugin_enabled(id, true) {
         return fail(e);
     }
-    match app.plugins.write().unwrap_or_else(|e| e.into_inner()).enable_plugin(&app, id) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+    // 写锁在派发 tick 之前必须收掉:插件执行会取同一把读锁,guard 若活到 match
+    // 结束,这次 tick 就是 dispatch_ticks 文档里写的那种自死锁。
+    let loaded = {
+        let mut registry = app.plugins.write().unwrap_or_else(|e| e.into_inner());
+        registry.enable_plugin(&app, id)
+    };
+    match loaded {
+        Ok(()) => {
+            // 启用即刻对它跑一次 tick:插件禁用期间宿主发生的变更不会派发给它,
+            // 只能靠这次(以及它自己的定时 tick)对齐。wasm 是 CPU 活,挪进
+            // blocking 线程;不 await——插件 tick 里可能有网络往返,最长会占满
+            // 钩子超时,不该拖住这个响应。句柄仍要跟一下:调度失败或被取消时,
+            // 面板那次「启用」看起来一切正常,而这次对齐根本没跑过。
+            let app = app.clone();
+            let tick = tokio::task::spawn_blocking(move || plugin::Registry::dispatch_tick_one(&app, id));
+            tokio::spawn(async move {
+                if let Err(e) = tick.await {
+                    warn!(plugin = id, "启用即 tick 没有跑完: {e}");
+                }
+            });
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => {
             let message = format!("{e:#}");
             // 回滚开关并保住 failed 状态:`set_plugin_enabled(false)` 会把
@@ -692,7 +712,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     // 与 plugin.rs 共享的最小合法模块:加载、启停、测试与日志全都用它。
-    use crate::plugin::MINIMAL_WAT;
+    use crate::plugin::{KV_TICK_WAT, MINIMAL_WAT};
 
     fn plugin_manifest(plugin_id: &str, abi_version: i64) -> String {
         plugin_manifest_at(plugin_id, abi_version, "1.0.0")
@@ -1136,6 +1156,66 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(test_plugin(Admin, State(app.clone()), Path(9999)).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 声明 `tick` 的 manifest 加一个会写 kv 的 on_tick 模块。
+    fn tick_archive(plugin_id: &str) -> Vec<u8> {
+        let manifest = format!(
+            "plugin_id = \"{plugin_id}\"\nname = \"Test Plugin\"\nversion = \"1.0.0\"\n\
+             abi_version = 2\nsubscribes = []\ntick = true\n"
+        );
+        tarball(&[
+            ("plugin.toml", manifest.into_bytes()),
+            ("plugin.wasm", wat::parse_str(KV_TICK_WAT).unwrap()),
+        ])
+    }
+
+    /// 启用即 tick 走的是 spawn_blocking 上的 fire-and-forget:轮询到它落账。
+    async fn until_tick(app: &App) {
+        for _ in 0..400 {
+            if !app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("启用即 tick 在 10 秒内没有落账");
+    }
+
+    /// 启用插件成功后宿主立刻跑一次它的 tick:插件停用期间发生的变更不会派发给
+    /// 它(它在内存里根本不存在),只能靠这次和它自己的定时 tick 补上。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabling_a_plugin_runs_one_tick() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, tick_archive("com.example.ticker")).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(app.db.get("plugin.com.example.ticker:called"), None, "启用之前不该跑过 tick");
+
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        until_tick(&app).await;
+        let entries = app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot();
+        assert_eq!(entries.len(), 1, "启用只跑一次 tick:{entries:?}");
+        assert_eq!(entries[0].plugin_id, "com.example.ticker");
+        assert_eq!(entries[0].event_type, "tick");
+        assert_eq!(entries[0].result, "success", "{entries:?}");
+        assert_eq!(app.db.get("plugin.com.example.ticker:called").as_deref(), Some("1"));
+    }
+
+    /// 启动时的预加载**不**触发 tick:那条路径恢复的是「已启用」这件事本身,
+    /// 不是一次启用动作——否则每重启一次,每个 tick 插件都白跑一轮。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preloading_enabled_plugins_does_not_tick_them() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, tick_archive("com.example.ticker")).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        app.db.set_plugin_enabled(id, true).unwrap();
+
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).init(&app);
+        assert!(app.plugins.read().unwrap_or_else(|e| e.into_inner()).is_loaded(id), "预加载要把它装进来");
+        assert_eq!(app.db.get("plugin.com.example.ticker:called"), None, "预加载不该触发 tick");
+        assert!(
+            app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot().is_empty(),
+            "预加载不该留 tick 记录"
+        );
     }
 
     /// manifest 声明了必填配置时,「测试」前宿主先预检:缺项直接 400 点名,而不是

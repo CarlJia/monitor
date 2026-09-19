@@ -25,10 +25,18 @@ use crate::App;
 /// KTD6). `plugin_expiry_soon` replaces the retired host-side `expiry_soon`
 /// and carries the same payload fields (`node_id`, `name`, `expires_at`,
 /// `days_left`, `threshold_days`).
+///
+/// v2 also carries the node lifecycle: `NodeAdded` when a node row is created
+/// (panel or automatic registration) and `NodeDeleted` when one is removed.
+/// Both carry the node's own `created_at`, because a subscriber has to tell one
+/// *machine* from another -- SQLite hands a deleted node's id to the next node
+/// created -- and the two can reach a subscriber out of order.
 #[derive(Debug, Clone)]
 pub enum Event {
     AgentOffline { node_id: i64, name: String, observed_at: i64, last_seen_at: i64 },
     AgentOnline { node_id: i64, name: String, observed_at: i64 },
+    NodeAdded { node_id: i64, name: String, created_at: i64 },
+    NodeDeleted { node_id: i64, name: String, created_at: i64 },
     Plugin { name: String, payload: serde_json::Value },
 }
 
@@ -58,6 +66,15 @@ impl serde::Serialize for Event {
                 m.serialize_entry("observed_at", observed_at)?;
                 m.end()
             }
+            Event::NodeAdded { node_id, name, created_at }
+            | Event::NodeDeleted { node_id, name, created_at } => {
+                let mut m = s.serialize_map(Some(4))?;
+                m.serialize_entry("type", self.type_name())?;
+                m.serialize_entry("node_id", node_id)?;
+                m.serialize_entry("name", name)?;
+                m.serialize_entry("created_at", created_at)?;
+                m.end()
+            }
             Event::Plugin { name, payload } => {
                 let mut m = s.serialize_map(None)?;
                 m.serialize_entry("type", name)?;
@@ -81,8 +98,11 @@ impl Event {
     /// 词表内——它们由各插件运行时发出,宿主无法预知全集。
     pub const AGENT_OFFLINE: &'static str = "agent_offline";
     pub const AGENT_ONLINE: &'static str = "agent_online";
+    pub const NODE_ADDED: &'static str = "node_added";
+    pub const NODE_DELETED: &'static str = "node_deleted";
     /// v2 支持的全部宿主自身事件名,manifest 的 `subscribes` 逐项对照。
-    pub const KNOWN: [&'static str; 2] = [Self::AGENT_OFFLINE, Self::AGENT_ONLINE];
+    pub const KNOWN: [&'static str; 4] =
+        [Self::AGENT_OFFLINE, Self::AGENT_ONLINE, Self::NODE_ADDED, Self::NODE_DELETED];
 
     /// The discriminator stored in `notification_log.event_type` and carried in
     /// the JSON `type` tag. A lifetime `&'static str` rather than a String:
@@ -91,20 +111,28 @@ impl Event {
         match self {
             Event::AgentOffline { .. } => Self::AGENT_OFFLINE,
             Event::AgentOnline { .. } => Self::AGENT_ONLINE,
+            Event::NodeAdded { .. } => Self::NODE_ADDED,
+            Event::NodeDeleted { .. } => Self::NODE_DELETED,
             Event::Plugin { name, .. } => name,
         }
     }
 
     pub fn node_id(&self) -> i64 {
         match self {
-            Event::AgentOffline { node_id, .. } | Event::AgentOnline { node_id, .. } => *node_id,
+            Event::AgentOffline { node_id, .. }
+            | Event::AgentOnline { node_id, .. }
+            | Event::NodeAdded { node_id, .. }
+            | Event::NodeDeleted { node_id, .. } => *node_id,
             Event::Plugin { payload, .. } => payload.get("node_id").and_then(|v| v.as_i64()).unwrap_or(0),
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Event::AgentOffline { name, .. } | Event::AgentOnline { name, .. } => name,
+            Event::AgentOffline { name, .. }
+            | Event::AgentOnline { name, .. }
+            | Event::NodeAdded { name, .. }
+            | Event::NodeDeleted { name, .. } => name,
             Event::Plugin { payload, .. } => payload.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
         }
     }
@@ -131,6 +159,9 @@ impl Event {
     pub fn threshold_or_state_key(&self) -> i64 {
         match self {
             Event::AgentOffline { .. } | Event::AgentOnline { .. } => 0,
+            // 身份取节点自己的创建时间戳:同一台机器的同一次创建只派发一次,
+            // 而 id 被复用后新建的那台是另一个值,不会被旧行抑制掉。
+            Event::NodeAdded { created_at, .. } | Event::NodeDeleted { created_at, .. } => *created_at,
             Event::Plugin { payload, .. } => {
                 let threshold = payload.get("threshold_days").and_then(|v| v.as_i64()).unwrap_or(0);
                 let day = payload
@@ -159,6 +190,11 @@ impl Event {
     /// True for the two sides of connectivity. State events are deduplicated
     /// by transition rather than by a content key: an offline node flapping
     /// its connection is one alert, not a stream of them.
+    ///
+    /// The node lifecycle events are *not* state events: `transition_state_event`
+    /// only knows the two connectivity sides, and every node event would look
+    /// like a transition into a side of its own — one row per emission, with no
+    /// deduplication to show for it. They carry their own key instead.
     pub fn is_state_event(&self) -> bool {
         matches!(self, Event::AgentOffline { .. } | Event::AgentOnline { .. })
     }
@@ -313,6 +349,56 @@ mod tests {
         assert_eq!(online.threshold_or_state_key(), 0);
         assert!(offline.is_state_event() && online.is_state_event());
         assert!(!expiry(1, "2026-10-01", 7, 7).is_state_event());
+
+        // 节点事件按创建时间戳定身份,不是状态事件。
+        let added = Event::NodeAdded { node_id: 1, name: String::new(), created_at: 4_242 };
+        let deleted = Event::NodeDeleted { node_id: 1, name: String::new(), created_at: 4_242 };
+        assert_eq!(added.threshold_or_state_key(), 4_242);
+        assert_eq!(deleted.threshold_or_state_key(), 4_242);
+        assert!(!added.is_state_event() && !deleted.is_state_event());
+    }
+
+    /// 节点事件按创建时间戳去重:同一台机器只派发一次,而 id 被复用后新建的
+    /// 那台是另一个键——订阅者不会漏掉「这个 id 换了机器」这件事。
+    #[test]
+    fn node_events_are_keyed_by_creation_not_by_id() {
+        let app = app();
+        let first = Event::NodeAdded { node_id: 5, name: "edge-1".into(), created_at: 100 };
+        emit(&app, &first).unwrap();
+        emit(&app, &first).unwrap();
+        assert_eq!(app.plugins.read().unwrap().dispatch_count(), 1, "同一次创建只派发一次");
+
+        // id 被复用:同一个 id、新的创建时间,是另一台机器,必须派发。
+        let second = Event::NodeAdded { node_id: 5, name: "edge-2".into(), created_at: 900 };
+        emit(&app, &second).unwrap();
+        assert_eq!(app.plugins.read().unwrap().dispatch_count(), 2, "复用 id 的新机器不能被旧行吞掉");
+    }
+
+    /// 节点生命周期事件不碰连通性状态:那对「在线/离线」行按节点只存一侧,
+    /// 节点事件挤进去会让离线扫描读到错误的当前状态。
+    #[test]
+    fn node_events_do_not_touch_connectivity_state() {
+        let app = app();
+        emit(&app, &Event::NodeAdded { node_id: 5, name: "edge-1".into(), created_at: 100 }).unwrap();
+        emit(&app, &Event::NodeDeleted { node_id: 5, name: "edge-1".into(), created_at: 100 }).unwrap();
+        assert_eq!(app.db.current_state_event(5).unwrap(), None, "节点事件不写连通性状态行");
+        assert_eq!(app.plugins.read().unwrap().dispatch_count(), 2, "两个事件照常派发");
+    }
+
+    /// 每个宿主事件的 `type_name` 都必须在 `KNOWN` 词表里:manifest 的 `subscribes`
+    /// 校验、db 的状态行与扫描循环共用这一份词表,漏掉一个就等于那个事件谁也没法
+    /// 订阅——而代码仍然编译通过。
+    #[test]
+    fn every_host_variant_is_in_the_known_vocabulary() {
+        let all = [
+            Event::AgentOffline { node_id: 1, name: String::new(), observed_at: 0, last_seen_at: 0 },
+            Event::AgentOnline { node_id: 1, name: String::new(), observed_at: 0 },
+            Event::NodeAdded { node_id: 1, name: String::new(), created_at: 0 },
+            Event::NodeDeleted { node_id: 1, name: String::new(), created_at: 0 },
+        ];
+        for event in &all {
+            assert!(Event::KNOWN.contains(&event.type_name()), "{} 不在 KNOWN 词表里", event.type_name());
+        }
     }
 
     /// The payload handed to a plugin, for U3/U8's ABI. Any change to this
@@ -350,6 +436,16 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"type":"agent_online","node_id":5,"name":"edge-1","observed_at":300}"#
+        );
+        let event = Event::NodeAdded { node_id: 5, name: "edge-1".into(), created_at: 100 };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"node_added","node_id":5,"name":"edge-1","created_at":100}"#
+        );
+        let event = Event::NodeDeleted { node_id: 5, name: "edge-1".into(), created_at: 100 };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"node_deleted","node_id":5,"name":"edge-1","created_at":100}"#
         );
     }
 }
