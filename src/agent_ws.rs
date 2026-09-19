@@ -254,7 +254,11 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<Stri
     match rpc.method.as_str() {
         "hello" => {
             let geo = geo_address(&rpc.params, ip);
-            let owed = app.db.save_facts(node_id, &rpc.params, &geo)?;
+            // `geo` keys the country lookup and feeds the geo address column;
+            // the observed address is kept separately so the panel has one
+            // piece of evidence about where this node is reachable from that
+            // the node itself does not get to report (R1).
+            let owed = app.db.save_facts(node_id, &rpc.params, &geo, ip)?;
             return Ok(owed.then_some(geo));
         }
         "report" => report(app, node_id, rpc.params)?,
@@ -766,6 +770,39 @@ mod tests {
         assert_eq!(n.hostname, "vps-1");
         assert_eq!(n.cpu_cores, 4);
         assert_eq!(n.ip, "198.51.100.4");
+        assert_eq!(n.observed_ip, "198.51.100.4");
+    }
+
+    /// The observed address is kept as its own fact, alongside the geo address
+    /// `ip` carries: it is the only evidence of where a NAT'd node is reachable
+    /// from that the node does not get to report about itself (R1).
+    #[test]
+    fn the_observed_address_is_recorded_beside_the_geo_address() {
+        let app = app();
+        let id = node(&app);
+        let hello = |v6: &str| {
+            json!({"jsonrpc": "2.0", "method": "hello",
+                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}})
+            .to_string()
+        };
+
+        // A public v6 is reported: `ip` keeps it and the peer is stored apart.
+        dispatch(&app, id, "104.23.175.81", &hello("2001:b030:112d:71f::45")).unwrap();
+        let n = app.db.node(id).unwrap().unwrap();
+        assert_eq!(n.ip, "2001:b030:112d:71f::45", "ip 仍是地理地址");
+        assert_eq!(n.observed_ip, "104.23.175.81", "观察地址另存");
+
+        // Only private addresses and a public peer: the geo fallback puts the
+        // peer in `ip`, and the observed column holds the same value.
+        dispatch(&app, id, "198.51.100.4", &hello("fe80::be24:11ff:fe83:c1b3")).unwrap();
+        let n = app.db.node(id).unwrap().unwrap();
+        assert_eq!(n.ip, "198.51.100.4");
+        assert_eq!(n.observed_ip, "198.51.100.4");
+
+        // A private peer is stored as-is: R4 judges publicness at display time,
+        // not here, so the write path keeps what it saw.
+        dispatch(&app, id, "192.168.1.9", &hello("fe80::be24:11ff:fe83:c1b3")).unwrap();
+        assert_eq!(app.db.node(id).unwrap().unwrap().observed_ip, "192.168.1.9");
     }
 
     /// Behind a CDN the peer address is an edge node that changes every

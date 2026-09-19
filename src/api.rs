@@ -141,6 +141,7 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
+        view["observed_ip"] = json!(node.observed_ip);
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
     }
@@ -2100,7 +2101,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "198.51.100.9").unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is
         // what a node token in the wrong hands can insert, and what the agent
@@ -2116,7 +2117,7 @@ mod tests {
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "remark", "hostname", "token"] {
+        for hidden in ["ip", "ipv4", "ipv6", "observed_ip", "remark", "hostname", "token"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2134,6 +2135,10 @@ mod tests {
         let admin = visible_nodes(&app, true).unwrap();
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
+        assert_eq!(
+            admin[0]["observed_ip"], "198.51.100.9",
+            "面板按地址族择优要用这一列,它必须随 ip/ipv4/ipv6 一起只出现在管理视图"
+        );
         assert_eq!(admin[0]["remark"], "secret note");
     }
 
@@ -2246,7 +2251,7 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9").unwrap();
+        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "198.51.100.9").unwrap();
 
         let public = live_snapshot(&app, false);
         let admin = live_snapshot(&app, true);
@@ -2410,6 +2415,7 @@ mod tests {
             .save_facts(
                 id,
                 &json!({"mem_total": 1_000, "swap_total": 1i64 << 30, "disk_total": 30i64 << 30}),
+                "ip",
                 "ip",
             )
             .unwrap();
