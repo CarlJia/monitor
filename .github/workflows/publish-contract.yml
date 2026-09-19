@@ -1,0 +1,46 @@
+name: publish-contract
+
+# A monitor-plugin-contract release is just a git tag other repos pull by
+# (`cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract
+#  --tag monitor-plugin-contract-vN`). There is no crates.io publish. This
+# workflow only *validates* the tag: it builds+tests the crate and checks the
+# tag's version equals the crate's own version, so a mistyped tag is caught
+# here instead of by a plugin repo's release failing to resolve it.
+#
+# It does not roll the tag back on mismatch (that would need write authority to
+# a pushed ref); a mismatch fails the run and notifies the maintainer to retag.
+
+on:
+  push:
+    tags:
+      - "monitor-plugin-contract-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag version matches the crate version
+        run: |
+          tag="${GITHUB_REF_NAME#monitor-plugin-contract-v}"   # 2.0.0 from monitor-plugin-contract-v2.0.0
+          cv=$(grep -m1 '^version' crates/monitor-plugin-contract/Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "tag=$tag crate=$cv"
+          if [ "$tag" != "$cv" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' does not match crate version '$cv' — retag"
+            exit 1
+          fi
+
+      - name: Contract major == ABI_VERSION
+        run: |
+          abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' src/plugin/manifest.rs | grep -oE '[0-9]+$')
+          cv=$(grep -m1 '^version' crates/monitor-plugin-contract/Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)
+          test "$cv" = "$abi" || { echo "::error::contract major $cv != ABI_VERSION $abi"; exit 1; }
+
+      - run: cargo test -p monitor-plugin-contract

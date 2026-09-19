@@ -57,6 +57,32 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  # The monitor-plugin-contract crate is a workspace member but NOT a default
+  # member, so the `check` job's `cargo test` above does not cover it. This job
+  # tests it and enforces the one invariant that can't live inside the crate
+  # itself (the crate is vendored by plugin repos, where monitor's manifest.rs
+  # doesn't exist): the crate's major version must equal the host's ABI_VERSION,
+  # so a host ABI bump and a contract release can never drift apart.
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version sync (contract major == ABI_VERSION)
+        run: |
+          abi=$(grep -oE 'pub const ABI_VERSION: i64 = [0-9]+' src/plugin/manifest.rs | grep -oE '[0-9]+$')
+          test -n "$abi" || { echo "::error::could not read ABI_VERSION"; exit 1; }
+          cv=$(grep -m1 '^version' crates/monitor-plugin-contract/Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)
+          test -n "$cv" || { echo "::error::could not read contract version"; exit 1; }
+          if [ "$cv" != "$abi" ]; then
+            echo "::error::contract major ($cv) != ABI_VERSION ($abi) — bump crates/monitor-plugin-contract/Cargo.toml with the ABI change"
+            exit 1
+          fi
+          echo "contract major $cv == ABI_VERSION $abi OK"
+      - run: cargo test -p monitor-plugin-contract
+
   # Plugin sources moved to CarlJia/monitor-hub-plugins, so a host-side ABI
   # change here (ABI_VERSION bump, or a plugin_id rename on the far side) no
   # longer shows up in this repo's tests — it would merge green and break the
