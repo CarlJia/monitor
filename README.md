@@ -10,8 +10,8 @@
 
 | 仓库 | 说明 |
 |---|---|
-| [monitor](https://github.com/monitor-probe/monitor) | hub：后台、API、公开页宿主 |
-| [agent](https://github.com/monitor-probe/agent) | Linux agent |
+| [monitor](https://github.com/CarlJia/monitor) | hub：后台、API、公开页宿主 |
+| [agent](https://github.com/CarlJia/agent) | Linux agent |
 | [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
 
 ```

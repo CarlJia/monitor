@@ -127,11 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`http_get` / `http_post` 插件目标**：必须是 https 且不得落在私有 / 保留网段（-9）；仅插件受此限，宿主自身调用不受影响。
 - **数据归属**：插件对宿主 node 表只读，业务数据由插件经 `plugin_data` 自持。
 
-[Unreleased]: https://github.com/monitor-probe/monitor/compare/v2.0.3...HEAD
-[2.0.3]: https://github.com/monitor-probe/monitor/compare/v2.0.2...v2.0.3
-[2.0.2]: https://github.com/monitor-probe/monitor/compare/v2.0.1...v2.0.2
-[2.0.1]: https://github.com/monitor-probe/monitor/compare/v1.2.1...v2.0.1
-[1.2.1]: https://github.com/monitor-probe/monitor/compare/v1.2.0...v1.2.1
-[1.2.0]: https://github.com/monitor-probe/monitor/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/monitor-probe/monitor/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/monitor-probe/monitor/releases/tag/v1.0.0
+[Unreleased]: https://github.com/CarlJia/monitor/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/CarlJia/monitor/compare/v2.0.2...v2.0.3
+[2.0.2]: https://github.com/CarlJia/monitor/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/CarlJia/monitor/compare/v1.2.1...v2.0.1
+[1.2.1]: https://github.com/CarlJia/monitor/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/CarlJia/monitor/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/CarlJia/monitor/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/CarlJia/monitor/releases/tag/v1.0.0
