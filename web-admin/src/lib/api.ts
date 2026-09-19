@@ -49,11 +49,20 @@ export type Node = {
   month_start: string
   /** Panel only. */
   hostname?: string
-  /** ISO 3166-1 alpha-2, derived from the address the agent connects from. */
+  /** ISO 3166-1 alpha-2, derived from the node's address. */
   country: string
   ip?: string
   ipv4?: string
   ipv6?: string
+  /**
+   * Panel only. Where this node's last connection arrived from, as the hub
+   * observed it, or empty for a node that has not connected since the hub
+   * started keeping it. The panel prefers an address the node reported about
+   * itself and falls back to this one; `ip` is not an input to that choice —
+   * it holds the address the country lookup keys on, which may be one the node
+   * reported about itself.
+   */
+  observed_ip?: string
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
@@ -101,18 +110,67 @@ function isLocalV4(ip: string): boolean {
 }
 
 /**
- * The addresses shown for a node. The agent reports its interfaces; `ip` is
- * where its connection arrived from, which the hub canonicalizes to dotted form
- * for IPv4. Behind NAT the interface holds only a private IPv4 while the
- * connection arrives from the public one, so that address leads. `ip` alone is
- * also the fallback for an agent too old to report its interfaces.
+ * Not globally routable. Only 2000::/3 is, so the complement is local — and the
+ * documentation/reserved ranges inside it are excluded too, mirroring the way
+ * `isLocalV4` excludes the v4 test nets instead of treating every dotted
+ * quad as reachable.
  */
-export function addresses(node: Pick<Node, "ip" | "ipv4" | "ipv6">): string[] {
-  const reported = [node.ipv4, node.ipv6].filter(Boolean) as string[]
-  const { ip } = node
-  if (!ip) return reported
-  if (node.ipv4 && isLocalV4(node.ipv4) && ip.includes(".") && !isLocalV4(ip)) return [ip, ...reported]
-  return reported.length ? reported : [ip]
+function isLocalV6(ip: string): boolean {
+  const lower = ip.toLowerCase()
+  // The documentation and reserved ranges, matching the way `isLocalV4`
+  // excludes the v4 test nets rather than calling every dotted quad reachable:
+  // 2001:db8::/32, 2001:2::/48, and Teredo's 2001::/32.
+  for (const reserved of ["2001:db8", "2001:2", "2001:0"]) {
+    if (lower === reserved || lower.startsWith(`${reserved}:`)) return true
+  }
+  const head = Number.parseInt(lower.split(":")[0] ?? "", 16)
+  return !Number.isFinite(head) || (head & 0xe000) !== 0x2000
+}
+
+/** One line per address family, each holding reachable addresses before private ones. */
+export type AddressLines = { v4: string[]; v6: string[] }
+
+/**
+ * The addresses shown for a node, split by family: IPv4 on one line, IPv6 on
+ * the next. Within a family the reachable address leads and a private one
+ * follows, because pasting either into an ssh command is why they are shown.
+ *
+ * The reachable address is the one the node reported about itself when it has
+ * one — it is not affected by whatever proxy or CDN fronts the hub — and the
+ * address the hub observed the node's connection from otherwise. A node behind
+ * NAT reports only its private interface, so the observed address is the only
+ * evidence of where it can be reached; `ip` is not consulted, being the geo
+ * address the country lookup keys on rather than an observation.
+ *
+ * Only a globally routable observed address is adopted: a private, loopback,
+ * link-local or CGNAT one would be the proxy the hub sits behind, printed as if
+ * it were the node's own.
+ */
+export function addresses(node: Pick<Node, "observed_ip" | "ipv4" | "ipv6">): AddressLines {
+  const own = { v4: node.ipv4, v6: node.ipv6 }
+  const isLocalOf = { v4: isLocalV4, v6: isLocalV6 }
+  // Where the kernel lets one socket serve both families, an IPv4 node's peer
+  // arrives as `::ffff:a.b.c.d` and is stored in that form. That is an IPv4
+  // address wearing a v6 wrapper: unwrap it, or the split below files it under
+  // v6 and the IPv4 line loses the only evidence of a reachable address it has.
+  const raw = node.observed_ip ?? ""
+  const observed = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(raw)?.[1] ?? raw
+  const observedFamily = observed.includes(":") ? "v6" : observed.includes(".") ? "v4" : ""
+
+  const lines: AddressLines = { v4: [], v6: [] }
+  for (const family of ["v4", "v6"] as const) {
+    const mine = own[family]
+    const isPrivate = Boolean(mine && isLocalOf[family](mine))
+    const reachable =
+      mine && !isPrivate
+        ? mine
+        : family === observedFamily && observed && !isLocalOf[family](observed)
+          ? observed
+          : ""
+    if (reachable) lines[family].push(reachable)
+    if (mine && isPrivate) lines[family].push(mine)
+  }
+  return lines
 }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */

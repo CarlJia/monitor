@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS node (
   swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
   agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
   ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+  -- The address this node's last connection was observed from, as the hub saw
+  -- it. Distinct from `ip`: that one holds the geo address the country lookup
+  -- keys on and may be an address the agent reported about itself, while this
+  -- one is evidence of where the connection actually arrived from.
+  observed_ip TEXT NOT NULL DEFAULT '',
   -- ISO 3166-1 alpha-2, looked up from `ip` once per address. Empty until the
   -- lookup answers, and empty is what a node whose country nobody could tell
   -- stays: the public page just leaves the badge off.
@@ -167,7 +172,7 @@ CREATE TABLE IF NOT EXISTS plugin_data (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// 两段式删列迁移(GATED_VERSION)未完成时停留的版本号。写成一个**绝对**的
 /// 常量而不是 `SCHEMA_VERSION - 1`:后者会随下一次升版一起漂走,把「v6 迁移
@@ -279,6 +284,28 @@ fn migrate_to_2(conn: &Connection) -> Result<()> {
 
 fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
+}
+
+/// v7 keeps the address a node's connection was observed from, so the panel can
+/// show a NAT'd node's reachable address without depending on what that node
+/// reported about itself.
+///
+/// The column belongs in `SCHEMA` as well, and the two halves are load-bearing
+/// in opposite directions. A fresh database is built from `SCHEMA` alone --
+/// `Db::open` passes `from = SCHEMA_VERSION`, so no migration runs -- and would
+/// therefore lack a column only the migration knows, failing every `save_facts`
+/// on the UPDATE. An old database reaches the column only through this
+/// migration, and `check_backup`'s reference is built from `SCHEMA`, so a
+/// column `SCHEMA` declares but this migration omits leaves a migrated backup
+/// short of it and the restore is refused as missing.
+///
+/// Runs regardless of the v6 column-drop gate, which can stay unfinished
+/// indefinitely: a database parked at `GATED_VERSION` would otherwise never get
+/// this column, and every report would fail on the UPDATE instead. The stamp
+/// stays `GATED_VERSION` there, so this runs again on each open and relies on
+/// `add_column` tolerating the duplicate.
+fn migrate_to_7(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "observed_ip TEXT NOT NULL DEFAULT ''")
 }
 
 /// v4 adds the `plugin` and `notification_log` tables and moves nothing. On a
@@ -407,6 +434,12 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     // v6 是条件迁移:财务列要等财务插件导入完才删。未完成时停在 GATED_VERSION
     // ——若照样 stamp 成 6,这一步就永远不会重跑,列再也删不掉。
     let at_six = if from < 6 { migrate_to_6(conn)? } else { true };
+    // v7 不挂在这个闸门上:它加的是别处都要用到的列,而 v6 可能永远完成不了,
+    // 停在 GATED_VERSION 的库若拿不到这一列,每次报告都会失败在 UPDATE 上。
+    // 于是它会随下次启动重跑,由 add_column 对重复列的容忍兜住。
+    if from < 7 {
+        migrate_to_7(conn)?;
+    }
     let stamped = if at_six { SCHEMA_VERSION } else { GATED_VERSION };
     conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
@@ -476,12 +509,17 @@ pub struct Node {
     pub agent_version: String,
     #[serde(default)]
     pub ip: String,
-    /// Reported by the agent from its own interfaces, unlike `ip`, which is
-    /// merely the address the agent's connection originated from.
+    /// Reported by the agent from its own interfaces.
     #[serde(default)]
     pub ipv4: String,
     #[serde(default)]
     pub ipv6: String,
+    /// Where this node's last connection arrived from, as the hub observed it,
+    /// or empty for a node that has not connected since this column existed.
+    /// The panel prefers an address the agent reported about itself and falls
+    /// back to this one; `ip` is not an input to that choice.
+    #[serde(default)]
+    pub observed_ip: String,
     /// ISO 3166-1 alpha-2 for `ip`, uppercase, or empty when unknown. Public: it
     /// appears on the status page beside the node's name.
     #[serde(default)]
@@ -813,7 +851,7 @@ impl Db {
     /// A new address invalidates the previous country, so the two move together in
     /// one statement: `SET` reads the row as it was, so the comparison is against
     /// the stored address rather than the one being written.
-    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<bool> {
+    pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, observed_ip: &str) -> Result<bool> {
         // The same rule `api::agent_register` applies to the name it receives:
         // these values come from an unvouched machine, control characters break
         // the panel's rows, and the length must be bounded. Six of them -- os,
@@ -836,7 +874,7 @@ impl Db {
         conn.execute(
             "UPDATE node SET hostname=?2, os=?3, kernel=?4, arch=?5, virt=?6, cpu_name=?7,
                              cpu_cores=?8, mem_total=?9, swap_total=?10, disk_total=?11,
-                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15,
+                             agent_version=?12, ip=?13, ipv4=?14, ipv6=?15, observed_ip=?16,
                              country=CASE WHEN ip=?13 THEN country ELSE '' END
              WHERE id=?1",
             params![
@@ -854,7 +892,8 @@ impl Db {
                 s("agent_version"),
                 ip,
                 s("ipv4"),
-                s("ipv6")
+                s("ipv6"),
+                observed_ip
             ],
         )?;
         Ok(conn.query_row("SELECT country = '' FROM node WHERE id=?1", [id], |r| r.get(0))?)
@@ -1845,6 +1884,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ip: s("ip"),
         ipv4: s("ipv4"),
         ipv6: s("ipv6"),
+        observed_ip: s("observed_ip"),
         country: s("country"),
         last_seen: n("last_seen"),
         token: s("token"),
@@ -2126,7 +2166,7 @@ mod tests {
         let db = db();
         let id = node(&db, 1);
         let facts = serde_json::json!({"hostname": "h"});
-        let save = |ip: &str| db.save_facts(id, &facts, ip).unwrap();
+        let save = |ip: &str| db.save_facts(id, &facts, ip, "").unwrap();
         let stored = || db.node(id).unwrap().unwrap().country;
 
         assert!(save("198.51.100.4"), "a node with no country is owed a lookup");
@@ -2460,11 +2500,36 @@ mod tests {
     fn facts_from_an_unvouched_machine_cannot_choose_their_own_length() {
         let db = db();
         let id = node(&db, 1);
-        db.save_facts(id, &serde_json::json!({"os": "A".repeat(10_000), "hostname": "x\u{7}y"}), "ip")
+        db.save_facts(id, &serde_json::json!({"os": "A".repeat(10_000), "hostname": "x\u{7}y"}), "ip", "")
             .unwrap();
         let stored = db.node(id).unwrap().unwrap();
         assert_eq!(stored.os.chars().count(), 128);
         assert_eq!(stored.hostname, "xy", "control characters break the panel's rows");
+    }
+
+    /// The observed address is its own fact, not the geo address in `ip`: the
+    /// panel reads it as the fallback for a node whose own interfaces are
+    /// private, so it must round-trip untouched and leave `country` alone.
+    #[test]
+    fn the_observed_address_is_stored_beside_the_geo_address() {
+        let db = db();
+        let id = node(&db, 1);
+        let facts = serde_json::json!({"ipv6": "2001:db8::1", "ipv4": "192.168.1.25"});
+
+        db.save_facts(id, &facts, "2001:db8::1", "198.51.100.7").unwrap();
+        let stored = db.node(id).unwrap().unwrap();
+        assert_eq!(stored.ip, "2001:db8::1", "ip 仍是地理地址");
+        assert_eq!(stored.ipv4, "192.168.1.25");
+        assert_eq!(stored.observed_ip, "198.51.100.7");
+
+        // 只换观察值不清空 country:失效判断只挂在 `ip` 上。
+        db.set_country(id, "US", "2001:db8::1").unwrap();
+        db.save_facts(id, &facts, "2001:db8::1", "203.0.113.9").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().country, "US", "观察值变化不清空 country");
+
+        // 空串表示这次没有可用的观察值,是允许的状态。
+        db.save_facts(id, &facts, "2001:db8::1", "").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().observed_ip, "");
     }
 
     /// A correction must survive the node's return. `all_traffic` gates the month
@@ -2789,10 +2854,10 @@ mod tests {
     /// also never grows the retired financial columns: `SCHEMA` no longer
     /// declares them.
     #[test]
-    fn a_fresh_database_is_on_schema_v6_with_the_new_tables() {
+    fn a_fresh_database_is_on_schema_v7_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
         let table = |name: &str| {
             conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
                 r.get::<_, i64>(0)
@@ -2806,6 +2871,7 @@ mod tests {
         for retired in ["price", "currency", "billing_cycle", "expires_at"] {
             assert!(!node_columns.contains(retired), "新库不该带退役列 {retired}");
         }
+        assert!(node_columns.contains("observed_ip"), "新库必须自己就带这一列,否则 save_facts 一写就失败");
         drop(conn);
 
         assert!(TABLES.contains(&"plugin"));
@@ -2818,7 +2884,7 @@ mod tests {
     /// held. Opening the result again must not redo anything that cannot be
     /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v6_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v7_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -2839,7 +2905,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = conn
                 .query_row(
@@ -2856,11 +2922,126 @@ mod tests {
         // Reopening is a no-op: the migration chain stops before the stamp.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
         drop(again);
         let _ = std::fs::remove_file(&file);
     }
 
+    /// v7 adds `observed_ip` to an existing database.
+    ///
+    /// The fixture is a hand-written v6 `node` list, not `SCHEMA` minus some
+    /// tables: `SCHEMA` already declares the new column, so a fixture derived
+    /// from it would carry the column itself, `migrate_to_7` would never run,
+    /// and the test would stay green with the migration deleted.
+    #[test]
+    fn a_v6_database_gains_the_observed_address_column() {
+        let file = std::env::temp_dir().join(format!("monitor-v6-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE node (
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL,
+               token TEXT NOT NULL UNIQUE,
+               sort INTEGER NOT NULL DEFAULT 0,
+               public INTEGER NOT NULL DEFAULT 1,
+               remark TEXT NOT NULL DEFAULT '',
+               traffic_limit INTEGER NOT NULL DEFAULT 0,
+               traffic_mode TEXT NOT NULL DEFAULT 'sum',
+               traffic_reset_day INTEGER NOT NULL DEFAULT 1,
+               hostname TEXT NOT NULL DEFAULT '', os TEXT NOT NULL DEFAULT '',
+               kernel TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '',
+               virt TEXT NOT NULL DEFAULT '', cpu_name TEXT NOT NULL DEFAULT '',
+               cpu_cores INTEGER NOT NULL DEFAULT 0, mem_total INTEGER NOT NULL DEFAULT 0,
+               swap_total INTEGER NOT NULL DEFAULT 0, disk_total INTEGER NOT NULL DEFAULT 0,
+               agent_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '',
+               ipv4 TEXT NOT NULL DEFAULT '', ipv6 TEXT NOT NULL DEFAULT '',
+               country TEXT NOT NULL DEFAULT '',
+               last_seen INTEGER NOT NULL DEFAULT 0,
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        assert!(
+            !columns_of(&old, "node").unwrap().contains("observed_ip"),
+            "夹具必须真的没有这一列,否则这个测试没有判别力"
+        );
+        drop(old);
+
+        let db = Db::open(path).unwrap();
+        let conn = db.conn();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert!(columns_of(&conn, "node").unwrap().contains("observed_ip"), "migrate_to_7 必须加上这一列");
+        drop(conn);
+        assert_eq!(db.nodes().unwrap().len(), 1, "升级保留原有节点");
+        // 迁移上来的库要能通过恢复校验:缺 DDL 时这一条会以 missing 拒收。
+        db.check_backup(path).expect("a migrated database must pass the backup gate");
+        drop(db);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A database parked at `GATED_VERSION`: the v6 column-drop gate is still
+    /// shut, so the stamp stays at 5 and `migrate_to_7` runs again on every
+    /// open. The column must still arrive -- it deliberately does not sit
+    /// behind that gate -- and the re-run must be tolerated.
+    ///
+    /// The fixture drops `observed_ip` from a `SCHEMA`-built database on
+    /// purpose: `SCHEMA` declares the column, so a fixture that kept it would
+    /// carry the very thing under test and prove nothing about the migration.
+    #[test]
+    fn a_database_parked_at_the_v6_gate_still_gains_the_observed_address_column() {
+        let file = std::env::temp_dir().join(format!("monitor-v5obs-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "ALTER TABLE node DROP COLUMN observed_ip;
+             INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);",
+        )
+        .unwrap();
+        // A real v5 database still carries the four financial columns the v6
+        // gate exists to drop; without them `migrate_to_6` finds nothing to do,
+        // reports the gate open, and the version advances -- which is a v6
+        // database, not the parked one under test.
+        for column in [
+            "price REAL NOT NULL DEFAULT 0",
+            "currency TEXT NOT NULL DEFAULT 'USD'",
+            "billing_cycle TEXT NOT NULL DEFAULT 'monthly'",
+            "expires_at TEXT",
+        ] {
+            old.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []).unwrap();
+        }
+        old.execute_batch("PRAGMA user_version = 5;").unwrap();
+        assert!(!columns_of(&old, "node").unwrap().contains("observed_ip"), "夹具必须真的没有这一列");
+        assert!(columns_of(&old, "node").unwrap().contains("price"), "夹具必须真的是 v5 形状");
+        drop(old);
+
+        // The gate is still shut, so the stamp must not advance past it...
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        // ...yet the column is there, because it is not behind that gate.
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("observed_ip"));
+        let id = db.nodes().unwrap()[0].id;
+        db.save_facts(id, &serde_json::json!({"hostname": "h"}), "8.8.8.8", "8.8.8.8").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().observed_ip, "8.8.8.8");
+        drop(db);
+
+        // Reopening re-runs the migration against a column that already exists;
+        // `add_column` tolerates the duplicate and the row survives.
+        let again = Db::open(path).unwrap();
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(again.node(id).unwrap().unwrap().observed_ip, "8.8.8.8");
+        drop(again);
+
+        let _ = std::fs::remove_file(&file);
+    }
     /// A database stamped newer than this binary is refused before anything
     /// touches it: an older hub would read and write tables it does not know,
     /// and would stamp its own version over the newer one.
@@ -2947,7 +3128,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(path).unwrap();
-        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
         let columns = columns_of(&db.conn(), "node").unwrap();
         for retired in ["price", "currency", "billing_cycle", "expires_at"] {
             assert!(!columns.contains(retired), "导入完成后 {retired} 应已删除");
@@ -2983,7 +3164,7 @@ mod tests {
         // must pass every gate and come out with the newer tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = checked
                 .query_row(

@@ -50,25 +50,35 @@ function copy(text: string) {
   )
 }
 
-// Every address a node has, each click-to-copy: pasting one into an ssh command
-// is why they are shown.
+// One line per address family — IPv4 on the first, IPv6 on the second — each
+// address click-to-copy: pasting one into an ssh command is why they are shown.
+// A family with nothing in it renders no line at all, so a node without one
+// does not grow an empty row.
 function Addresses({ node }: { node: Node }) {
-  const list = addresses(node)
-  if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
+  const lines = addresses(node)
+  if (!lines.v4.length && !lines.v6.length) {
+    return <span className="text-sm text-muted-foreground">—</span>
+  }
   return (
     <div className="flex flex-col items-start gap-y-0.5">
-      {list.map((address) => (
-        <button
-          key={address}
-          type="button"
-          onClick={() => copy(address)}
-          title="点击复制"
-          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-        >
-          {address}
-          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-        </button>
-      ))}
+      {[lines.v4, lines.v6].map((line, family) =>
+        line.length ? (
+          <div key={family} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            {line.map((address) => (
+              <button
+                key={address}
+                type="button"
+                onClick={() => copy(address)}
+                title="点击复制"
+                className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
+              >
+                {address}
+                <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+              </button>
+            ))}
+          </div>
+        ) : null,
+      )}
     </div>
   )
 }
