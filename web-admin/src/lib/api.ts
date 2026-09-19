@@ -117,12 +117,18 @@ function isLocalV4(ip: string): boolean {
  */
 function isLocalV6(ip: string): boolean {
   const lower = ip.toLowerCase()
-  for (const reserved of ["2001:db8:", "2001:2:", "2001:0:"]) {
-    if (lower === reserved.slice(0, -1) || lower.startsWith(reserved)) return true
+  // The documentation and reserved ranges, matching the way `isLocalV4`
+  // excludes the v4 test nets rather than calling every dotted quad reachable:
+  // 2001:db8::/32, 2001:2::/48, and Teredo's 2001::/32.
+  for (const reserved of ["2001:db8", "2001:2", "2001:0"]) {
+    if (lower === reserved || lower.startsWith(`${reserved}:`)) return true
   }
   const head = Number.parseInt(lower.split(":")[0] ?? "", 16)
   return !Number.isFinite(head) || (head & 0xe000) !== 0x2000
 }
+
+/** One line per address family, each holding reachable addresses before private ones. */
+export type AddressLines = { v4: string[]; v6: string[] }
 
 /**
  * The addresses shown for a node, split by family: IPv4 on one line, IPv6 on
@@ -142,26 +148,30 @@ function isLocalV6(ip: string): boolean {
  */
 export function addresses(node: Pick<Node, "observed_ip" | "ipv4" | "ipv6">): AddressLines {
   const own = { v4: node.ipv4, v6: node.ipv6 }
-  const local = { v4: isLocalV4, v6: isLocalV6 }
-  const observed = node.observed_ip ?? ""
+  const isLocalOf = { v4: isLocalV4, v6: isLocalV6 }
+  // Where the kernel lets one socket serve both families, an IPv4 node's peer
+  // arrives as `::ffff:a.b.c.d` and is stored in that form. That is an IPv4
+  // address wearing a v6 wrapper: unwrap it, or the split below files it under
+  // v6 and the IPv4 line loses the only evidence of a reachable address it has.
+  const raw = node.observed_ip ?? ""
+  const observed = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(raw)?.[1] ?? raw
   const observedFamily = observed.includes(":") ? "v6" : observed.includes(".") ? "v4" : ""
 
   const lines: AddressLines = { v4: [], v6: [] }
   for (const family of ["v4", "v6"] as const) {
     const mine = own[family]
-    const isLocal = local[family]
-    const fromReport = mine && !isLocal(mine) ? mine : ""
-    const fromObserved =
-      !fromReport && family === observedFamily && observed && !isLocal(observed) ? observed : ""
-    const reachable = fromReport || fromObserved
+    const isPrivate = Boolean(mine && isLocalOf[family](mine))
+    const reachable =
+      mine && !isPrivate
+        ? mine
+        : family === observedFamily && observed && !isLocalOf[family](observed)
+          ? observed
+          : ""
     if (reachable) lines[family].push(reachable)
-    if (mine && isLocal(mine)) lines[family].push(mine)
+    if (mine && isPrivate) lines[family].push(mine)
   }
   return lines
 }
-
-/** One line per address family, each holding reachable addresses before private ones. */
-export type AddressLines = { v4: string[]; v6: string[] }
 
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {

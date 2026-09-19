@@ -290,14 +290,20 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
 /// show a NAT'd node's reachable address without depending on what that node
 /// reported about itself.
 ///
-/// The column belongs in `SCHEMA` as well: `check_backup` compares a migrated
-/// backup against a database `SCHEMA` built, so a column only the migration
-/// knows would be reported missing on every old backup. The reverse -- DDL only
-/// -- leaves migrated databases without it and fails every `save_facts`.
+/// The column belongs in `SCHEMA` as well, and the two halves are load-bearing
+/// in opposite directions. A fresh database is built from `SCHEMA` alone --
+/// `Db::open` passes `from = SCHEMA_VERSION`, so no migration runs -- and would
+/// therefore lack a column only the migration knows, failing every `save_facts`
+/// on the UPDATE. An old database reaches the column only through this
+/// migration, and `check_backup`'s reference is built from `SCHEMA`, so a
+/// column `SCHEMA` declares but this migration omits leaves a migrated backup
+/// short of it and the restore is refused as missing.
 ///
 /// Runs regardless of the v6 column-drop gate, which can stay unfinished
 /// indefinitely: a database parked at `GATED_VERSION` would otherwise never get
-/// this column, and every report would fail on the UPDATE instead.
+/// this column, and every report would fail on the UPDATE instead. The stamp
+/// stays `GATED_VERSION` there, so this runs again on each open and relies on
+/// `add_column` tolerating the duplicate.
 fn migrate_to_7(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "observed_ip TEXT NOT NULL DEFAULT ''")
 }
@@ -2516,7 +2522,7 @@ mod tests {
         assert_eq!(stored.ipv4, "192.168.1.25");
         assert_eq!(stored.observed_ip, "198.51.100.7");
 
-        // 只换观察值不清空 country:R2 把失效判断留在 `ip` 上。
+        // 只换观察值不清空 country:失效判断只挂在 `ip` 上。
         db.set_country(id, "US", "2001:db8::1").unwrap();
         db.save_facts(id, &facts, "2001:db8::1", "203.0.113.9").unwrap();
         assert_eq!(db.node(id).unwrap().unwrap().country, "US", "观察值变化不清空 country");
@@ -2878,7 +2884,7 @@ mod tests {
     /// held. Opening the result again must not redo anything that cannot be
     /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v6_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v7_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -2979,6 +2985,63 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// A database parked at `GATED_VERSION`: the v6 column-drop gate is still
+    /// shut, so the stamp stays at 5 and `migrate_to_7` runs again on every
+    /// open. The column must still arrive -- it deliberately does not sit
+    /// behind that gate -- and the re-run must be tolerated.
+    ///
+    /// The fixture drops `observed_ip` from a `SCHEMA`-built database on
+    /// purpose: `SCHEMA` declares the column, so a fixture that kept it would
+    /// carry the very thing under test and prove nothing about the migration.
+    #[test]
+    fn a_database_parked_at_the_v6_gate_still_gains_the_observed_address_column() {
+        let file = std::env::temp_dir().join(format!("monitor-v5obs-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap();
+
+        let old = Connection::open(path).unwrap();
+        old.execute_batch(SCHEMA).unwrap();
+        old.execute_batch(
+            "ALTER TABLE node DROP COLUMN observed_ip;
+             INSERT INTO node (name, token, created_at) VALUES ('kept', 't', 1);",
+        )
+        .unwrap();
+        // A real v5 database still carries the four financial columns the v6
+        // gate exists to drop; without them `migrate_to_6` finds nothing to do,
+        // reports the gate open, and the version advances -- which is a v6
+        // database, not the parked one under test.
+        for column in [
+            "price REAL NOT NULL DEFAULT 0",
+            "currency TEXT NOT NULL DEFAULT 'USD'",
+            "billing_cycle TEXT NOT NULL DEFAULT 'monthly'",
+            "expires_at TEXT",
+        ] {
+            old.execute(&format!("ALTER TABLE node ADD COLUMN {column}"), []).unwrap();
+        }
+        old.execute_batch("PRAGMA user_version = 5;").unwrap();
+        assert!(!columns_of(&old, "node").unwrap().contains("observed_ip"), "夹具必须真的没有这一列");
+        assert!(columns_of(&old, "node").unwrap().contains("price"), "夹具必须真的是 v5 形状");
+        drop(old);
+
+        // The gate is still shut, so the stamp must not advance past it...
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        // ...yet the column is there, because it is not behind that gate.
+        assert!(columns_of(&db.conn(), "node").unwrap().contains("observed_ip"));
+        let id = db.nodes().unwrap()[0].id;
+        db.save_facts(id, &serde_json::json!({"hostname": "h"}), "8.8.8.8", "8.8.8.8").unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().observed_ip, "8.8.8.8");
+        drop(db);
+
+        // Reopening re-runs the migration against a column that already exists;
+        // `add_column` tolerates the duplicate and the row survives.
+        let again = Db::open(path).unwrap();
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(again.node(id).unwrap().unwrap().observed_ip, "8.8.8.8");
+        drop(again);
+
+        let _ = std::fs::remove_file(&file);
+    }
     /// A database stamped newer than this binary is refused before anything
     /// touches it: an older hub would read and write tables it does not know,
     /// and would stamp its own version over the newer one.
