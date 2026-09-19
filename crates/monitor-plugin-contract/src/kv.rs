@@ -79,11 +79,20 @@ impl ContractKv {
     }
 
     /// 按前缀列出,按 key 排序(与 monitor 的 `ORDER BY record_key` 一致)。
+    ///
+    /// 前缀匹配是 **ASCII 大小写不敏感**的:真宿主走 SQLite `LIKE`,而连接没开
+    /// `case_sensitive_like`,SQLite 的 LIKE 对 ASCII 默认不区分大小写。替身逐
+    /// 字节比会让"大小写不同但真宿主能匹配"的前缀少返回行(方向是更严,但会让
+    /// 插件在替身上挂、在真宿主上通过)。
     pub fn plugin_data_list(&self, plugin_id: &str, prefix: &str) -> Vec<(String, String)> {
         let rows = self.plugin_data.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<(String, String)> = rows
             .iter()
-            .filter(|((pid, key), _)| pid == plugin_id && key.starts_with(prefix))
+            .filter(|((pid, key), _)| {
+                pid == plugin_id
+                    && key.len() >= prefix.len()
+                    && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            })
             .map(|((_, key), data)| (key.clone(), data.clone()))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -122,10 +131,7 @@ impl ContractNodes {
     /// 播一台节点(默认离线)。`created_at` 是它的身份;`sort` 默认取 id
     /// (不设即等价于按 id 排)。
     pub fn add_node(&self, id: i64, name: &str, created_at: i64) {
-        self.nodes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, (id, name.to_owned(), created_at));
+        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (id, name.to_owned(), created_at));
     }
 
     /// 设一台节点的 `sort`(真宿主 `node.sort`,面板可拖拽调整)。
@@ -152,12 +158,16 @@ impl ContractNodes {
         let mut out: Vec<(i64, i64, NodeInfo)> = nodes
             .iter()
             .map(|(&id, (sort, name, created_at))| {
-                (*sort, id, NodeInfo {
+                (
+                    *sort,
                     id,
-                    name: name.clone(),
-                    online: online.contains(&id),
-                    created_at: *created_at,
-                })
+                    NodeInfo {
+                        id,
+                        name: name.clone(),
+                        online: online.contains(&id),
+                        created_at: *created_at,
+                    },
+                )
             })
             .collect();
         out.sort_by_key(|(sort, id, _)| (*sort, *id));
@@ -196,6 +206,15 @@ mod tests {
         assert_eq!(kv.plugin_data_usage("a"), (3, 3));
         kv.plugin_data_delete("a", "node:2");
         assert_eq!(kv.plugin_data_usage("a").0, 2);
+    }
+
+    /// 前缀匹配对齐 SQLite `LIKE`:ASCII 大小写不敏感。
+    #[test]
+    fn plugin_data_prefix_match_is_ascii_case_insensitive() {
+        let kv = ContractKv::new();
+        assert!(kv.plugin_data_put_within_quota("a", "Node:1", "x", 100));
+        assert_eq!(kv.plugin_data_list("a", "node:").len(), 1, "前缀大小写不同也应命中");
+        assert_eq!(kv.plugin_data_list("a", "NODE:").len(), 1);
     }
 
     /// 总配额:超一点都拒,且不写入。
