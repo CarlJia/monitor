@@ -29,6 +29,11 @@ const LAUNCH_TIMEOUT_MS = 30000
 // 单条 CDP 请求的上限。Chrome 中途死掉时 ws 不再回任何消息，没有它 await 会一直
 // 挂着，门禁就一直挂到 CI 的 job 上限——挂死不比红好，它不给任何归因。
 const RPC_TIMEOUT_MS = 10000
+// 单次 navigation 后等 DOMContentLoaded 的上限。Page.navigate 不等 document 解析，
+// 直接 read() 会撞上 document.body 还没创建好的窗口期，innerText 抛 TypeError 把整
+// 轮 measure 拖红。等 Chrome 发 DOMContentLoaded（这时 <body> 已解析）再 read，
+// race 就被消灭了。10s 跟 RPC_TIMEOUT_MS 同档，dist 冷解析几秒，留宽一个量级。
+const NAV_TIMEOUT_MS = 10000
 
 // 一张 1x1 的 PNG，供主题预览图端点使用。图本身不重要，重要的是它在 <img> 的
 // onLoad 里才被显示出来——那条路径会撑开卡片。
@@ -272,6 +277,8 @@ async function measure(chrome, base, profile) {
     throw launchFail()
   }
 
+  // 外层 sessionId：见 try 内 attach 后那一行的注释。
+  let sessionId = null
   const ws = new WebSocket(wsUrl)
   let id = 0
   const pending = new Map()
@@ -282,12 +289,43 @@ async function measure(chrome, base, profile) {
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)) }
     pending.clear()
   }
+  // 把 Page.lifecycleEvent 转给 pendingDomReady：等到对应 sessionId 的
+  // name === "DOMContentLoaded" 才放行后续 read()。Chrome 153+ 默认不发 lifecycleEvent，
+  // 需先 Page.setLifecycleEventsEnabled({enabled:true})；flatten=true 时 sessionId
+  // 在顶层 msg.sessionId，事件字段是 params.name 不是 params.eventName。
+  // 这时 <body> 已解析完，document.body 不再为 null，read 不会撞 TypeError。
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data)
+    if (msg.method === "Page.lifecycleEvent" && msg.sessionId === sessionId && msg.params?.name === "DOMContentLoaded") {
+      const r = pendingDomReady
+      pendingDomReady = null
+      if (r) { clearTimeout(r.timer); r.resolve() }
+    }
     const p = pending.get(msg.id)
     if (p) { pending.delete(msg.id); clearTimeout(p.timer); p.resolve(msg) }
   }
-  ws.onclose = () => rejectAll(`与 Chrome 的调试连接已断开${exitReason ? `（Chrome ${exitReason}）` : ""}`)
+  ws.onclose = () => {
+    const r = pendingDomReady
+    pendingDomReady = null
+    if (r) { clearTimeout(r.timer); r.reject(new Error(`与 Chrome 的调试连接已断开${exitReason ? `（Chrome ${exitReason}）` : ""}`)) }
+    rejectAll(`与 Chrome 的调试连接已断开${exitReason ? `（Chrome ${exitReason}）` : ""}`)
+  }
+  // 单槽：每次 navigate 前 waitForDomReady 把它清掉，避免上一轮 stale 的事件
+  // resolve 错对象，也避免两个 route 之间的 lifecycleEvent 串台。Chrome 中途死掉
+  // 时 ws 不再回消息——ws.onclose 会 reject 它，NAV_TIMEOUT_MS 是兜底。
+  let pendingDomReady = null
+  const waitForDomReady = () => new Promise((resolve, reject) => {
+    if (pendingDomReady) {
+      clearTimeout(pendingDomReady.timer)
+      pendingDomReady = null
+    }
+    const timer = setTimeout(() => {
+      pendingDomReady = null
+      reject(new Error(`Chrome 未在 ${NAV_TIMEOUT_MS / 1000}s 内对 navigation 发出 DOMContentLoaded${exitReason ? `（Chrome ${exitReason}）` : ""}`))
+    }, NAV_TIMEOUT_MS)
+    pendingDomReady = { resolve, timer }
+  })
+
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
     const m = { id: ++id, method, params }
     if (sessionId) m.sessionId = sessionId
@@ -306,9 +344,15 @@ async function measure(chrome, base, profile) {
     })
 
     const { result: { targetId } } = await send("Target.createTarget", { url: "about:blank" })
-    const { result: { sessionId } } = await send("Target.attachToTarget", { targetId, flatten: true })
+    const { result: { sessionId: sid } } = await send("Target.attachToTarget", { targetId, flatten: true })
+    // 把 sid 暴露给外层 ws.onmessage：setLifecycleEventsEnabled 启用后 Chrome
+    // 立刻会发若干 init lifecycleEvent，闭包查找 sessionId 不能撞 TDZ。
+    sessionId = sid
     await send("Page.enable", {}, sessionId)
     await send("Runtime.enable", {}, sessionId)
+    // Chrome 153+ 默认不发 Page.lifecycleEvent，必须显式启用；不然下面
+    // waitForDomReady 永远等不到 DOMContentLoaded，整个 measure 都会超时挂死。
+    await send("Page.setLifecycleEventsEnabled", { enabled: true }, sessionId)
     // 注入失败要当场报：注入不成功时页面里没有 __cls，下面读数表达式的 ?? 0
     // 兜底会把「仪器没装上」显示成 CLS 0，这门禁就静默全绿了。
     const injected = await send("Page.addScriptToEvaluateOnNewDocument", { source: OBSERVER }, sessionId)
@@ -326,6 +370,11 @@ async function measure(chrome, base, profile) {
     const results = []
     for (const route of ROUTES) {
       await send("Page.navigate", { url: base + route.path }, sessionId)
+      // 等 DOMContentLoaded 之后再读：这时 <body> 已解析完，document.body.innerText
+      // 不会再撞上 null。Page.navigate 不等 document 解析，不挂一道就会撞上 read
+      // 早于 <body> 创建的窗口——CI runner 上 race 比本地宽，dist 体积一变长就被
+      // 触发。
+      await waitForDomReady()
 
       // 等 marker 出现（页面确实渲染了）再多等一小段：最后一块数据到达往往正是
       // 抖动发生的时刻，抢在它之前读会漏掉。

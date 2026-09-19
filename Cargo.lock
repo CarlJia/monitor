@@ -1309,6 +1309,7 @@ dependencies = [
  "futures-core",
  "hex",
  "mime_guess",
+ "monitor-plugin-contract",
  "rand 0.9.5",
  "reqwest",
  "rusqlite",
@@ -1325,6 +1326,19 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
+name = "monitor-plugin-contract"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
  "wasmtime",
  "wat",
 ]

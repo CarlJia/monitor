@@ -1,16 +1,22 @@
-//! 引擎与加载(R6)、调用骨架与事件派发入口。宿主函数面见 [`super::host_funcs`],
+//! 引擎与加载(R6)、调用骨架与事件派发入口。宿主函数面的**实现**在
+//! `monitor-plugin-contract` crate(与契约测试同一份闭包),本模块的
+//! `PluginState` 实现它的 `Host`/`HasScratch`,把每个宿主操作委托回 `Arc<App>`;
 //! 插件日志汇集见 [`super::log`]。
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use tracing::warn;
 use wasmtime::{Memory, Store};
+
+use monitor_plugin_contract::{HasScratch, Host, HttpMethod, NodeInfo};
 
 use crate::notification_bus::Event;
 use crate::{db::PluginRow, App};
 
-use super::host_funcs::host_linker;
+use super::host_funcs::{host_linker, plugin_http_fetch};
 use super::log::{new_log_sink, LogSink};
 use super::manifest::Manifest;
 
@@ -81,30 +87,14 @@ pub fn load(engine: &wasmtime::Engine, row: &PluginRow) -> Result<LoadedPlugin> 
 // 上限、每次调用的状态与实例化
 // ---------------------------------------------------------------------------
 
-/// 每次调用的默认 fuel 限额(KTD6)。dispatch 每次读 setting
-/// `plugin.fuel_limit` 覆写,缺省回落到这里。
-pub const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
-
-/// ABI v2 数据面钩子(`on_tick`、`render_page`、`on_action`、`on_cleanup`)的
-/// 默认 fuel 限额,比事件派发那档宽 20 倍。
-///
-/// 分成两档是因为两者的工作量量级不同:派发收到的是**有界**的事件载荷(节点
-/// id/名字),1,000,000 足够;而这些钩子读的是插件自己的 plugin_data,开销随
-/// 数据规模线性增长——财务插件渲染页面要读它全部节点的财务记录,实测空页面
-/// 44 万、每台机器再 5.4 万(每小时 tick 是 67 万 + 每台 2.4 万),十来台机器就
-/// 把派发那档预算烧穿:页面端点回 502,tick 静默停在 `fuel_exhausted`。
-/// 20,000,000 对当前的财务插件够约 365 台;插件的开销结构变了(或机器更多)时
-/// 由 setting `plugin.hook_fuel_limit` 覆写。
-pub const DEFAULT_HOOK_FUEL_LIMIT: u64 = 20_000_000;
-
-/// 单个插件的 kv 值上限:8 KiB,足够放渠道配置,又不会让 setting 表被一个插件
-/// 当对象存储用。面板的 kv 写入引用同一个上限:「面板能写的不能比插件运行时
-/// 能写的多」,否则面板成了绕过插件存储限额的后门。
-pub const KV_VALUE_MAX: usize = 8 * 1024;
-
-/// kv 的 key 上限,128 字节。面板、manifest 的 `[[kv]]` 声明与 kv 命名空间
-/// 共用这一个数字:三处各写一份,迟早会漂。
-pub const KV_KEY_MAX: usize = 128;
+// 限额与错误码的**唯一定义**在 `monitor-plugin-contract`:那里是 13 个宿主函数的
+// 实现,这里是它们的调用方与 `Host` 实现。两处各抄一份迟早会漂,所以这里只
+// re-export,不重新定义(契约 crate 的 `constants` / `error_codes`)。
+pub(super) use monitor_plugin_contract::constants::HTTP_TIMEOUT;
+use monitor_plugin_contract::constants::PLUGIN_DATA_MAX;
+pub use monitor_plugin_contract::constants::{
+    DEFAULT_FUEL_LIMIT, DEFAULT_HOOK_FUEL_LIMIT, KV_KEY_MAX, KV_VALUE_MAX,
+};
 
 /// 一个 kv key 的形状问题。key 的语法只有一套,[`kv_key_problem`] 是它唯一的
 /// 判定点;两个调用方(manifest 的 `[[kv]]` 校验、面板的 kv 编辑器)只是把结果
@@ -140,16 +130,11 @@ pub fn kv_key_problem(key: &str) -> Option<KvKeyProblem> {
     None
 }
 
-/// 插件 http 请求的墙钟超时(A13):4 秒,落在 5 秒的派发预算内,留 1 秒给宿主
-/// 自己的开销。挂在请求上:插件走 `App::plugin_http`(不跟随重定向的那个),
-/// 它的 client 级超时是 15 秒,服务于宿主侧下载,不能为插件收短。
-pub(super) const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// 单次 http 响应体的硬上限:64 KiB。插件声明的 resp_cap 再大也读这么多——
-/// 有界下载要防的正是"cap 被声明成超大值/响应体本身无限大"的内存放大。
-pub(super) const HTTP_RESP_MAX: usize = 64 * 1024;
-
 /// Store 的 user data:宿主函数看得见的全部宿主侧状态。
+///
+/// 它自己不含宿主函数实现——那 13 个闭包在 `monitor-plugin-contract` 里,泛型在
+/// `Host`/`HasScratch` 上;这里实现这两个 trait,每个方法委托回 [`App`](crate::App),
+/// 所以运行时行为与闭包直接摸 `app` 时逐字一致。
 pub(crate) struct PluginState {
     /// kv 命名空间隔离:`plugin.<plugin_id>:<key>`。
     pub(super) plugin_id: String,
@@ -165,6 +150,148 @@ pub(crate) struct PluginState {
     pub(super) resp_cap: i32,
     /// 本次调用里插件经 `host.log` 打出的日志。见 [`super::log::PluginLog`]。
     pub(super) logs: LogSink,
+}
+
+// ---------------------------------------------------------------------------
+// 宿主契约的真宿主一侧(KTD1)
+// ---------------------------------------------------------------------------
+//
+// 13 个宿主函数的闭包体在 `monitor-plugin-contract` 里,泛型在这两个 trait 上;
+// 这里把每个操作委托回 `Arc<App>`,与闭包当年直接摸 `app` 逐字同义。宿主侧的
+// 失败原因(读库失败、emit 失败、http 出错)在这一侧打点——闭包只拿得到
+// `Err(())`,错误链到不了那边。
+
+impl Host for PluginState {
+    fn kv_get(&self, key: &str) -> Result<Option<String>, ()> {
+        self.app.db.try_get(key).map_err(|e| {
+            warn!(plugin = %self.plugin_id, "kv_get 读库失败: {e:#}");
+        })
+    }
+
+    fn kv_set(&self, key: &str, value: &str) -> Result<(), ()> {
+        // 写库失败不给 -8 而是 -2(kv 的错误码表见契约 crate 的 error_codes),
+        // 这一层只报"失败",折码在闭包那边。
+        self.app.db.set(key, value).map_err(|_| ())
+    }
+
+    fn data_put(&self, plugin_id: &str, key: &str, value: &str) -> Result<bool, ()> {
+        // 配额检查与写入在 db 层的同一事务里做:分成"读用量→判→写"三步时,同一
+        // 插件的两次并发写会各自通过检查,合起来越过上限(KTD3)。
+        match self.app.db.plugin_data_put_within_quota(plugin_id, key, value, PLUGIN_DATA_MAX) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => {
+                warn!(plugin = %plugin_id, "data_put 失败: {e:#}");
+                Err(())
+            }
+        }
+    }
+
+    fn data_get(&self, plugin_id: &str, key: &str) -> Result<Option<String>, ()> {
+        // 读失败并进「无此记录」:data_get 的错误码表里没有"库坏了"这一档,旧
+        // 插件把任何 <=0 都当无值,行为保持不变。
+        Ok(self.app.db.plugin_data_get(plugin_id, key).unwrap_or(None))
+    }
+
+    fn data_delete(&self, plugin_id: &str, key: &str) -> Result<(), ()> {
+        match self.app.db.plugin_data_delete(plugin_id, key) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!(plugin = %plugin_id, "data_delete 失败: {e:#}");
+                Err(())
+            }
+        }
+    }
+
+    fn data_list(&self, plugin_id: &str, prefix: &str) -> Result<Vec<(String, String)>, ()> {
+        match self.app.db.plugin_data_list(plugin_id, prefix) {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                warn!(plugin = %plugin_id, "data_list 失败: {e:#}");
+                Err(())
+            }
+        }
+    }
+
+    fn nodes_query(&self) -> Result<Vec<NodeInfo>, ()> {
+        let online: HashSet<i64> =
+            self.app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+        match self.app.db.node_basics() {
+            Ok(nodes) => Ok(nodes
+                .into_iter()
+                .map(|(id, name, created_at)| NodeInfo { id, name, online: online.contains(&id), created_at })
+                .collect()),
+            Err(e) => {
+                warn!(plugin = %self.plugin_id, "host_nodes_query 读节点失败: {e:#}");
+                Err(())
+            }
+        }
+    }
+
+    fn emit_event(&self, name: &str, payload: serde_json::Value) -> Result<(), ()> {
+        let event = Event::Plugin { name: name.to_owned(), payload };
+        if let Err(e) = crate::notification_bus::emit(&self.app, &event) {
+            warn!(plugin = %self.plugin_id, "emit_event 失败: {e:#}");
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn http_request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Option<Vec<u8>>,
+        download_cap: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, i32> {
+        // 请求的构造、SSRF 预检、预算收缩与有界下载都在 `plugin_http_fetch` 里
+        // ——它要 `App::plugin_http`(不跟随重定向的那个 client),所以留在真宿主
+        // 这一侧,没有进契约 crate。
+        let (label, method) = match method {
+            HttpMethod::Get => ("host_http_get", reqwest::Method::GET),
+            HttpMethod::Post => ("host_http_post", reqwest::Method::POST),
+        };
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            warn!(plugin = %self.plugin_id, "{label} 不在异步运行时上下文中");
+            return Err(-4);
+        };
+        handle.block_on(plugin_http_fetch(
+            &self.app,
+            &self.plugin_id,
+            label,
+            method,
+            url,
+            body,
+            download_cap,
+            deadline,
+        ))
+    }
+}
+
+impl HasScratch for PluginState {
+    fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    fn resp(&self) -> (i32, i32) {
+        (self.resp_ptr, self.resp_cap)
+    }
+
+    fn set_resp(&mut self, ptr: i32, cap: i32) {
+        self.resp_ptr = ptr;
+        self.resp_cap = cap;
+    }
+
+    fn push_log(&self, text: &str) {
+        // 清洗与截断留在汇集点那一侧(见 [`super::log`]):它认识面板的 detail
+        // 契约,契约 crate 不认识。
+        self.logs.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+    }
 }
 
 /// 把调用侧的 Store/内存组合暴露给 tests:测试需要直接看内存与 db,而
@@ -371,13 +498,9 @@ pub fn call_json_hook(
 /// 不超过 `max` 的最大字符边界偏移:截断必须落在边界上,否则切出的字节不是
 /// 合法 UTF-8。detail 的带省略号截断与 host_kv_get 的前缀截断共用(一个加
 /// 省略号一个不加,共用的是边界计算)。
-pub(super) fn char_boundary_end(s: &str, max: usize) -> usize {
-    let mut end = s.len().min(max);
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
+///
+/// 定义在契约 crate(`host_kv_get` 那一侧也要用它),这里只 re-export。
+pub(super) use monitor_plugin_contract::host_linker::char_boundary_end;
 
 /// 按字符边界截断,加省略号标记被截。
 pub(super) fn truncate(s: &str, max: usize) -> String {
