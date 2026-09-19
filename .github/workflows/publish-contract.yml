@@ -3,9 +3,10 @@ name: publish-contract
 # A monitor-plugin-contract release is just a git tag other repos pull by
 # (`cargo add --git https://github.com/CarlJia/monitor monitor-plugin-contract
 #  --tag monitor-plugin-contract-vN`). There is no crates.io publish. This
-# workflow only *validates* the tag: it builds+tests the crate and checks the
-# tag's version equals the crate's own version, so a mistyped tag is caught
-# here instead of by a plugin repo's release failing to resolve it.
+# workflow only *validates* the tag: it checks the tagged crate is the one on
+# main, that the tag's version equals the crate's own version, and that the
+# crate builds+tests. All three mistakes are caught here rather than by a plugin
+# repo's release failing to resolve or compile against the tag.
 #
 # It does not roll the tag back on mismatch (that would need write authority to
 # a pushed ref); a mismatch fails the run and notifies the maintainer to retag.
@@ -24,8 +25,27 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Plugins pull the tag as a *commit*, so what ships is whatever that commit
+      # holds — versions notwithstanding. v2.0.0 was tagged on a commit whose
+      # crate was already 2.0.0 and ABI 2, yet sat three fixes behind main, so
+      # every plugin release failed to compile against it. Comparing the crate
+      # to main's is what catches that; ancestry alone does not, because a stale
+      # commit merged into main is still an ancestor of it.
+      - name: Tagged crate matches the crate on main
+        run: |
+          if ! git diff --quiet "$GITHUB_SHA:crates/monitor-plugin-contract" \
+                               "origin/main:crates/monitor-plugin-contract"; then
+            git diff --stat "$GITHUB_SHA:crates/monitor-plugin-contract" \
+                            "origin/main:crates/monitor-plugin-contract"
+            echo "::error::$GITHUB_REF_NAME ships a crate that differs from main's — retag a commit on main"
+            exit 1
+          fi
+          echo "tagged crate matches main"
 
       - name: Tag version matches the crate version
         run: |
