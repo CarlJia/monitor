@@ -241,6 +241,7 @@ impl Manifest {
                 KNOWN_EVENT_NAMES.join(", ")
             );
         }
+        let mut seen_events = HashSet::new();
         for event in &m.subscribes {
             let known = KNOWN_EVENT_NAMES.contains(&event.as_str());
             let plugin_event =
@@ -251,6 +252,11 @@ impl Manifest {
                     KNOWN_EVENT_NAMES.join(", ")
                 );
             }
+            // 重复项在真实派发里只算一次(registry 用 `.any()` 判订阅),但「测试」是
+            // 按这张表逐条派发的——留着重复项,点一次测试就会把同一个事件真发两遍。
+            if !seen_events.insert(event.as_str()) {
+                bail!("manifest.subscribes 里事件 `{event}` 重复");
+            }
         }
         // 「测试」要回放的样例:只有订阅了的事件才可能被派发到,给没订阅的事件
         // 写样例只会让人以为测过了。payload 的顶层不许带 `type`——事件名由宿主
@@ -260,6 +266,15 @@ impl Manifest {
             if !m.subscribes.contains(&sample.name) {
                 bail!(
                     "manifest.sample 的事件 `{}` 不在 subscribes 里;样例只能给本插件订阅的事件用",
+                    sample.name
+                );
+            }
+            // 宿主自身事件由宿主自己造得出真实结构(见 api_plugins::synthetic_events),
+            // 样例根本不会被查询。放着不拒就是一份永远不生效的死配置,作者还会以为
+            // 测试时的节点名/时间是他给的。
+            if KNOWN_EVENT_NAMES.contains(&sample.name.as_str()) {
+                bail!(
+                    "manifest.sample 的事件 `{}` 是宿主自身事件;样例只对 `{PLUGIN_EVENT_PREFIX}` 前缀的插件事件有意义",
                     sample.name
                 );
             }
@@ -421,6 +436,8 @@ mod tests {
             (over_long.as_str(), "上限"),
             // agent_online 不在 MANIFEST 的 subscribes 里(它只有 agent_offline)。
             ("[[sample]]\nname = \"agent_online\"\npayload = \"{}\"\n", "subscribes"),
+            // 宿主自身事件不在插件的「样本」范围里——宿主自己造得出真实结构,样例不会生效。
+            ("[[sample]]\nname = \"agent_offline\"\npayload = \"{}\"\n", "宿主"),
             ("[[sample]]\nname = \"plugin_expiry_soon\"\npayload = \"[]\"\n", "对象"),
             ("[[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{\"type\":\"x\"}'\n", "type"),
             (
@@ -487,6 +504,17 @@ mod tests {
         let kv_only = format!("{bare}\n[[kv]]\nkey = \"bot_token\"\nrequired = true\n");
         let err = Manifest::parse(&kv_only).unwrap_err().to_string();
         assert!(err.contains("至少"), "实际: {err}");
+    }
+
+    /// `subscribes` 里的重复项在真实派发里只算一次(registry 用 `.any()` 判订阅),
+    /// 但「测试」按整表遍历、逐条派发——留个重复项,点一次测试就会把同一个事件真
+    /// 发两遍。上传时拦住比在运行时让操作员追消息来源更好查。
+    #[test]
+    fn duplicate_subscribes_entries_are_rejected() {
+        let text = "plugin_id = \"com.example.dup\"\nname = \"t\"\nversion = \"1\"\nabi_version = 2\n\
+                   subscribes = [\"agent_offline\", \"agent_online\", \"agent_offline\"]\n";
+        let err = Manifest::parse(text).unwrap_err().to_string();
+        assert!(err.contains("agent_offline") && err.contains("重复"), "应点名重复的 agent_offline,实际:{err}");
     }
 
     #[test]
