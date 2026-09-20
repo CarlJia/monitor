@@ -284,6 +284,15 @@ export function kvWriteFor(row: KvDraft): string | undefined {
   return row.value === row.original ? undefined : row.value
 }
 
+/**
+ * 这一行是否允许删除。插件声明过的字段是内置参数，只能改值——删掉它渠道配置
+ * 就没了（后端对这类 key 也回 400）；自定义的 key（新加的、或存量里没声明的）
+ * 才给删除。声明过的模板类字段清空保存即回到插件内置文案，用不着删。
+ */
+export function kvDeletable(row: KvDraft): boolean {
+  return row.decl === undefined
+}
+
 export type Plugin = {
   id: number
   plugin_id: string

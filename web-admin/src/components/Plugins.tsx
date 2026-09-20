@@ -12,7 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
+  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
   type KvDraft, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 import { testResultsText } from "@/lib/format"
@@ -137,7 +137,8 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
           <DialogDescription className="leading-relaxed">
             插件运行时通过 host_kv_get 读这些值（命名空间 <code>plugin.{plugin.plugin_id}:</code>）。
             排在前面的是插件在 plugin.toml 里声明的字段；key 非空、不含 ':'、128 字节内；value 8 KiB 内。
-            删除一个已有的 key 会连同值一起从后端移除。
+            声明的字段是内置参数，只能改值、不能删除（模板类字段清空保存即回到插件内置文案）；
+            自定义的 key 删除会连同值一起从后端移除。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
@@ -201,22 +202,25 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                       {reveal ? <EyeOff /> : <Eye />}
                     </Button>
                   )}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    title={row.original === null ? "移除" : "删除"}
-                    aria-label={row.original === null ? "移除" : "删除"}
-                    onClick={() =>
-                      row.original === null
-                        ? setRows((old) => old?.filter((_, j) => j !== i) ?? old)
-                        : setRows((old) => {
-                            setDeleted((d) => [...d, row.key])
-                            return old?.filter((_, j) => j !== i) ?? old
-                          })
-                    }
-                  >
-                    <Trash2 className="text-destructive" />
-                  </Button>
+                  {/* 声明过的字段是插件内置参数：只能改值，不给删除（后端同样拒绝）。 */}
+                  {kvDeletable(row) && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title={row.original === null ? "移除" : "删除"}
+                      aria-label={row.original === null ? "移除" : "删除"}
+                      onClick={() =>
+                        row.original === null
+                          ? setRows((old) => old?.filter((_, j) => j !== i) ?? old)
+                          : setRows((old) => {
+                              setDeleted((d) => [...d, row.key])
+                              return old?.filter((_, j) => j !== i) ?? old
+                            })
+                      }
+                    >
+                      <Trash2 className="text-destructive" />
+                    </Button>
+                  )}
                 </div>
                 {decl?.hint && <p className="text-xs text-muted-foreground">{decl.hint}</p>}
               </div>
