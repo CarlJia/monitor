@@ -203,19 +203,12 @@ impl Manifest {
             // 编辑形态:词表小且封闭。写错一个词在上传时就是显式错误,而不是在
             // 面板上默默退化成单行框——操作员会以为是自己填错了。
             if decl.kind != "text" && decl.kind != "textarea" {
-                bail!(
-                    "manifest.kv `{}` 的 type 只能是 `text` 或 `textarea`(当前 `{}`)",
-                    decl.key,
-                    decl.kind
-                );
+                bail!("manifest.kv `{}` 的 type 只能是 `text` 或 `textarea`(当前 `{}`)", decl.key, decl.kind);
             }
             // 必填与默认值互斥:两者并存会让「这个框是空的」既表示缺配置、又表示
             // 用默认值,测试前的必填预检就说不清该不该拦。
             if decl.required && decl.default.is_some() {
-                bail!(
-                    "manifest.kv `{}` 不能同时声明 required 与 default:必填的字段没有默认值可用",
-                    decl.key
-                );
+                bail!("manifest.kv `{}` 不能同时声明 required 与 default:必填的字段没有默认值可用", decl.key);
             }
             // 默认值最终要么原样进 kv 行、要么与 kv 行等价,所以按 kv 值的同一上限
             // 挡——两处不同的话,作者能写下一个面板显示得出来、却永远存不进去的值。
@@ -284,10 +277,7 @@ impl Manifest {
             match serde_json::from_str::<Value>(&sample.payload) {
                 Ok(Value::Object(fields)) => {
                     if fields.contains_key("type") {
-                        bail!(
-                            "manifest.sample `{}` 的 payload 不能带 `type`:事件名由宿主注入",
-                            sample.name
-                        );
+                        bail!("manifest.sample `{}` 的 payload 不能带 `type`:事件名由宿主注入", sample.name);
                     }
                 }
                 _ => bail!(
@@ -514,7 +504,10 @@ mod tests {
         let text = "plugin_id = \"com.example.dup\"\nname = \"t\"\nversion = \"1\"\nabi_version = 2\n\
                    subscribes = [\"agent_offline\", \"agent_online\", \"agent_offline\"]\n";
         let err = Manifest::parse(text).unwrap_err().to_string();
-        assert!(err.contains("agent_offline") && err.contains("重复"), "应点名重复的 agent_offline,实际:{err}");
+        assert!(
+            err.contains("agent_offline") && err.contains("重复"),
+            "应点名重复的 agent_offline,实际:{err}"
+        );
     }
 
     #[test]

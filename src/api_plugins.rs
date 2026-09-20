@@ -484,10 +484,7 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         Err(e) => return fail(e),
     };
     if !missing.is_empty() {
-        return bad(&format!(
-            "插件缺少必填配置:{}；请在插件的「配置」里填写后再测试",
-            missing.join("、")
-        ));
+        return bad(&format!("插件缺少必填配置:{}；请在插件的「配置」里填写后再测试", missing.join("、")));
     }
 
     let handle = tokio::runtime::Handle::current();
@@ -1345,24 +1342,40 @@ mod tests {
         let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
-            ["agent_offline", "agent_online", "node_added", "node_deleted", "plugin_expiry_soon", "plugin_ghost"],
+            [
+                "agent_offline",
+                "agent_online",
+                "node_added",
+                "node_deleted",
+                "plugin_expiry_soon",
+                "plugin_ghost"
+            ],
             "按 subscribes 的顺序逐条来,面板才好逐条展示"
         );
         match &events[0].1 {
             Some(Event::AgentOffline { node_id, name, observed_at, last_seen_at }) => {
-                assert_eq!((*node_id, observed_at, last_seen_at), (0, &1_000, &700), "留一段静默时长,离线文案才有东西可渲染");
+                assert_eq!(
+                    (*node_id, observed_at, last_seen_at),
+                    (0, &1_000, &700),
+                    "留一段静默时长,离线文案才有东西可渲染"
+                );
                 assert_eq!(name, "test");
             }
             other => panic!("应当是真实结构的 AgentOffline,实际 {other:?}"),
         }
         match &events[1].1 {
-            Some(Event::AgentOnline { node_id, observed_at, .. }) => assert_eq!((*node_id, *observed_at), (0, 1_000)),
+            Some(Event::AgentOnline { node_id, observed_at, .. }) => {
+                assert_eq!((*node_id, *observed_at), (0, 1_000))
+            }
             other => panic!("应当是 AgentOnline,实际 {other:?}"),
         }
         // 新增与删除共用一个 created_at:财务插件按「身份相符」判要不要真删,
         // 一配对净效果为零,不会留下一条名为 test 的假节点。
         match (&events[2].1, &events[3].1) {
-            (Some(Event::NodeAdded { created_at: added, .. }), Some(Event::NodeDeleted { created_at, .. })) => {
+            (
+                Some(Event::NodeAdded { created_at: added, .. }),
+                Some(Event::NodeDeleted { created_at, .. }),
+            ) => {
                 assert_eq!((added, created_at), (&1_000, &1_000));
             }
             other => panic!("应当是 NodeAdded + NodeDeleted,实际 {other:?}"),
