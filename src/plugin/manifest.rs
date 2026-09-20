@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::notification_bus::Event;
 
@@ -24,6 +25,11 @@ pub const KNOWN_EVENT_NAMES: [&str; Event::KNOWN.len()] = Event::KNOWN;
 /// 用同一个常数判(它的实现在 `monitor-plugin-contract` 里),所以定义在契约
 /// crate,这里只 re-export:manifest 校验与宿主函数不可能各认一个前缀。
 pub use monitor_plugin_contract::constants::PLUGIN_EVENT_PREFIX;
+
+/// kv 值的体量上限。`[[kv]]` 的 `default` 是面板预填的文案,它最终要么进 kv
+/// 行、要么与 kv 行等价,所以按同一个上限挡——两处不同的话,作者能写下一个
+/// 面板显示得出来、却永远存不进去的默认值。
+use monitor_plugin_contract::constants::KV_VALUE_MAX;
 
 /// `[[kv]]` 的条数上限。64 项已远超真实插件(tg-notify 只声明 2 项);这条挡的
 /// 不是错误配置,而是「64 KiB 的 manifest 塞进上千个声明」——那些声明会被插件
@@ -46,6 +52,9 @@ pub struct PageDecl {
 /// 后台事件旁边没有操作员,一个 400 也无处可给。所以 `required` 的含义只是
 /// 「点『测试』前应该有值」;条件性才需要的字段(比如只有某种事件才用得上)留
 /// `required = false`,让操作员自己判断。
+///
+/// v2.x 起另有两个纯展示字段:`kind`(`type`,单行还是多行)与 `default`
+/// (没配值时对话框里预填什么)。两者都只影响面板,插件运行时读到的仍然是 kv。
 #[derive(Debug, Clone, Deserialize)]
 pub struct KvDecl {
     /// kv 的 key,即 `plugin.<plugin_id>:<key>` 的右半边。
@@ -57,6 +66,37 @@ pub struct KvDecl {
     pub required: bool,
     /// 一句话说明该怎么填,面板显示在输入框下面。
     pub hint: Option<String>,
+    /// 编辑形态:`text`(缺省)或 `textarea`。面板据此决定用单行输入框还是
+    /// 多行编辑器——多行是通用能力,面板不知道哪个字段是「模板」。
+    ///
+    /// 存成 String 而不是枚举:非法值要报出**是哪个 kv key** 写错了,而 serde
+    /// 的 `unknown variant` 只说位置、不说 key。
+    #[serde(rename = "type", default = "default_kv_kind")]
+    pub kind: String,
+    /// 该 kv 没有值(或值为空白)时,面板在编辑器里预填的文案。插件运行时的
+    /// 内置默认值仍写在插件自己的代码里——这份是给操作员看的基准,好让他「改
+    /// 一个字」而不是从空白写起。
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// `KvDecl::kind` 的缺省值:单行。
+fn default_kv_kind() -> String {
+    "text".into()
+}
+
+/// manifest 的 `[[sample]]` 声明:一条**插件事件**的测试样例载荷。
+///
+/// 宿主的「测试」按插件声明的 `subscribes` 逐条合成事件;宿主自身事件有真实
+/// 结构可造,`plugin_` 前缀的事件宿主一无所知,只能回放插件在这里给的样例。
+/// 说清事件长什么样是插件的知识,不是宿主的(KTD4)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SampleDecl {
+    /// 事件名,必须出现在本 manifest 的 `subscribes` 里。
+    pub name: String,
+    /// 一份 JSON 对象,顶层不能带 `type`——事件名由宿主注入,与
+    /// `Event::Plugin` 的序列化规则同一份语义。
+    pub payload: String,
 }
 
 /// plugin.toml。字段与校验规则见 [`Manifest::parse`]。
@@ -91,6 +131,16 @@ pub struct Manifest {
     /// 测试前预检,不构成工作面、也不参与真实派发。
     #[serde(default)]
     pub kv: Vec<KvDecl>,
+    /// 「测试」要回放的插件事件样例。见 [`SampleDecl`]:只有 `plugin_` 前缀的
+    /// 订阅项需要它——宿主自身事件由宿主自己造得出真实结构。
+    ///
+    /// TOML 里是 `[[sample]]`(单数,与 `[[kv]]` 同形),字段名取复数读起来更像
+    /// 一个表:这一处是 manifest 里唯一「键名与字段名不同形」的地方,rename 写
+    /// 明它,免得日后有人照着字段名去写 `[[samples]]`——那会被静默忽略(未知键
+    /// 一律忽略,这正是老宿主能读新 manifest 的原因),而插件作者只会看到
+    /// 「样例没生效」。
+    #[serde(rename = "sample", default)]
+    pub samples: Vec<SampleDecl>,
 }
 
 fn default_wasm_entry() -> String {
@@ -150,6 +200,34 @@ impl Manifest {
             if !seen_keys.insert(decl.key.as_str()) {
                 bail!("manifest.kv 里 key `{}` 重复", decl.key);
             }
+            // 编辑形态:词表小且封闭。写错一个词在上传时就是显式错误,而不是在
+            // 面板上默默退化成单行框——操作员会以为是自己填错了。
+            if decl.kind != "text" && decl.kind != "textarea" {
+                bail!(
+                    "manifest.kv `{}` 的 type 只能是 `text` 或 `textarea`(当前 `{}`)",
+                    decl.key,
+                    decl.kind
+                );
+            }
+            // 必填与默认值互斥:两者并存会让「这个框是空的」既表示缺配置、又表示
+            // 用默认值,测试前的必填预检就说不清该不该拦。
+            if decl.required && decl.default.is_some() {
+                bail!(
+                    "manifest.kv `{}` 不能同时声明 required 与 default:必填的字段没有默认值可用",
+                    decl.key
+                );
+            }
+            // 默认值最终要么原样进 kv 行、要么与 kv 行等价,所以按 kv 值的同一上限
+            // 挡——两处不同的话,作者能写下一个面板显示得出来、却永远存不进去的值。
+            if let Some(default) = &decl.default {
+                if default.len() > KV_VALUE_MAX {
+                    bail!(
+                        "manifest.kv `{}` 的 default 超过 {KV_VALUE_MAX} 字节的上限(当前 {})",
+                        decl.key,
+                        default.len()
+                    );
+                }
+            }
         }
         if m.subscribes.is_empty() && !m.tick && m.page.is_none() && !m.cleanup {
             bail!(
@@ -172,6 +250,36 @@ impl Manifest {
                     "manifest.subscribes 含未知事件 `{event}`;v2 支持的宿主事件: {},插件事件以 `{PLUGIN_EVENT_PREFIX}` 前缀声明",
                     KNOWN_EVENT_NAMES.join(", ")
                 );
+            }
+        }
+        // 「测试」要回放的样例:只有订阅了的事件才可能被派发到,给没订阅的事件
+        // 写样例只会让人以为测过了。payload 的顶层不许带 `type`——事件名由宿主
+        // 注入,与 `Event::Plugin` 的序列化规则是同一份语义。
+        let mut seen_samples = HashSet::new();
+        for sample in &m.samples {
+            if !m.subscribes.contains(&sample.name) {
+                bail!(
+                    "manifest.sample 的事件 `{}` 不在 subscribes 里;样例只能给本插件订阅的事件用",
+                    sample.name
+                );
+            }
+            if !seen_samples.insert(sample.name.as_str()) {
+                bail!("manifest.sample 里事件 `{}` 重复", sample.name);
+            }
+            match serde_json::from_str::<Value>(&sample.payload) {
+                Ok(Value::Object(fields)) => {
+                    if fields.contains_key("type") {
+                        bail!(
+                            "manifest.sample `{}` 的 payload 不能带 `type`:事件名由宿主注入",
+                            sample.name
+                        );
+                    }
+                }
+                _ => bail!(
+                    "manifest.sample `{}` 的 payload 必须是一个 JSON 对象,收到 `{}`",
+                    sample.name,
+                    sample.payload
+                ),
             }
         }
         Ok(m)
@@ -275,6 +383,50 @@ mod tests {
             ("[[kv]]\nkey = \"a:b\"\n", "':'"),
             (over_long.as_str(), "上限"),
             ("[[kv]]\nkey = \"t\"\n[[kv]]\nkey = \"t\"\n", "重复"),
+        ] {
+            let err = Manifest::parse(&with(block)).unwrap_err().to_string();
+            assert!(err.contains(needle), "`{block}` 应报 `{needle}`,实际: {err}");
+        }
+    }
+
+    /// `[[kv]]` 的编辑形态与默认值,以及 `[[sample]]` 样例:面板据此选控件、预填
+    /// 内置文案;样例只对订阅的事件有意义(宿主对别的插件的事件字段一无所知)。
+    #[test]
+    fn kv_editing_hints_and_test_samples_are_validated() {
+        let with = |block: &str| format!("{MANIFEST}\n{block}");
+        // 缺省:单行编辑器、没有默认值——老插件的 manifest 一个字段都不用改。
+        let m = Manifest::parse(&with("[[kv]]\nkey = \"chat_id\"\n")).unwrap();
+        assert_eq!(m.kv[0].kind, "text");
+        assert_eq!(m.kv[0].default, None);
+        // 声明多行与默认值。
+        let m = Manifest::parse(&with(
+            "[[kv]]\nkey = \"tpl\"\ntype = \"textarea\"\ndefault = \"⏰ {name} 到期\"\n",
+        ))
+        .unwrap();
+        assert_eq!(m.kv[0].kind, "textarea");
+        assert_eq!(m.kv[0].default.as_deref(), Some("⏰ {name} 到期"));
+        // 样例:name 在订阅里才收;没有 [[sample]] 的老 manifest 得到空表。
+        let m = Manifest::parse(&with(
+            "[[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{\"node_id\":0}'\n",
+        ))
+        .unwrap();
+        assert_eq!(m.samples.len(), 1);
+        assert_eq!(m.samples[0].name, "plugin_expiry_soon");
+        assert!(Manifest::parse(MANIFEST).unwrap().samples.is_empty());
+
+        let over_long = format!("[[kv]]\nkey = \"tpl\"\ndefault = \"{}\"\n", "x".repeat(KV_VALUE_MAX + 1));
+        for (block, needle) in [
+            ("[[kv]]\nkey = \"tpl\"\ntype = \"multiline\"\n", "type"),
+            ("[[kv]]\nkey = \"bot_token\"\nrequired = true\ndefault = \"x\"\n", "required"),
+            (over_long.as_str(), "上限"),
+            // agent_online 不在 MANIFEST 的 subscribes 里(它只有 agent_offline)。
+            ("[[sample]]\nname = \"agent_online\"\npayload = \"{}\"\n", "subscribes"),
+            ("[[sample]]\nname = \"plugin_expiry_soon\"\npayload = \"[]\"\n", "对象"),
+            ("[[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{\"type\":\"x\"}'\n", "type"),
+            (
+                "[[sample]]\nname = \"plugin_expiry_soon\"\npayload = \"{}\"\n[[sample]]\nname = \"plugin_expiry_soon\"\npayload = \"{}\"\n",
+                "重复",
+            ),
         ] {
             let err = Manifest::parse(&with(block)).unwrap_err().to_string();
             assert!(err.contains(needle), "`{block}` 应报 `{needle}`,实际: {err}");
