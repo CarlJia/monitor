@@ -533,8 +533,11 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 }
 
 /// 派发日志的分页查询参数(R16)。`page` 从 1 起算,`page_size` 是单页条数;
-/// 都缺省(page=1、page_size=50)。越界值就近夹取而不是 400:这是操作员自己的
-/// 面板,夹到合法区间比报错更省一次往返。
+/// 都缺省(page=1、page_size=50)。非法值与越界值走两条路:负数、非数字、超
+/// 出 u32 的值在 `Option<u32>` 反序列化时就过不了,axum Query 直接以 400
+/// (纯文本 rejection)拒绝,根本到不了 handler;夹取只负责成功解析后的数值
+/// 越界(page<1→1,page_size 越界→1..=500)——这部分就近夹取而不是报错,
+/// 是操作员自己的面板,夹到合法区间比报错更省一次往返。
 #[derive(Deserialize, Default)]
 pub struct LogPage {
     page: Option<u32>,
@@ -1829,6 +1832,17 @@ mod tests {
         let clamped = call(1, 9999).await;
         assert_eq!(clamped["page_size"], 500, "{clamped}");
         assert_eq!(clamped["entries"].as_array().unwrap().len(), 3, "{clamped}");
+
+        // page=0 下夹到 1。这组锁的是下溢防线:handler 先 `.max(1)` 再算
+        // `(page_no as u64 - 1)`,page=0 若不夹,u64 会下溢(debug panic /
+        // release 回绕成天文数字),返回的页就错得离谱。
+        let zero = call(0, 2).await;
+        assert_eq!(zero["page"], 1, "{zero}");
+        assert_eq!(zero["total"], 3, "{zero}");
+        let zero_entries = zero["entries"].as_array().unwrap();
+        assert_eq!(zero_entries.len(), 2, "{zero}");
+        // 与 page=1 同款:返回的是最新的 2 条,at 非递增(可能同秒)。
+        assert!(zero_entries.windows(2).all(|w| w[0]["at"].as_i64() >= w[1]["at"].as_i64()), "{zero}");
     }
 
     /// restore 整库替换 plugin 表,内存里的 Registry 也必须跟着按还原后的

@@ -357,11 +357,13 @@ SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id）
    面板里的交互走 `POST /api/plugins/{id}/action` 调 `on_action`；
 7. 清理：`POST /api/plugins/{id}/cleanup` 调 `on_cleanup`——清理逻辑
    完全在插件手里，宿主只转发调用与回收统计；
-8. 日志：`GET /api/plugins/{id}/logs` 返回最近 100 条派发结果（进程内环形
+8. 日志：`GET /api/plugins/{id}/logs` 返回 `{ entries, total, page, page_size }`
+   信封，接受 `page`（从 1 起，缺省 1）/`page_size`（缺省 50，上限 500）；
+   `entries` 沿新→旧顺序，`total` 是环形缓冲里该插件的全部条数（进程内环形
    缓冲，重启后为空；长期审计在 notification_log）。每条另带 `detail`：插件
-自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
-在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
-审计表，不混插件自由文本）。
+   自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
+   在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
+   审计表，不混插件自由文本）。
 
 渠道配置（bot token 等）不建议打进 wasm——在 manifest 里用 `[[kv]]` 声明
 字段（面板据此渲染标签、必填标记与提示），值写在面板的插件 KV 编辑器里

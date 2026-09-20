@@ -294,15 +294,30 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
     pluginLogs(selected, page, LOGS_PAGE_SIZE)
       .then((r) => {
         if (s !== seq.current) return
+        // total 缩水（记录被清、环形缓冲回绕）后当前页可能越过末页：照常落地会
+        // 显示一页空记录、页码停在界外且不自愈。先按新 total 算页数，越界就只拨
+        // 页码、不落地本帧的 entries/total——页码一变 effect 马上用正确页重拉。
+        const serverPages = Math.max(1, Math.ceil(r.total / LOGS_PAGE_SIZE))
+        if (page > serverPages) {
+          setPage(serverPages)
+          return
+        }
         setEntries(r.entries)
         setTotal(r.total)
       })
       .catch((e: Error) => {
         if (s !== seq.current) return
         setEntries([])
-        setTotal(0)
+        // 失败不清 total：page>1 时清零会让分页条整体消失（连「上一页」都点不到），
+        // 用户被困在一个因失败而空掉的页上。保留旧 total 至少还能翻回第一页。
         toast.error(e.message)
       })
+    // 卸载（及下次重跑前）递增 seq，让在途响应不落地——尤其失败路径的 toast，
+    // 不能在用户已离开页面之后才弹出。发出请求的路径都会走到这里；前面两个
+    // 提前 return 的分支没发请求，无需清理。这里要的恰恰是「最新的」seq
+    // （规则建议的拷贝 ref 到局部变量反而是错的），故压掉该警告。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { seq.current++ }
     // pulse：「测试」（不重拉列表）与「启停」后由父组件递增，触发本 effect 重跑；
     // 上传/删除只重拉列表，靠 epoch 变化触发（见 remove()）。plugins 是守卫读的
     // 当帧闭包，刻意不入依赖。
@@ -356,7 +371,11 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
         <p className="text-sm text-muted-foreground">加载中…</p>
       ) : shown.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          {entries.length === 0 ? "该插件还没有派发记录" : "没有符合筛选的记录"}
+          {/* 整页为空且不在第一页：多半是越界页或失败页，不是真的没有记录——
+              文案区分开，别拿「还没有派发记录」误报。 */}
+          {entries.length === 0
+            ? (page > 1 ? "这一页没有记录，回到第一页看看" : "该插件还没有派发记录")
+            : "没有符合筛选的记录"}
         </p>
       ) : (
         <div className="divide-y rounded-lg border">
