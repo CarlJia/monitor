@@ -10,11 +10,12 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { Textarea } from "@/components/ui/textarea"
 import {
-  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
-  type Plugin, type PluginConfigDecl, type PluginLogEntry,
+  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
+  type KvDraft, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
-import { dispatchResultText } from "@/lib/format"
+import { testResultsText } from "@/lib/format"
 
 import { ConfirmDialog } from "./ConfirmDialog"
 
@@ -53,7 +54,7 @@ function PluginStatus({ plugin }: { plugin: Plugin }) {
 // kv 行的可编辑状态：original 为 null 的是新行（未保存过，本地移除即可）；
 // 已有行点删除时从 rows 摘除并记入 deleted，保存时统一调后端的 DELETE 路由。
 // decl 是 manifest 声明过这一项时的展示信息：key 由插件定死，不能改名。
-type KvRow = { key: string; value: string; original: string | null; decl?: PluginConfigDecl }
+type KvRow = KvDraft
 
 // 渠道配置里常见的凭据字段：默认掩码，眼睛按钮切换可见。
 const SECRET_KEY = /token|secret|password/i
@@ -77,8 +78,10 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
         // 声明过的字段按 manifest 顺序排在最前（带标签、必填标记与提示），没声明
         // 的存量行跟在后面：操作者照声明填，不必猜 key 名，也不会被存量键淹没。
         const declared: KvRow[] = decls.map((decl) => {
-          const value = stored.get(decl.key)
-          return { key: decl.key, value: value ?? "", original: value ?? null, decl }
+          // 存量为空（或根本没有这一行）时展示声明里的默认值：操作员看到的就是
+          // 插件内置的那段文案，改一个字即可，而不是从空白写起。
+          const stored_ = stored.get(decl.key)
+          return { key: decl.key, value: kvShownValue(stored_, decl), original: stored_ ?? null, decl }
         })
         const declaredKeys = new Set(decls.map((d) => d.key))
         const rest: KvRow[] = pairs
@@ -94,18 +97,12 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
 
   async function save() {
     if (!rows) return
-    // 与后端 set_plugin_kv 同一套规则，先在本地过一遍，报错能带上 key。
+    // 该写什么、该不该写由 kvWriteFor 决定（纯函数，有测试）——没填完的新行、以及声明了
+    // 默认值却没被自定义的字段都不会落库。
     const writes: [string, string][] = []
     for (const row of rows) {
-      if (row.original === null) {
-        // 没填完的新行不保存，而不是挡住整个表单。声明过的字段本来就带着一行空壳，
-        // 没填就更不该为它落一条空 kv 行——插件读到的仍是「没配」，而列表里会多出
-        // 一行操作员从没创建、也解释不了来源的记录。
-        const untouchedDecl = row.decl !== undefined && row.value === ""
-        if (row.key.trim() && !untouchedDecl) writes.push([row.key.trim(), row.value])
-      } else if (row.value !== row.original) {
-        writes.push([row.key, row.value])
-      }
+      const value = kvWriteFor(row)
+      if (value !== undefined) writes.push([row.original === null ? row.key.trim() : row.key, value])
     }
     for (const [key] of writes) {
       // 长度按**字节**算：服务端比的是 128 字节（plugin::KV_KEY_MAX），而 JS 的
@@ -146,9 +143,13 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
         <div className="space-y-2">
           {rows.map((row, i) => {
             const decl = row.decl
-            const secret = SECRET_KEY.test(row.key)
+            // 多行字段用 textarea：掩码那套只对单行输入框有意义，所以多行一律不掩。
+            const multiline = decl?.type === "textarea"
+            const secret = !multiline && SECRET_KEY.test(row.key)
             const reveal = shown[row.key] ?? false
             const missing = decl?.required && !row.value.trim()
+            // 框里显示的就是声明里的默认值 = 还没自定义过：改了才落库，清空即回到它。
+            const asDefault = kvIsDefault(row.value, decl)
             return (
               <div key={i} className="space-y-1">
                 {decl && (
@@ -156,9 +157,10 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                     <span className="font-medium">{decl.label ?? decl.key}</span>
                     {decl.required && <span className="text-destructive">必填</span>}
                     {missing && <span className="text-muted-foreground">还没填，「测试」会被拦下</span>}
+                    {asDefault && <span className="text-muted-foreground">未自定义，用插件内置文案</span>}
                   </div>
                 )}
-                <div className="flex items-center gap-2">
+                <div className={multiline ? "flex items-start gap-2" : "flex items-center gap-2"}>
                   {/* 已存或声明过的 key 不可改名：改名在后端等于新增一个 key，旧值留在原地。 */}
                   {row.original === null && !decl ? (
                     <Input
@@ -172,14 +174,22 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
                       {row.key}
                     </code>
                   )}
-                  <Input
-                    type={secret && !reveal ? "password" : "text"}
-                    className="min-w-0 flex-1"
-                    placeholder="value"
-                    value={row.value}
-                    autoComplete="off"
-                    onChange={(e) => patch(i, { value: e.target.value })}
-                  />
+                  {multiline ? (
+                    <Textarea
+                      className="min-h-24 min-w-0 flex-1 font-mono text-xs"
+                      value={row.value}
+                      onChange={(e) => patch(i, { value: e.target.value })}
+                    />
+                  ) : (
+                    <Input
+                      type={secret && !reveal ? "password" : "text"}
+                      className="min-w-0 flex-1"
+                      placeholder="value"
+                      value={row.value}
+                      autoComplete="off"
+                      onChange={(e) => patch(i, { value: e.target.value })}
+                    />
+                  )}
                   {secret && (
                     <Button
                       variant="ghost"
@@ -412,14 +422,16 @@ export function Plugins({ go }: { go: (to: string) => void }) {
     setTesting(plugin.id)
     try {
       const r = await testPlugin(plugin.id)
-      // 描述里插件自己的日志优先：`result: other:2` 对操作者毫无信息量，缺什么
-      // 配置、被 SSRF 拦了、还是 Telegram 回了非 2xx，全在那句话里。
-      const description = dispatchResultText({
-        result: r.wasm_result,
-        elapsed_ms: r.elapsed_ms,
-        detail: r.detail,
-      })
-      if (r.wasm_result === "success") {
+      // 一次点击会把每条订阅都真派发一遍（见宿主侧 test_plugin），所以逐条展示，
+      // 整体成败按「每条都成功」算；单条文案怎么拼（含插件日志优先）由
+      // testResultsText 拥有，这里不重复那套规则。
+      const { ok, dispatched, text } = testResultsText(r.results)
+      // 一条都没派发（没订阅、或订阅的插件事件都缺样例）不算失败：宿主对这两种情况
+      // 返的都是 200,报「派发失败」会让一个完全正常的插件显得坏了。
+      const description = <span className="whitespace-pre-line">{text}</span>
+      if (!dispatched) {
+        toast.warning(`${plugin.name} 没有可测试的通知`, { description })
+      } else if (ok) {
         toast.success(`${plugin.name} 测试派发成功`, { description })
       } else {
         toast.error(`${plugin.name} 测试派发失败`, { description })

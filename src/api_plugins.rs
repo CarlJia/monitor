@@ -290,12 +290,16 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                         "tick": m.as_ref().map(|m| m.tick).unwrap_or(false),
                         "cleanup": m.as_ref().map(|m| m.cleanup).unwrap_or(false),
                         // 声明的渠道配置字段:面板「配置」对话框据此渲染标签、
-                        // 标注必填、显示提示,不必让操作者猜 key 名。
+                        // 标注必填、显示提示,不必让操作者猜 key 名。`type` 决定
+                        // 单行还是多行控件,`default` 是没配值时预填的文案——两者
+                        // 都是通用能力,面板不知道哪个字段是「模板」。
                         "config": m.as_ref().map(|m| m.kv.iter().map(|c| json!({
                             "key": c.key.clone(),
                             "label": c.label.clone(),
                             "required": c.required,
                             "hint": c.hint.clone(),
+                            "type": c.kind.clone(),
+                            "default": c.default.clone(),
                         })).collect::<Vec<_>>()).unwrap_or_default(),
                     })
                 })
@@ -412,65 +416,119 @@ fn missing_required_config(app: &App, plugin_id: &str, manifest: &Manifest) -> a
     Ok(missing)
 }
 
-/// 测试通知(R12):合成一个明天的 ExpirySoon 事件,走与真实派发完全相同的
-/// 执行路径(超时、fuel、宿主函数),但绕过 emit 与 notification_log——一次
-/// 手工测试不占幂等键,真实事件的成功与否不该被它覆盖(U4 的 dispatch_one)。
+/// 一次「测试」要派发的合成事件:宿主自身事件用真实结构(字段齐全),`plugin_`
+/// 前缀的事件宿主一无所知,只能用插件在 manifest 里声明的样例回放(KTD4)。
+///
+/// 按 `subscribes` 的顺序返回 `(事件名, Option<事件>)`;`None` 表示这条测不了
+/// ——没声明样例,编一个空载荷派发过去只会让插件报解析失败,操作员会以为是自己
+/// 的插件坏了。
+///
+/// 合成事件一律用 `node_id: 0`:真实节点 id 为正,订阅节点事件的插件据此忽略它,
+/// 一次测试就不会在别人的数据里留下残留。
+fn synthetic_events(manifest: &Manifest, now: i64) -> Vec<(String, Option<Event>)> {
+    manifest
+        .subscribes
+        .iter()
+        .map(|name| {
+            let event = match name.as_str() {
+                // 静默时长留一段:0 秒的「已离线」测不出文案的样子。
+                Event::AGENT_OFFLINE => Some(Event::AgentOffline {
+                    node_id: 0,
+                    name: "test".into(),
+                    observed_at: now,
+                    last_seen_at: now - 300,
+                }),
+                Event::AGENT_ONLINE => {
+                    Some(Event::AgentOnline { node_id: 0, name: "test".into(), observed_at: now })
+                }
+                // 新增与删除共用同一个 created_at:订阅节点事件的插件按「身份相符」
+                // 判断要不要真删,这一配对净效果为零,测试不会留下一条假记录。
+                Event::NODE_ADDED => {
+                    Some(Event::NodeAdded { node_id: 0, name: "test".into(), created_at: now })
+                }
+                Event::NODE_DELETED => {
+                    Some(Event::NodeDeleted { node_id: 0, name: "test".into(), created_at: now })
+                }
+                plugin_event => manifest
+                    .samples
+                    .iter()
+                    .find(|sample| sample.name == plugin_event)
+                    .and_then(|sample| serde_json::from_str(&sample.payload).ok())
+                    .map(|payload| Event::Plugin { name: plugin_event.to_owned(), payload }),
+            };
+            (name.clone(), event)
+        })
+        .collect()
+}
+
+/// 测试通知(R12):按插件声明的订阅**逐条**合成事件并派发,每条都走与真实派发
+/// 完全相同的执行路径(超时、fuel、宿主函数),但绕过 emit 与 notification_log
+/// ——一次手工测试不占幂等键,真实事件的成功与否不该被它覆盖(U4 的 dispatch_one)。
+/// 一次点击把每个模板都真发一遍,所以每条的结果都要回给面板。
 ///
 /// 派发前先按 manifest 的 `[[kv]]` 预检必填项:插件返回 `other:2` 这种码,
 /// 操作者从面板上看不出缺的是什么。只有这一条路径做预检——真实派发没有 400 可
-/// 给,后台事件旁边也没有操作员。
+/// 给,后台事件旁边也没有操作员。预检拦下的是整批,不是第一条。
 pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let plugin_id = match plugin_or_404(&app, id) {
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    // 未启用/加载失败时取不到 manifest,跳过预检,交给下面 dispatch_one 原有的
-    // 那句「插件未启用或加载失败」——两条错误不该互相盖掉。
-    let manifest = app.plugins.read().unwrap_or_else(|e| e.into_inner()).manifest_of(id);
-    if let Some(manifest) = &manifest {
-        let missing = match missing_required_config(&app, &plugin_id, manifest) {
-            Ok(missing) => missing,
-            Err(e) => return fail(e),
+    // 未启用/加载失败时取不到 manifest,枚举不出订阅也就不可能合成任何一条:
+    // 直接说清状况,而不是报「测试了 0 条」。
+    let Some(manifest) = app.plugins.read().unwrap_or_else(|e| e.into_inner()).manifest_of(id) else {
+        return bad("插件未启用或加载失败；先启用它再测试");
+    };
+    let missing = match missing_required_config(&app, &plugin_id, &manifest) {
+        Ok(missing) => missing,
+        Err(e) => return fail(e),
+    };
+    if !missing.is_empty() {
+        return bad(&format!("插件缺少必填配置:{}；请在插件的「配置」里填写后再测试", missing.join("、")));
+    }
+
+    let handle = tokio::runtime::Handle::current();
+    let mut results = Vec::new();
+    for (name, event) in synthetic_events(&manifest, Utc::now().timestamp()) {
+        let Some(event) = event else {
+            results.push(json!({
+                "event": name,
+                "result": "no_sample",
+                "elapsed_ms": 0,
+                "detail": "插件没有为这个事件声明 [[sample]] 样例载荷，无法测试",
+            }));
+            continue;
         };
-        if !missing.is_empty() {
-            return bad(&format!(
-                "插件缺少必填配置:{}；请在插件的「配置」里填写后再测试",
-                missing.join("、")
-            ));
+        // `dispatch_one` 自己只在取插件快照时借一次读锁,执行期间不持锁,所以
+        // 这里不必再套一层 guard。wasm 是 CPU 活,仍挪进 blocking 线程,用预先
+        // 取好的 runtime handle 驱动——run_one 的 spawn 与超时照常落在 runtime 上。
+        let app = app.clone();
+        let handle = handle.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            handle.block_on(plugin::Registry::dispatch_one(&app, id, &event))
+        })
+        .await;
+        match outcome {
+            Ok(Ok(entry)) => results.push(json!({
+                "event": name,
+                "result": entry.result,
+                "elapsed_ms": entry.elapsed_ms,
+                // 插件自己打的话:错误码是它私有的,`other:2` 光看数字排不了障。
+                "detail": entry.detail,
+            })),
+            // 预检之后才被停用这种竞态：把这条记成失败，而不是把整批结果丢掉——
+            // 前面几条可能已经真的发出去了(给 Telegram 发了通知),操作员必须
+            // 看到哪一条发了、哪一条没发。
+            Ok(Err(e)) => results.push(json!({
+                "event": name,
+                "result": "not_loaded",
+                "elapsed_ms": 0,
+                "detail": format!("插件未启用或加载失败,这一条没能派发:{e:#}"),
+            })),
+            Err(e) => return fail(anyhow::anyhow!(e)),
         }
     }
-    let event = Event::Plugin {
-        name: "plugin_expiry_soon".into(),
-        payload: serde_json::json!({
-            "node_id": 0,
-            "name": "test",
-            "expires_at": (Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
-            "days_left": 1,
-            "threshold_days": 1,
-        }),
-    };
-    // `dispatch_one` 自己只在取插件快照时借一次读锁,执行期间不持锁,所以
-    // 这里不必再套一层 guard。wasm 是 CPU 活,仍挪进 blocking 线程,用预先
-    // 取好的 runtime handle 驱动——run_one 的 spawn 与超时照常落在 runtime 上。
-    let outcome = {
-        let app = app.clone();
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || handle.block_on(plugin::Registry::dispatch_one(&app, id, &event)))
-            .await
-    };
-    match outcome {
-        Ok(Ok(entry)) => Json(json!({
-            "plugin_id": plugin_id,
-            "wasm_result": entry.result,
-            "elapsed_ms": entry.elapsed_ms,
-            // 插件自己打的话:错误码是它私有的,`other:2` 光看数字排不了障。
-            "detail": entry.detail,
-        }))
-        .into_response(),
-        // 未加载(未启用或加载失败)是调用侧可修复的状态,400 而不是 500。
-        Ok(Err(_)) => bad("插件未启用或加载失败；先启用它再测试"),
-        Err(e) => fail(anyhow::anyhow!(e)),
-    }
+    Json(json!({"plugin_id": plugin_id, "results": results})).into_response()
 }
 
 /// 一个插件的派发日志(R16):内存环形缓冲的快照按 plugin_id 过滤,取最近
@@ -1131,14 +1189,17 @@ mod tests {
         assert!(row.enabled && row.status == "enabled");
         assert!(app.plugins.read().unwrap_or_else(|e| e.into_inner()).is_loaded(id));
 
-        // 测试通知:合成的 ExpirySoon 事件,返回真实执行结果。
+        // 测试通知:按订阅逐条合成、逐条真派发(plugin_manifest 订阅两条)。
         let tested = test_plugin(Admin, State(app.clone()), Path(id)).await;
         assert_eq!(tested.status(), StatusCode::OK);
         let body = body_of(tested).await;
         assert_eq!(body["plugin_id"], "com.example.lifecycle");
-        assert_eq!(body["wasm_result"], "success");
-        assert!(body["elapsed_ms"].as_u64().is_some());
-        assert!(body["detail"].is_null(), "不打日志的插件 detail 就是 null");
+        let first = &body["results"][0];
+        assert_eq!(first["event"], "agent_offline");
+        assert_eq!(first["result"], "success");
+        assert!(first["elapsed_ms"].as_u64().is_some());
+        assert!(first["detail"].is_null(), "不打日志的插件 detail 就是 null");
+        assert_eq!(body["results"].as_array().unwrap().len(), 2, "两条订阅各一条结果");
 
         assert_eq!(disable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         let row = app.db.get_plugin(id).unwrap().unwrap();
@@ -1255,12 +1316,151 @@ mod tests {
         // 空串等于没填:预检必须与插件运行时看到的一致。
         assert_eq!(set("bot_token", "").await.status(), StatusCode::OK);
         assert_eq!(test().await.status(), StatusCode::BAD_REQUEST, "空值不算填过");
+        // 拦下的是整批测试,不是「第一条」:一条都不该派发出去。
+        assert!(
+            app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot().is_empty(),
+            "缺必填配置时不该派发任何一条"
+        );
 
         // 填上真值:放行,回到真实的派发路径(MINIMAL_WAT 返回 0)。
         assert_eq!(set("bot_token", "123:abc").await.status(), StatusCode::OK);
         let ok = test().await;
         assert_eq!(ok.status(), StatusCode::OK);
-        assert_eq!(body_of(ok).await["wasm_result"], "success");
+        assert_eq!(body_of(ok).await["results"][0]["result"], "success");
+    }
+
+    /// 「测试」的合成事件:宿主自身事件用真实结构(字段齐全),插件事件回放
+    /// manifest 里声明的样例。node_id 一律 0——真实节点 id 为正,订阅节点事件的
+    /// 插件据此忽略它,一次测试才不会在别人的数据里留下残留。
+    #[test]
+    fn synthetic_events_carry_real_host_payloads_and_replay_samples() {
+        let text = "plugin_id = \"com.example.synth\"\nname = \"t\"\nversion = \"1.0.0\"\n\
+                    abi_version = 2\nsubscribes = [\"agent_offline\", \"agent_online\", \"node_added\", \
+                    \"node_deleted\", \"plugin_expiry_soon\", \"plugin_ghost\"]\n\
+                    [[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{\"node_id\":7,\"name\":\"edge-1\"}'\n";
+        let events = synthetic_events(&Manifest::parse(text).unwrap(), 1_000);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "agent_offline",
+                "agent_online",
+                "node_added",
+                "node_deleted",
+                "plugin_expiry_soon",
+                "plugin_ghost"
+            ],
+            "按 subscribes 的顺序逐条来,面板才好逐条展示"
+        );
+        match &events[0].1 {
+            Some(Event::AgentOffline { node_id, name, observed_at, last_seen_at }) => {
+                assert_eq!(
+                    (*node_id, observed_at, last_seen_at),
+                    (0, &1_000, &700),
+                    "留一段静默时长,离线文案才有东西可渲染"
+                );
+                assert_eq!(name, "test");
+            }
+            other => panic!("应当是真实结构的 AgentOffline,实际 {other:?}"),
+        }
+        match &events[1].1 {
+            Some(Event::AgentOnline { node_id, observed_at, .. }) => {
+                assert_eq!((*node_id, *observed_at), (0, 1_000))
+            }
+            other => panic!("应当是 AgentOnline,实际 {other:?}"),
+        }
+        // 新增与删除共用一个 created_at:财务插件按「身份相符」判要不要真删,
+        // 一配对净效果为零,不会留下一条名为 test 的假节点。
+        match (&events[2].1, &events[3].1) {
+            (
+                Some(Event::NodeAdded { created_at: added, .. }),
+                Some(Event::NodeDeleted { created_at, .. }),
+            ) => {
+                assert_eq!((added, created_at), (&1_000, &1_000));
+            }
+            other => panic!("应当是 NodeAdded + NodeDeleted,实际 {other:?}"),
+        }
+        match &events[4].1 {
+            Some(Event::Plugin { name, payload }) => {
+                assert_eq!(name, "plugin_expiry_soon");
+                assert_eq!(payload["name"], "edge-1", "回放的是插件在 manifest 里声明的样例");
+            }
+            other => panic!("应当回放声明的样例,实际 {other:?}"),
+        }
+        assert!(events[5].1.is_none(), "没声明样例的插件事件记成「测不了」,而不是编一个空载荷去派发");
+    }
+
+    /// 「测试」按订阅逐条真派发:一次点击把每条订阅都过一遍真实路径,声明的样例
+    /// 回放给插件。订阅顺序即结果顺序。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_plugin_walks_every_subscribed_event() {
+        let app = plugin_app();
+        let manifest = format!(
+            "{}[[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{{\"node_id\":0,\"name\":\"test\"}}'\n",
+            plugin_manifest("com.example.walks", 2)
+        );
+        assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+
+        let body = body_of(test_plugin(Admin, State(app.clone()), Path(id)).await).await;
+        assert_eq!(body["plugin_id"], "com.example.walks");
+        let results = body["results"].as_array().expect("逐条结果").clone();
+        let names: Vec<&str> = results.iter().map(|r| r["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["agent_offline", "plugin_expiry_soon"], "plugin_manifest 订阅的这两条");
+        for entry in &results {
+            assert_eq!(entry["result"], "success", "MINIMAL_WAT 对什么都返回 0:{entry}");
+            assert!(entry["elapsed_ms"].as_u64().is_some());
+        }
+    }
+
+    /// 没声明 `[[sample]]` 的插件事件:明说「测不了」,而不是编一个空载荷派发——
+    /// 空载荷到插件那边是解析失败(错误码 1),操作员会以为是自己的插件坏了。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsampled_plugin_event_is_reported_not_dispatched() {
+        let app = plugin_app();
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.nosample", 2))).await.status(),
+            StatusCode::OK
+        );
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+
+        let results = body_of(test_plugin(Admin, State(app.clone()), Path(id)).await).await["results"]
+            .as_array()
+            .expect("逐条结果")
+            .clone();
+        assert_eq!(results[0]["result"], "success");
+        assert_eq!(results[1]["result"], "no_sample");
+        assert!(
+            results[1]["detail"].as_str().unwrap_or_default().contains("样例"),
+            "要说清缺什么:{:?}",
+            results[1]["detail"]
+        );
+        // 关键:那一条没有被派发出去(派发日志里只该有真正跑过的那条)。
+        let logged: Vec<String> = app
+            .plugins
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .dispatch_log_snapshot()
+            .into_iter()
+            .map(|entry| entry.event_type)
+            .collect();
+        assert_eq!(logged, ["agent_offline"], "没样例的那条不该进派发日志");
+    }
+
+    /// 靠 tick/page 工作、没订阅任何事件的插件:「测试」返回空结果而不是报错
+    /// ——它没什么可测的,但按钮不该因此变红。(tick_archive 的 manifest 就是
+    /// subscribes = [] + tick,且模块真的导出了 on_tick。)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_without_subscriptions_tests_nothing() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, tick_archive("com.example.quiet")).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+
+        let body = body_of(test_plugin(Admin, State(app.clone()), Path(id)).await).await;
+        assert_eq!(body["results"], json!([]), "没有订阅就没有可测的:空结果,不是错误");
     }
 
     /// 预检遇到读库失败要报 500,不能把库故障说成「你还没配」——那是一句自信而错误
@@ -1291,7 +1491,8 @@ mod tests {
         let app = plugin_app();
         let manifest = format!(
             "{}[[kv]]\nkey = \"bot_token\"\nlabel = \"Bot Token\"\nrequired = true\n\
-             hint = \"向 @BotFather 申请\"\n[[kv]]\nkey = \"chat_id\"\n",
+             hint = \"向 @BotFather 申请\"\n[[kv]]\nkey = \"tpl\"\ntype = \"textarea\"\n\
+             default = \"⏰ {{name}} 到期\"\n[[kv]]\nkey = \"chat_id\"\n",
             plugin_manifest("com.example.declares", 2)
         );
         assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
@@ -1299,8 +1500,9 @@ mod tests {
         assert_eq!(
             body[0]["config"],
             json!([
-                {"key": "bot_token", "label": "Bot Token", "required": true, "hint": "向 @BotFather 申请"},
-                {"key": "chat_id", "label": null, "required": false, "hint": null},
+                {"key": "bot_token", "label": "Bot Token", "required": true, "hint": "向 @BotFather 申请", "type": "text", "default": null},
+                {"key": "tpl", "label": null, "required": false, "hint": null, "type": "textarea", "default": "⏰ {name} 到期"},
+                {"key": "chat_id", "label": null, "required": false, "hint": null, "type": "text", "default": null},
             ])
         );
         // 没声明 [[kv]] 的插件解析出空表:面板照旧,不显示配置提示。
@@ -1510,8 +1712,11 @@ mod tests {
         let entries = log.as_array().unwrap();
         assert_eq!(entries.len(), 2, "alpha 测试了两次:{log}");
         assert!(entries.iter().all(|e| e["plugin_id"] == "com.example.alpha"), "{log}");
+        // 每次「测试」派发的是它订阅的那条宿主事件。plugin_manifest 订阅两条,其中
+        // plugin_expiry_soon 是插件事件而 manifest 没给它声明样例,所以不派发——
+        // 真跑过的只有 agent_offline。
         assert!(
-            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "plugin_expiry_soon"),
+            entries.iter().all(|e| e["result"] == "success" && e["event_type"] == "agent_offline"),
             "{log}"
         );
         // 快照新 → 旧:最新一条在头部(两次测试可能落在同一秒,只比先后)。
