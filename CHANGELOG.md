@@ -5,6 +5,12 @@ All notable changes to monitor-hub will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- 插件面板的派发日志支持翻页:`GET /api/plugins/{id}/logs` 接受 `page` / `page_size` 查询参数(缺省 1 / 50,单页上限 500),响应改为 `{ entries, total, page, page_size }` 信封——`total` 是该插件在环形缓冲里的全部条数,翻页不动它。之前硬编码只回最近 100 条,更早的派发在面板上不可见;现在可以一直翻到环形缓冲的最旧一条(至多 1000 条)。
+
 ## [2.0.7] - 2026-09-20
 
 ### Added

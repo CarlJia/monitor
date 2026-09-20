@@ -320,6 +320,17 @@ export type PluginLogEntry = {
   detail: string | null
 }
 
+/**
+ * 派发日志的一页（R16）。`total` 是该插件在环形缓冲里的全部条数，翻页不动它；
+ * `entries` 沿快照的新 → 旧顺序，第一页是最新的一段，翻过头的页是空数组。
+ */
+export type PluginLogPage = {
+  entries: PluginLogEntry[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export type PluginKv = { key: string; value: string }
 
 /**
@@ -379,8 +390,9 @@ export const testPlugin = (id: number) =>
     { method: "POST" },
   )
 
-/** 一个插件最近的 100 条派发记录（R16）。 */
-export const pluginLogs = (id: number) => api<PluginLogEntry[]>(`/plugins/${id}/logs`)
+/** 一个插件的派发记录（R16），按页取：page 从 1 起，缺省单页 50 条。 */
+export const pluginLogs = (id: number, page = 1, pageSize = 50) =>
+  api<PluginLogPage>(`/plugins/${id}/logs?page=${page}&page_size=${pageSize}`)
 
 /** 写一个插件的 kv 行（R13）。key 校验在后端 set_plugin_kv。 */
 export const setPluginKv = (id: number, key: string, value: string) =>

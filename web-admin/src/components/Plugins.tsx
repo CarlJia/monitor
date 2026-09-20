@@ -242,13 +242,24 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
   )
 }
 
-// 底部日志卡片（R16）：后端的日志 API 按插件查，所以这里带一个插件选择器，
-// 默认跟第一个插件。事件类型复选筛选，最多显示后端给的最近 100 条。
+// 底部日志卡片（R16）：后端的日志 API 按插件查并分页（缺省单页 50 条），所以
+// 这里带一个插件选择器，默认跟第一个插件。事件类型复选筛选仍在本页内做；
+// 环形缓冲最多留 1000 条，翻页可以一直翻到最旧。
+const LOGS_PAGE_SIZE = 50
+
 function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }) {
   const [selected, setSelected] = useState<number | null>(null)
   const [entries, setEntries] = useState<PluginLogEntry[] | null>(null)
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
   const [events, setEvents] = useState<string[]>(Object.keys(EVENT_BADGES))
   const [tick, setTick] = useState(0)
+  // 序号化的重拉：翻页、刷新与动作后的并发响应若乱序，只有最新一次落地——
+  // 与父组件 loadSeq 同一招，旧页的慢响应不能盖掉新页。
+  const seq = useRef(0)
+  // 上一轮的「环境」快照：换插件、刷新、动作（pulse）或列表重载都会变。环境
+  // 变了页码就拨回第一页——新记录都落在最前，停在旧页只会看错数据。
+  const lastEpoch = useRef<string | null>(null)
 
   // 插件列表变化（上传、删除）时保住仍存在的选择，否则回落到第一个。
   useEffect(() => {
@@ -257,23 +268,43 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   }, [plugins])
 
   useEffect(() => {
+    const epoch = `${selected}-${pulse}-${tick}-${plugins.length}`
+    const epochChanged = lastEpoch.current !== epoch
+    lastEpoch.current = epoch
+    // 先清日志：无论是否跳过，都不该把上一帧（可能属于已删插件）的记录留在屏上。
+    setEntries(null)
+    // 环境变了而页码停在旧处：这一帧只拨页码、不发请求——页码变化会立刻再触发
+    // 本 effect，避免用旧页码多发一次、乱序时把第一页盖掉。
+    if (epochChanged && page !== 1) {
+      setPage(1)
+      return
+    }
     // 守卫：selected 不在最新列表里就跳过——别拿已删 id 去请求 logs（404）。删除
     // 后 plugins 更新会让选中项回退，但那次回退所在的渲染里 selected 还是旧值，
     // 这道门就负责拦下那一帧。
-    // 先清日志：无论是否跳过，都不该把上一帧（可能属于已删插件）的记录留在屏上。
-    setEntries(null)
     if (selected == null || !plugins.some((p) => p.id === selected)) return
-    pluginLogs(selected)
-      .then(setEntries)
-      .catch((e: Error) => { setEntries([]); toast.error(e.message) })
+    const s = ++seq.current
+    pluginLogs(selected, page, LOGS_PAGE_SIZE)
+      .then((r) => {
+        if (s !== seq.current) return
+        setEntries(r.entries)
+        setTotal(r.total)
+      })
+      .catch((e: Error) => {
+        if (s !== seq.current) return
+        setEntries([])
+        setTotal(0)
+        toast.error(e.message)
+      })
     // pulse：「测试」（不重拉列表）与「启停」后由父组件递增，触发本 effect 重跑；
     // 上传/删除只重拉列表，靠 plugins 变化触发（见 remove()）。
-  }, [selected, pulse, tick, plugins])
+  }, [selected, pulse, tick, plugins, page])
 
   if (!plugins.length || selected == null) return null
   const shown = (entries ?? []).filter((entry) => events.includes(entry.event_type))
   const toggle = (type: string) =>
     setEvents((old) => (old.includes(type) ? old.filter((t) => t !== type) : [...old, type]))
+  const pages = Math.max(1, Math.ceil(total / LOGS_PAGE_SIZE))
 
   return (
     <Card className="gap-4 p-5">
@@ -281,7 +312,8 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
         <div>
           <h3 className="text-sm font-medium">派发日志</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            该插件最近 100 次派发（含「测试」按钮的调用）。缓冲在 hub 内存里，重启后为空；长期审计在通知日志表。
+            该插件的派发记录分页展示，新的在前（含「测试」按钮的调用）。缓冲在 hub
+            内存里，最多 1000 条，重启后为空；长期审计在通知日志表。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -348,6 +380,30 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
               )}
             </div>
           ))}
+        </div>
+      )}
+      {entries !== null && total > 0 && (
+        <div className="flex items-center justify-end gap-2 text-xs text-muted-foreground">
+          {/* 事件筛选只作用于当前页，页码与条数始终按后端的全部记录算。 */}
+          <span className="tnum">
+            第 {page} / {pages} 页 · 共 {total} 条
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+          >
+            上一页
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page >= pages}
+            onClick={() => setPage((p) => Math.min(pages, p + 1))}
+          >
+            下一页
+          </Button>
         </div>
       )}
     </Card>
