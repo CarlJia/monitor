@@ -290,12 +290,16 @@ pub async fn list_plugins(_: Admin, State(app): State<Shared>) -> Response {
                         "tick": m.as_ref().map(|m| m.tick).unwrap_or(false),
                         "cleanup": m.as_ref().map(|m| m.cleanup).unwrap_or(false),
                         // 声明的渠道配置字段:面板「配置」对话框据此渲染标签、
-                        // 标注必填、显示提示,不必让操作者猜 key 名。
+                        // 标注必填、显示提示,不必让操作者猜 key 名。`type` 决定
+                        // 单行还是多行控件,`default` 是没配值时预填的文案——两者
+                        // 都是通用能力,面板不知道哪个字段是「模板」。
                         "config": m.as_ref().map(|m| m.kv.iter().map(|c| json!({
                             "key": c.key.clone(),
                             "label": c.label.clone(),
                             "required": c.required,
                             "hint": c.hint.clone(),
+                            "type": c.kind.clone(),
+                            "default": c.default.clone(),
                         })).collect::<Vec<_>>()).unwrap_or_default(),
                     })
                 })
@@ -1291,7 +1295,8 @@ mod tests {
         let app = plugin_app();
         let manifest = format!(
             "{}[[kv]]\nkey = \"bot_token\"\nlabel = \"Bot Token\"\nrequired = true\n\
-             hint = \"向 @BotFather 申请\"\n[[kv]]\nkey = \"chat_id\"\n",
+             hint = \"向 @BotFather 申请\"\n[[kv]]\nkey = \"tpl\"\ntype = \"textarea\"\n\
+             default = \"⏰ {{name}} 到期\"\n[[kv]]\nkey = \"chat_id\"\n",
             plugin_manifest("com.example.declares", 2)
         );
         assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
@@ -1299,8 +1304,9 @@ mod tests {
         assert_eq!(
             body[0]["config"],
             json!([
-                {"key": "bot_token", "label": "Bot Token", "required": true, "hint": "向 @BotFather 申请"},
-                {"key": "chat_id", "label": null, "required": false, "hint": null},
+                {"key": "bot_token", "label": "Bot Token", "required": true, "hint": "向 @BotFather 申请", "type": "text", "default": null},
+                {"key": "tpl", "label": null, "required": false, "hint": null, "type": "textarea", "default": "⏰ {name} 到期"},
+                {"key": "chat_id", "label": null, "required": false, "hint": null, "type": "text", "default": null},
             ])
         );
         // 没声明 [[kv]] 的插件解析出空表:面板照旧,不显示配置提示。

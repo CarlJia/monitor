@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
-import type { PluginFieldDecl } from "./api.ts"
+import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, kvIsDefault, kvShownValue, kvWriteFor, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
+import type { PluginConfigDecl, PluginFieldDecl } from "./api.ts"
 import { dispatchResultText, money } from "./format.ts"
 
 // `fields` 来自插件写的 JSON，类型只是断言。下面几例故意喂类型系统不允许的
@@ -273,4 +273,41 @@ assert.deepEqual(addresses({ observed_ip: "::ffff:192.168.1.9", ipv4: "192.168.1
 // 两族都空时两行都空,调用方渲染整列占位符。
 assert.deepEqual(addresses({}), lines([]))
 
-console.log("partial edits, traffic corrections, provisioning, page-vocabulary, address and dispatch-result checks passed")
+// 插件「配置」对话框的预填与落库判定（U2）。展示值：存量非空白优先，其次声明
+// 里的默认值——面板必须与插件看到的「没有值」一致，所以纯空白也算没有。
+const tplDecl: PluginConfigDecl = {
+  key: "template_agent_offline", label: "离线文案", required: false, hint: null,
+  type: "textarea", default: "🔴 节点 {name} 已离线",
+}
+const plainDecl: PluginConfigDecl = { key: "chat_id", label: null, required: false, hint: null }
+assert.equal(kvShownValue("我的文案", tplDecl), "我的文案")
+assert.equal(kvShownValue(null, tplDecl), "🔴 节点 {name} 已离线")
+assert.equal(kvShownValue("", tplDecl), "🔴 节点 {name} 已离线")
+assert.equal(kvShownValue("   ", tplDecl), "🔴 节点 {name} 已离线")
+// 没声明默认值的字段（token、chat_id 这类）展示空串，与今天一致。
+assert.equal(kvShownValue(null, plainDecl), "")
+assert.equal(kvShownValue(null, undefined), "")
+// 展示值正好等于默认值 = 还没自定义过；没有默认值时这个判定永远为假。
+assert.equal(kvIsDefault(tplDecl.default!, tplDecl), true)
+assert.equal(kvIsDefault("我的文案", tplDecl), false)
+assert.equal(kvIsDefault("", plainDecl), false)
+
+const kvRow = (value: string, original: string | null, decl?: PluginConfigDecl) => ({ key: tplDecl.key, value, original, decl })
+// 没自定义过的新行不写：否则打开一次对话框点保存，就把内置文案固化成了 kv 值，
+// 之后插件升级换了文案，这份存量值再也跟不上。
+assert.equal(kvWriteFor(kvRow(tplDecl.default!, null, tplDecl)), undefined)
+// 原本自定义过、现在回到默认值：写空把它清掉，插件那边回退到内置文案。
+assert.equal(kvWriteFor(kvRow(tplDecl.default!, "我的文案", tplDecl)), "")
+// 库里本来就存着空串（上次清空过），显示的是默认值：什么都不用动。
+assert.equal(kvWriteFor(kvRow(tplDecl.default!, "", tplDecl)), undefined)
+// 改了内容写新值，没改什么都不写。
+assert.equal(kvWriteFor(kvRow("我的文案", "我的文案", tplDecl)), undefined)
+assert.equal(kvWriteFor(kvRow("新文案", "我的文案", tplDecl)), "新文案")
+// 没有默认值的字段维持今天的规则：填了才写、值变了才写。
+assert.equal(kvWriteFor({ key: "chat_id", value: "", original: null, decl: plainDecl }), undefined)
+assert.equal(kvWriteFor({ key: "chat_id", value: "-100", original: null, decl: plainDecl }), "-100")
+assert.equal(kvWriteFor({ key: "chat_id", value: "-100", original: "-100", decl: plainDecl }), undefined)
+// 自己加的行（没声明、key 还空着）不写。
+assert.equal(kvWriteFor({ key: "  ", value: "x", original: null }), undefined)
+
+console.log("partial edits, traffic corrections, provisioning, page-vocabulary, address, plugin-config and dispatch-result checks passed")

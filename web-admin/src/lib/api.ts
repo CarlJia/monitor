@@ -224,6 +224,64 @@ export type PluginConfigDecl = {
   required: boolean
   /** 一句话填写说明；未声明为 null。 */
   hint: string | null
+  /**
+   * 编辑形态：`textarea` 用多行控件，其余（含缺省与认不出的值）用单行输入框。
+   * 与插件页 `form` 块那套 `FIELD_TYPES` 是两条渲染路径，互不相干。
+   */
+  type?: string
+  /**
+   * 该 key 没有值时对话框里预填的文案——插件内置文案的基准，好让操作员「改一个
+   * 字」而不是从空白写起。null 或缺省 = 没有默认值。
+   */
+  default?: string | null
+}
+
+/**
+ * 「配置」对话框一行的草稿：当前值、库里的原值、以及 manifest 的声明。
+ * `original` 为 null 表示库里还没有这一行。
+ */
+export type KvDraft = { key: string; value: string; original: string | null; decl?: PluginConfigDecl }
+
+/**
+ * 一行在对话框里显示的文案：存量非空白优先，其次声明里的默认值，最后空串。
+ *
+ * 「空白也算没有」是刻意的：操作员把模板清空保存后，kv 行还在但值是空的，宿主
+ * 对空值返回 0、插件回退到内置文案——面板必须与插件看到的一致，所以重新打开
+ * 对话框时显示回默认文案，而不是一格看不见的空。
+ */
+export function kvShownValue(stored: string | null | undefined, decl?: PluginConfigDecl): string {
+  const value = stored ?? ""
+  if (value.trim() !== "") return value
+  return decl?.default ?? ""
+}
+
+/**
+ * 这一行是否「没被自定义过」——展示值正好是声明里的默认值。
+ *
+ * 用途是**不落库**：打开对话框什么都没改就点保存，不该把内置文案固化成一条 kv
+ * 值（固化了之后插件升级换了内置文案，这份存量值再也跟不上）。代价是一条恰好与
+ * 内置文案逐字相同的自定义模板会被当成没自定义——渲染结果一样，只是配置从显式
+ * 变回隐式。
+ */
+export function kvIsDefault(shown: string, decl?: PluginConfigDecl): boolean {
+  return decl?.default != null && shown === decl.default
+}
+
+/**
+ * 一行草稿该写什么：`undefined` = 不动，空串 = 清掉这一行（插件回退到内置
+ * 文案），其余是要写的值。调用方负责 key 的取值与形状校验。
+ */
+export function kvWriteFor(row: KvDraft): string | undefined {
+  const asDefault = kvIsDefault(row.value, row.decl)
+  if (row.original === null) {
+    // 没填完的新行不落库：空值、只有默认值、或 key 还是空的，都不该为它写一行
+    // ——落一条空 kv 会让配置列表里多出一行操作员从没创建、也解释不了来源的记录。
+    if (row.key.trim() === "" || row.value === "" || asDefault) return undefined
+    return row.value
+  }
+  // 原本自定义过、现在回到默认值：写空把它清掉，而不是留着那份旧文案。
+  if (asDefault) return row.original === "" ? undefined : ""
+  return row.value === row.original ? undefined : row.value
 }
 
 export type Plugin = {
