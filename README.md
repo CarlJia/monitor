@@ -90,7 +90,7 @@ payload = '{"node_id":0,"name":"test"}'  # JSON 对象；顶层不能带 type（
 | `plugin_id` | 非空、不含 `:`（它是 kv 命名空间 `plugin.<plugin_id>:<key>` 的分隔符）；重复的 `plugin_id` 上传被拒，升级需先删除旧版 |
 | `name` / `version` | 非空 |
 | `abi_version` | 必须为 `2` |
-| `subscribes` | 订阅的宿主事件列表，最多 32 条。宿主自身的事件名有白名单——`agent_offline` / `agent_online` / `node_added` / `node_deleted`，其余必须是 `plugin_` 前缀，写错在上传时即被拒。`node_added` / `node_deleted` 是较新的宿主事件：宿主未升级时插件会因白名单校验而加载失败，**发布顺序是先宿主后插件**（`abi_version` 仍为 2）。v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
+| `subscribes` | 订阅的宿主事件列表，最多 32 条、不重复。宿主自身的事件名有白名单——`agent_offline` / `agent_online` / `node_added` / `node_deleted`，其余必须是 `plugin_` 前缀，写错在上传时即被拒。`node_added` / `node_deleted` 是较新的宿主事件：宿主未升级时插件会因白名单校验而加载失败，**发布顺序是先宿主后插件**（`abi_version` 仍为 2）。v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
 | `wasm_entry` | 可选，缺省 `plugin.wasm`：包内 wasm 入口文件名 |
 | `[tick]` | 存在则每小时调度一次 `on_tick`（面板**启用**插件成功后立刻另跑一次） |
 | `[page]` | 存在则面板里出现「页面」入口；`title` 必填 |
@@ -193,6 +193,10 @@ SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id）
 ——同一秒内删掉再新建、且 id 恰好被复用，两台机器会得到相同的身份。所以订阅者该拿它做
 校验而不是做删除的依据：对不上就当没发生过，等下一轮 `nodes_query` 对账（宿主的删除会先清掉
 该 id 的通知行，复用 id 的新机器不会因此被抑制）。两个事件是异步派发的，可能乱序到达。
+
+**「测试」端点的合成事件用 `node_id: 0`**（见「上传与生命周期」第 5 条）——
+真实节点 id 为正，订阅节点事件的插件应据此忽略合成事件。一次「测试」如果
+留下了一行名为 `test` 的幽灵记录，那是插件漏了这层守卫。
 
 ### 面板页面协议（manifest 声明 `[page]` 时）
 
@@ -339,19 +343,25 @@ SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id）
    「先删再传」；
 4. 启用：`POST /api/plugins/{id}/enable`（加载失败会标记 `failed` 并带原因；成功后宿主
    立刻为该插件跑一次 `on_tick`，不阻塞这次响应）；
-5. 测试：`POST /api/plugins/{id}/test` 构造一条合成的 `plugin_expiry_soon`
-   事件，走与真实派发完全相同的执行路径。派发前先按 manifest 的 `[[kv]]`
-   预检必填项，缺项（行不存在或值为空）直接 400 点名缺哪一项，而不是让插件
-   回来一个 `other:2` 让操作员猜；
+5. 测试：`POST /api/plugins/{id}/test` **按 manifest 的 `subscribes` 逐条**合成事件
+   并派发，走与真实派发完全相同的执行路径，逐条返回结果。宿主自身事件
+   （`agent_offline` / `agent_online` / `node_added` / `node_deleted`）用真实结构造，
+   其中 `node_id` 一律为 `0`——真实节点 id 为正，**订阅节点事件的插件必须据此
+   忽略合成事件**，否则一次「测试」就在插件自己的数据里留下一行名为 `test`
+   的假节点（这也是 `finance-stats` 必须加 `node_id > 0` 门的原因）。
+   `plugin_` 前缀的事件宿主一无所知，只能回放插件在 `[[sample]]` 里声明的载荷；
+   没声明的那条报「没有样例载荷」而不是编一个空载荷。派发前先按 `[[kv]]`
+   预检必填项，缺项（行不存在或值为空）直接 400 点名缺哪一项、一条都不派发
+   ——拦的是整批，不是第一条；
 6. 页面：`GET /api/plugins/{id}/page` 调 `render_page` 拿 JSON 描述；
    面板里的交互走 `POST /api/plugins/{id}/action` 调 `on_action`；
 7. 清理：`POST /api/plugins/{id}/cleanup` 调 `on_cleanup`——清理逻辑
    完全在插件手里，宿主只转发调用与回收统计；
 8. 日志：`GET /api/plugins/{id}/logs` 返回最近 100 条派发结果（进程内环形
    缓冲，重启后为空；长期审计在 notification_log）。每条另带 `detail`：插件
-   自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
-   在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
-   审计表，不混插件自由文本）。
+自己经 `host.log` 打的话——`other:2` 这种错误码是插件私有的，原因只可能
+在那句话里。`detail` 只进内存派发日志，不进 notification_log（那是宿主的
+审计表，不混插件自由文本）。
 
 渠道配置（bot token 等）不建议打进 wasm——在 manifest 里用 `[[kv]]` 声明
 字段（面板据此渲染标签、必填标记与提示），值写在面板的插件 KV 编辑器里
@@ -387,4 +397,3 @@ SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id）
 - **1.2.1** — 插件失败透出插件日志、`host.rs` 拆分
 - **1.2.0** — 插件 ABI 升到 v2（破坏性）：14 个宿主函数、SSRF 防线、`plugin_data` 自持表、`finance-stats` 财务统计插件、`tg-notify` 迁移到 v2
 - **1.0.0** — 初始版本
-
