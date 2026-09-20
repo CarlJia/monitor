@@ -519,9 +519,15 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
                 // 插件自己打的话:错误码是它私有的,`other:2` 光看数字排不了障。
                 "detail": entry.detail,
             })),
-            // 未加载(未启用或加载失败)是调用侧可修复的状态,400 而不是 500。
-            // 预检通过之后才被停用这类竞态也走这里:整批失败,不给半批结果。
-            Ok(Err(_)) => return bad("插件未启用或加载失败；先启用它再测试"),
+            // 预检之后才被停用这种竞态：把这条记成失败，而不是把整批结果丢掉——
+            // 前面几条可能已经真的发出去了(给 Telegram 发了通知),操作员必须
+            // 看到哪一条发了、哪一条没发。
+            Ok(Err(e)) => results.push(json!({
+                "event": name,
+                "result": "not_loaded",
+                "elapsed_ms": 0,
+                "detail": format!("插件未启用或加载失败,这一条没能派发:{e:#}"),
+            })),
             Err(e) => return fail(anyhow::anyhow!(e)),
         }
     }
