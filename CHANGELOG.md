@@ -5,11 +5,12 @@ All notable changes to monitor-hub will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.7] - 2026-09-20
 
 ### Added
 
 - 财务统计页「汇总与币种选择」合成一行展示：年化续费总成本、剩余总价值与展示币种下拉同处一栏，操作员一眼能把两个数与按什么币种算的对上；汇率不可用时金额印「—」，下拉照常给（#12）。
+- CI(plugin-contract)：拒绝契约 tag 时检查契约 crate 是否落后于主仓——上一次发布的 `monitor-plugin-contract-v2.0.0` 指向的 commit 落后 main 三个修复，ABI 已声明但 `ABI_VERSION` 未重导出、MockHttp 也没 `Arc`，拉 tag 编译插件会直接挂。比对 tag 与 main 的 crate 内容，任何差异即拒绝放行；祖先检查抓不到这种情况（stale commit 仍是 main 的祖先）。
 
 ## [2.0.3] - 2026-09-18
 
