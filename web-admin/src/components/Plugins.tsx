@@ -15,7 +15,7 @@ import {
   deletePlugin, deletePluginKv, disablePlugin, enablePlugin, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
   type KvDraft, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
-import { dispatchResultText } from "@/lib/format"
+import { testResultsText } from "@/lib/format"
 
 import { ConfirmDialog } from "./ConfirmDialog"
 
@@ -424,14 +424,15 @@ export function Plugins({ go }: { go: (to: string) => void }) {
     setTesting(plugin.id)
     try {
       const r = await testPlugin(plugin.id)
-      // 描述里插件自己的日志优先：`result: other:2` 对操作者毫无信息量，缺什么
-      // 配置、被 SSRF 拦了、还是 Telegram 回了非 2xx，全在那句话里。
-      const description = dispatchResultText({
-        result: r.wasm_result,
-        elapsed_ms: r.elapsed_ms,
-        detail: r.detail,
-      })
-      if (r.wasm_result === "success") {
+      // 一次点击会把每条订阅都真派发一遍（见宿主侧 test_plugin），所以逐条展示，
+      // 整体成败按「每条都成功」算。描述里插件自己的日志优先：`result: other:2` 对
+      // 操作者毫无信息量，缺什么配置、被 SSRF 拦了、还是 Telegram 回了非 2xx，
+      // 全在那句话里。
+      const { ok, text } = testResultsText(r.results)
+      // `whitespace-pre-line`：多条结果靠换行分条，默认样式会把换行折成空格，
+      // 三条挤成一句就分不清哪条属于哪个事件。
+      const description = <span className="whitespace-pre-line">{text}</span>
+      if (ok) {
         toast.success(`${plugin.name} 测试派发成功`, { description })
       } else {
         toast.error(`${plugin.name} 测试派发失败`, { description })

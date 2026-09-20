@@ -323,6 +323,13 @@ export type PluginLogEntry = {
 export type PluginKv = { key: string; value: string }
 
 /**
+ * 「测试」的一条派发结果。`result` 与派发日志同一套词表（`success` /
+ * `other:N` / `timeout` / `host_error:…`），另有一个 `no_sample`——这条订阅是插件
+ * 事件而 manifest 没给它声明样例载荷，宿主根本没派发（不是失败，是测不了）。
+ */
+export type PluginTestResult = { event: string; result: string; elapsed_ms: number; detail: string | null }
+
+/**
  * 上传插件包（R11）。multipart 的 `plugin` 字段带 tar.gz，后端上限 8 MiB。
  * 单独于 `api()`：FormData 不能带 json 的 content-type；413 是代理拦的，
  * 网络断在 fetch 自己身上——两者都要一句人说的话。
@@ -370,8 +377,9 @@ export const disablePlugin = (id: number) =>
  * 声明了必填 `[[config]]` 而还没填时返回 400，body 是点名缺哪一项的中文说明
  * （`api()` 会把它当 error message 抛出来）。
  */
+/** 测试一个插件（R12）：按它声明的订阅逐条真派发，逐条返回结果。 */
 export const testPlugin = (id: number) =>
-  api<{ plugin_id: string; wasm_result: string; elapsed_ms: number; detail: string | null }>(
+  api<{ plugin_id: string; results: PluginTestResult[] }>(
     `/plugins/${id}/test`,
     { method: "POST" },
   )

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict"
 import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, kvIsDefault, kvShownValue, kvWriteFor, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
 import type { PluginConfigDecl, PluginFieldDecl } from "./api.ts"
-import { dispatchResultText, money } from "./format.ts"
+import { dispatchResultText, money, testResultsText } from "./format.ts"
 
 // `fields` 来自插件写的 JSON，类型只是断言。下面几例故意喂类型系统不允许的
 // 值：归一化必须自己挡住，不能靠调用方守规矩。
@@ -272,6 +272,29 @@ assert.deepEqual(addresses({ observed_ip: "::FFFF:8.8.8.8", ipv4: "192.168.1.25"
 assert.deepEqual(addresses({ observed_ip: "::ffff:192.168.1.9", ipv4: "192.168.1.25" }), lines(["192.168.1.25"]))
 // 两族都空时两行都空,调用方渲染整列占位符。
 assert.deepEqual(addresses({}), lines([]))
+
+// 「测试」逐条结果（U4）：一次点击派发多条，每条一行；整体按「每条都 success」
+// 判成败。一条都没跑起来时既不能读成成功，也不该只剩一句「失败」——第一行说明白。
+assert.deepEqual(testResultsText([]), { ok: false, text: "这个插件没有订阅任何事件，没有可测试的通知" })
+const threeResults = [
+  { event: "agent_offline", result: "success", elapsed_ms: 12, detail: null },
+  { event: "agent_online", result: "success", elapsed_ms: 9, detail: null },
+  { event: "plugin_expiry_soon", result: "other:2", elapsed_ms: 0, detail: "kv 里没有 chat_id" },
+]
+const three = testResultsText(threeResults)
+assert.equal(three.ok, false, "有一条没成，整体就不算成功")
+assert.equal(three.text, [
+  "agent_offline：result: success · 耗时 12 ms",
+  "agent_online：result: success · 耗时 9 ms",
+  "plugin_expiry_soon：kv 里没有 chat_id · result: other:2 · 耗时 0 ms",
+].join("\n"))
+assert.equal(testResultsText(threeResults.slice(0, 2)).ok, true)
+// 全是「没样例」：不是失败，是没有可测的。
+const unsampled = [
+  { event: "plugin_expiry_soon", result: "no_sample", elapsed_ms: 0, detail: "插件没有为这个事件声明 [[sample]] 样例载荷，无法测试" },
+]
+assert.equal(testResultsText(unsampled).ok, false)
+assert.match(testResultsText(unsampled).text, /^没有任何一条被派发/)
 
 // 插件「配置」对话框的预填与落库判定（U2）。展示值：存量非空白优先，其次声明
 // 里的默认值——面板必须与插件看到的「没有值」一致，所以纯空白也算没有。
