@@ -372,11 +372,6 @@ export const enablePlugin = (id: number) =>
 export const disablePlugin = (id: number) =>
   api<{ ok: boolean }>(`/plugins/${id}/disable`, { method: "POST" })
 
-/**
- * 测试通知（R12）：合成一个明天的 ExpirySoon 事件走真实派发路径。
- * 声明了必填 `[[config]]` 而还没填时返回 400，body 是点名缺哪一项的中文说明
- * （`api()` 会把它当 error message 抛出来）。
- */
 /** 测试一个插件（R12）：按它声明的订阅逐条真派发，逐条返回结果。 */
 export const testPlugin = (id: number) =>
   api<{ plugin_id: string; results: PluginTestResult[] }>(
