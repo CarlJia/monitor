@@ -258,8 +258,14 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   // 与父组件 loadSeq 同一招，旧页的慢响应不能盖掉新页。
   const seq = useRef(0)
   // 上一轮的「环境」快照：换插件、刷新、动作（pulse）或列表重载都会变。环境
-  // 变了页码就拨回第一页——新记录都落在最前，停在旧页只会看错数据。
+  // 变了页码就拨回第一页——新记录都落在最前，停在旧页只会看错数据。取
+  // plugins.length 而非数组身份：启停走乐观更新，列表身份变了内容没变，
+  // 不该为此多拉一次日志。
   const lastEpoch = useRef<string | null>(null)
+  const epoch = useMemo(
+    () => `${selected}-${pulse}-${tick}-${plugins.length}`,
+    [selected, pulse, tick, plugins.length],
+  )
 
   // 插件列表变化（上传、删除）时保住仍存在的选择，否则回落到第一个。
   useEffect(() => {
@@ -267,8 +273,9 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
     setSelected((cur) => (cur != null && plugins.some((p) => p.id === cur) ? cur : plugins[0].id))
   }, [plugins])
 
+  // 依赖 epoch 而非四个原始值：环境没变的重渲染（乐观更新后的列表换血）不再
+  // 触发重拉，一次启停收敛为 pulse 那一次请求。
   useEffect(() => {
-    const epoch = `${selected}-${pulse}-${tick}-${plugins.length}`
     const epochChanged = lastEpoch.current !== epoch
     lastEpoch.current = epoch
     // 先清日志：无论是否跳过，都不该把上一帧（可能属于已删插件）的记录留在屏上。
@@ -297,8 +304,10 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
         toast.error(e.message)
       })
     // pulse：「测试」（不重拉列表）与「启停」后由父组件递增，触发本 effect 重跑；
-    // 上传/删除只重拉列表，靠 plugins 变化触发（见 remove()）。
-  }, [selected, pulse, tick, plugins, page])
+    // 上传/删除只重拉列表，靠 epoch 变化触发（见 remove()）。plugins 是守卫读的
+    // 当帧闭包，刻意不入依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [epoch, page])
 
   if (!plugins.length || selected == null) return null
   const shown = (entries ?? []).filter((entry) => events.includes(entry.event_type))

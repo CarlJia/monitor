@@ -390,8 +390,8 @@ export const testPlugin = (id: number) =>
     { method: "POST" },
   )
 
-/** 一个插件的派发记录（R16），按页取：page 从 1 起，缺省单页 50 条。 */
-export const pluginLogs = (id: number, page = 1, pageSize = 50) =>
+/** 一个插件的派发记录（R16），按页取：page 从 1 起；缺省值在后端（1 / 50）。 */
+export const pluginLogs = (id: number, page: number, pageSize: number) =>
   api<PluginLogPage>(`/plugins/${id}/logs?page=${page}&page_size=${pageSize}`)
 
 /** 写一个插件的 kv 行（R13）。key 校验在后端 set_plugin_kv。 */

@@ -541,8 +541,8 @@ pub struct LogPage {
     page_size: Option<u32>,
 }
 
-/// 单页条数的缺省与上限。环形缓冲全局只留 1000 条,500 已能一页装下单个插件
-/// 的全部记录,再大的请求没有意义。
+/// 单页条数的缺省与上限。缓冲是全局的(`DISPATCH_LOG_CAP`),单个插件最多可
+/// 占满全部 1000 条;上限 500 只限制单次序列化的规模,一页装不下就翻页。
 const LOG_PAGE_SIZE_DEFAULT: u32 = 50;
 const LOG_PAGE_SIZE_MAX: u32 = 500;
 
@@ -560,7 +560,6 @@ pub async fn plugin_dispatch_log(
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    // 就近夹取而非 400:操作员自己的面板,夹回合法区间省一次往返。
     let page_no = page.page.unwrap_or(1).max(1);
     let page_size = page.page_size.unwrap_or(LOG_PAGE_SIZE_DEFAULT).clamp(1, LOG_PAGE_SIZE_MAX);
     let filtered: Vec<_> = app
