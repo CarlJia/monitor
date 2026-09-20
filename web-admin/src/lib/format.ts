@@ -92,17 +92,21 @@ export function dispatchResultText(
  * `dispatchResultText`——错误码对操作员没有信息量，插件自己打的那句才有。
  *
  * 整体成败按「每条都 success」算。一条都没跑起来时（没订阅，或订阅的插件事件都
- * 没声明样例载荷）不算成功，也别让它读成「派发失败」——第一行先把这件事说明白。
+ * 没声明样例载荷）不算成功，也别让它读成「派发失败」——`dispatched` 让面板把这种
+ * 情况弹成 warning 而不是 error。
  */
 export function testResultsText(
   results: { event: string; result: string; elapsed_ms: number; detail: string | null }[],
-): { ok: boolean; text: string } {
+): { ok: boolean; dispatched: boolean; text: string } {
   if (results.length === 0) {
-    return { ok: false, text: "这个插件没有订阅任何事件，没有可测试的通知" }
+    return { ok: false, dispatched: false, text: "这个插件没有订阅任何事件，没有可测试的通知" }
   }
+  // `no_sample` 是「该条没派发」的事实标记：测试端点收到这一类条目时没真发出消息。
+  // 面板据此判断要不要把整次测试弹成 warning（一条都没真发）。
+  const dispatched = results.some((entry) => entry.result !== "no_sample")
   const head = results.every((entry) => entry.result === "no_sample")
     ? "没有任何一条被派发：订阅的插件事件都没有声明样例载荷"
     : ""
   const lines = results.map((entry) => `${entry.event}：${dispatchResultText(entry)}`)
-  return { ok: results.every((entry) => entry.result === "success"), text: [head, ...lines].filter(Boolean).join("\n") }
+  return { ok: results.every((entry) => entry.result === "success"), dispatched, text: [head, ...lines].filter(Boolean).join("\n") }
 }

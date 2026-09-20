@@ -97,9 +97,7 @@ function KvDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) 
 
   async function save() {
     if (!rows) return
-    // 与后端 set_plugin_kv 同一套规则，先在本地过一遍，报错能带上 key。
-    // 与后端 set_plugin_kv 同一套规则，先在本地过一遍，报错能带上 key。该不该
-    // 写、写什么由 kvWriteFor 决定（纯函数，有测试）——没填完的新行、以及声明了
+    // 该写什么、该不该写由 kvWriteFor 决定（纯函数，有测试）——没填完的新行、以及声明了
     // 默认值却没被自定义的字段都不会落库。
     const writes: [string, string][] = []
     for (const row of rows) {
@@ -427,11 +425,13 @@ export function Plugins({ go }: { go: (to: string) => void }) {
       // 一次点击会把每条订阅都真派发一遍（见宿主侧 test_plugin），所以逐条展示，
       // 整体成败按「每条都成功」算；单条文案怎么拼（含插件日志优先）由
       // testResultsText 拥有，这里不重复那套规则。
-      const { ok, text } = testResultsText(r.results)
-      // `whitespace-pre-line`：多条结果靠换行分条，默认样式会把换行折成空格，
-      // 三条挤成一句就分不清哪条属于哪个事件。
+      const { ok, dispatched, text } = testResultsText(r.results)
+      // 一条都没派发（没订阅、或订阅的插件事件都缺样例）不算失败：宿主对这两种情况
+      // 返的都是 200,报「派发失败」会让一个完全正常的插件显得坏了。
       const description = <span className="whitespace-pre-line">{text}</span>
-      if (ok) {
+      if (!dispatched) {
+        toast.warning(`${plugin.name} 没有可测试的通知`, { description })
+      } else if (ok) {
         toast.success(`${plugin.name} 测试派发成功`, { description })
       } else {
         toast.error(`${plugin.name} 测试派发失败`, { description })

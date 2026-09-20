@@ -275,7 +275,7 @@ assert.deepEqual(addresses({}), lines([]))
 
 // 「测试」逐条结果（U4）：一次点击派发多条，每条一行；整体按「每条都 success」
 // 判成败。一条都没跑起来时既不能读成成功，也不该只剩一句「失败」——第一行说明白。
-assert.deepEqual(testResultsText([]), { ok: false, text: "这个插件没有订阅任何事件，没有可测试的通知" })
+assert.deepEqual(testResultsText([]), { ok: false, dispatched: false, text: "这个插件没有订阅任何事件，没有可测试的通知" })
 const threeResults = [
   { event: "agent_offline", result: "success", elapsed_ms: 12, detail: null },
   { event: "agent_online", result: "success", elapsed_ms: 9, detail: null },
@@ -283,6 +283,7 @@ const threeResults = [
 ]
 const three = testResultsText(threeResults)
 assert.equal(three.ok, false, "有一条没成，整体就不算成功")
+assert.equal(three.dispatched, true, "有一条真派发了,不算「什么都没发」")
 assert.equal(three.text, [
   "agent_offline：result: success · 耗时 12 ms",
   "agent_online：result: success · 耗时 9 ms",
@@ -293,8 +294,10 @@ assert.equal(testResultsText(threeResults.slice(0, 2)).ok, true)
 const unsampled = [
   { event: "plugin_expiry_soon", result: "no_sample", elapsed_ms: 0, detail: "插件没有为这个事件声明 [[sample]] 样例载荷，无法测试" },
 ]
-assert.equal(testResultsText(unsampled).ok, false)
-assert.match(testResultsText(unsampled).text, /^没有任何一条被派发/)
+const un = testResultsText(unsampled)
+assert.equal(un.ok, false)
+assert.equal(un.dispatched, false)
+assert.match(un.text, /^没有任何一条被派发/)
 
 // 插件「配置」对话框的预填与落库判定（U2）。展示值：存量非空白优先，其次声明
 // 里的默认值——面板必须与插件看到的「没有值」一致，所以纯空白也算没有。
