@@ -3,11 +3,12 @@
 //! 这里通过 `use crate::api::{...}` 复用。
 
 use axum::extract::multipart::MultipartError;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -531,24 +532,56 @@ pub async fn test_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     Json(json!({"plugin_id": plugin_id, "results": results})).into_response()
 }
 
-/// 一个插件的派发日志(R16):内存环形缓冲的快照按 plugin_id 过滤,取最近
-/// 100 条。缓冲是进程内的,重启后为空——面板把它当「刚才发生了什么」看,
-/// 长期审计在 notification_log。
-pub async fn plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+/// 派发日志的分页查询参数(R16)。`page` 从 1 起算,`page_size` 是单页条数;
+/// 都缺省(page=1、page_size=50)。越界值就近夹取而不是 400:这是操作员自己的
+/// 面板,夹到合法区间比报错更省一次往返。
+#[derive(Deserialize, Default)]
+pub struct LogPage {
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+/// 单页条数的缺省与上限。环形缓冲全局只留 1000 条,500 已能一页装下单个插件
+/// 的全部记录,再大的请求没有意义。
+const LOG_PAGE_SIZE_DEFAULT: u32 = 50;
+const LOG_PAGE_SIZE_MAX: u32 = 500;
+
+/// 一个插件的派发日志(R16):内存环形缓冲的快照按 plugin_id 过滤,分页返回。
+/// 缓冲是进程内的,重启后为空——面板把它当「刚才发生了什么」看,长期审计在
+/// notification_log。快照新 → 旧,分页延续同一顺序:第一页是最新的一段,
+/// total 是该插件在缓冲里的全部条数,翻页不改变它。
+pub async fn plugin_dispatch_log(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    Query(page): Query<LogPage>,
+) -> Response {
     let plugin_id = match plugin_or_404(&app, id) {
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let entries: Vec<_> = app
+    // 就近夹取而非 400:操作员自己的面板,夹回合法区间省一次往返。
+    let page_no = page.page.unwrap_or(1).max(1);
+    let page_size = page.page_size.unwrap_or(LOG_PAGE_SIZE_DEFAULT).clamp(1, LOG_PAGE_SIZE_MAX);
+    let filtered: Vec<_> = app
         .plugins
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .dispatch_log_snapshot()
         .into_iter()
         .filter(|entry| entry.plugin_id == plugin_id)
-        .take(100)
         .collect();
-    Json(entries).into_response()
+    // (page-1)*page_size 在 u32 相乘会溢出,先升位再算;跳过的是快照下标,
+    // 总量至多环形缓冲的 1000,usize 装得下。
+    let skip = (page_no as u64 - 1) * page_size as u64;
+    let entries: Vec<_> = filtered.iter().skip(skip as usize).take(page_size as usize).collect();
+    Json(json!({
+        "entries": entries,
+        "total": filtered.len(),
+        "page": page_no,
+        "page_size": page_size,
+    }))
+    .into_response()
 }
 
 /// 一个声明了 page 的启用插件渲染它的面板页面(U5/KTD5)。宿主调插件的
@@ -1708,9 +1741,15 @@ mod tests {
             assert_eq!(test_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
         }
 
-        let log = body_of(plugin_dispatch_log(Admin, State(app.clone()), Path(alpha)).await).await;
-        let entries = log.as_array().unwrap();
+        let log = body_of(
+            plugin_dispatch_log(Admin, State(app.clone()), Path(alpha), Query(LogPage::default())).await,
+        )
+        .await;
+        let entries = log["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "alpha 测试了两次:{log}");
+        assert_eq!(log["total"], 2, "分页总数按插件过滤后计:{log}");
+        assert_eq!(log["page"], 1, "缺省落在第一页:{log}");
+        assert_eq!(log["page_size"], 50, "缺省单页 50 条:{log}");
         assert!(entries.iter().all(|e| e["plugin_id"] == "com.example.alpha"), "{log}");
         // 每次「测试」派发的是它订阅的那条宿主事件。plugin_manifest 订阅两条,其中
         // plugin_expiry_soon 是插件事件而 manifest 没给它声明样例,所以不派发——
@@ -1723,9 +1762,74 @@ mod tests {
         assert!(entries[0]["at"].as_i64() >= entries[1]["at"].as_i64(), "{log}");
 
         assert_eq!(
-            plugin_dispatch_log(Admin, State(app.clone()), Path(9999)).await.status(),
+            plugin_dispatch_log(Admin, State(app.clone()), Path(9999), Query(LogPage::default()))
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// 分页把环形缓冲里该插件的全部分派记录翻出来,不再止步旧实现的「最近
+    /// 100 条」:第一页是最新的一段,往后翻按同一顺序续,翻过头给空页而
+    /// total 仍然报全量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_dispatch_log_paginates_through_the_whole_ring() {
+        let app = plugin_app();
+        assert_eq!(
+            upload(&app, plugin_archive(&plugin_manifest("com.example.alpha", 2))).await.status(),
+            StatusCode::OK
+        );
+        let id = app.db.list_plugins().unwrap()[0].id;
+        for _ in 0..3 {
+            assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+            assert_eq!(test_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        }
+
+        let call = |page: u32, size: u32| {
+            let app = app.clone();
+            async move {
+                body_of(
+                    plugin_dispatch_log(
+                        Admin,
+                        State(app),
+                        Path(id),
+                        Query(LogPage { page: Some(page), page_size: Some(size) }),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        // 三条记录、单页 2 条:第一页装最新两条,第二页是剩下的最旧一条。
+        let first = call(1, 2).await;
+        assert_eq!(first["total"], 3, "{first}");
+        assert_eq!(first["page"], 1, "{first}");
+        assert_eq!(first["page_size"], 2, "{first}");
+        assert_eq!(first["entries"].as_array().unwrap().len(), 2, "{first}");
+        let second = call(2, 2).await;
+        assert_eq!(second["entries"].as_array().unwrap().len(), 1, "{second}");
+        assert_eq!(second["total"], 3, "翻页不动 total:{second}");
+        // 快照新 → 旧跨页保持:第一页末条不早于第二页首条(可能同秒)。
+        let first_ats = first["entries"].as_array().unwrap();
+        let second_ats = second["entries"].as_array().unwrap();
+        assert!(
+            first_ats.last().unwrap()["at"].as_i64() >= second_ats[0]["at"].as_i64(),
+            "跨页顺序应仍是新 → 旧:{first} {second}"
+        );
+
+        // 翻过头的页是空的,total 不变——前端据此知道没有更多页。
+        let past = call(9, 2).await;
+        assert_eq!(past["entries"].as_array().unwrap().len(), 0, "{past}");
+        assert_eq!(past["total"], 3, "{past}");
+
+        // 单页 0 条与超过上限的 page_size 都就近夹取,不报错。
+        let clamped = call(1, 0).await;
+        assert_eq!(clamped["page_size"], 1, "{clamped}");
+        assert_eq!(clamped["entries"].as_array().unwrap().len(), 1, "{clamped}");
+        let clamped = call(1, 9999).await;
+        assert_eq!(clamped["page_size"], 500, "{clamped}");
+        assert_eq!(clamped["entries"].as_array().unwrap().len(), 3, "{clamped}");
     }
 
     /// restore 整库替换 plugin 表,内存里的 Registry 也必须跟着按还原后的
