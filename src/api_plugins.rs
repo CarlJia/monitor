@@ -4,7 +4,7 @@
 
 use axum::extract::multipart::MultipartError;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
@@ -264,6 +264,119 @@ fn unpack_plugin(archive: &[u8]) -> Result<HashMap<String, Vec<u8>>, anyhow::Err
         bail!("插件包里没有任何文件");
     }
     Ok(files)
+}
+
+/// 含数据包里 `data.json` 的当前格式版本（KTD1）。旧 hub 不认这个条目会
+/// 静默忽略；新 hub 用它给将来的格式演进留门。
+const DATA_JSON_FORMAT: u32 = 1;
+/// 含数据包里数据条目的固定文件名（KTD1、KTD3）。
+const DATA_JSON_NAME: &str = "data.json";
+
+/// 含数据包的数据条目形状（KTD1）。`plugin_id` 与 `plugin.toml` 的必须一致，
+/// 否则导入侧按构造包 400（防向别的插件命名空间注入数据）。`records` 的
+/// `updated_at` 随包导出但不参与包优先合并（R8），保留是为将来若改选时间
+/// 仲裁不必换格式。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DataJson {
+    pub format: u32,
+    pub plugin_id: String,
+    #[serde(default)]
+    pub kv: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub records: std::collections::BTreeMap<String, DataRecord>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct DataRecord {
+    pub data: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+/// 把导出快照打成一个扁平 tar.gz（KTD1、KTD2）：`plugin.toml`（库内
+/// `manifest_json` 原文直接作字节，不重序列化）、wasm（按 manifest 声明的
+/// `wasm_entry` 原名）、`data.json`。全程内存，包仅数 MiB。
+fn pack_export(export: &crate::db_plugins::PluginExport, wasm_entry: &str) -> Result<Vec<u8>, anyhow::Error> {
+    use anyhow::Context;
+    use std::io::Read;
+
+    let data = DataJson {
+        format: DATA_JSON_FORMAT,
+        plugin_id: export.plugin.plugin_id.clone(),
+        kv: export.kv.iter().cloned().collect(),
+        records: export
+            .records
+            .iter()
+            .map(|(k, d)| (k.clone(), DataRecord { data: d.clone(), updated_at: 0 }))
+            .collect(),
+    };
+    let data_json = serde_json::to_vec(&data).context("序列化 data.json 失败")?;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut encoder);
+        let entries: [(&str, &[u8]); 3] = [
+            ("plugin.toml", export.plugin.manifest_json.as_bytes()),
+            (wasm_entry, &export.plugin.wasm_blob),
+            (DATA_JSON_NAME, &data_json),
+        ];
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            let mut reader = bytes;
+            builder
+                .append_data(&mut header, name, reader.by_ref())
+                .with_context(|| format!("打包条目 {name} 失败"))?;
+        }
+        builder.into_inner().context("收尾 tar 失败")?;
+    }
+    encoder.finish().context("gzip 收尾失败")
+}
+
+/// 导出一个插件连同它的数据（R1–R4）：单事务快照读 + 内存 tar.gz 下载。
+///
+/// 停用与加载失败的行同样导得出——数据是值钱的部分，不能只给启用行（R1）。
+/// 响应头与整库备份同级（R4）：包内含明文渠道密钥，`no-store` 禁缓存、
+/// `attachment` 触发下载、`Content-Length` 让浏览器显示进度。
+pub async fn export_plugin(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let packed = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, String, Vec<u8>)>, anyhow::Error> {
+            use anyhow::Context;
+            let Some(export) = app.db.export_plugin(id)? else {
+                return Ok(None);
+            };
+            // wasm 入口名按 manifest 声明取原名，round-trip 才能把模块按原名放回。
+            let manifest = Manifest::parse(&export.plugin.manifest_json)
+                .context("库内 manifest 解析失败，无法确定 wasm 入口名")?;
+            let filename = format!(
+                "{}-{}-{}.tar.gz",
+                export.plugin.plugin_id,
+                export.plugin.version,
+                Utc::now().format("%Y%m%d-%H%M%S")
+            );
+            let bytes = pack_export(&export, &manifest.wasm_entry)?;
+            Ok(Some((filename, export.plugin.plugin_id, bytes)))
+        })
+    }
+    .await;
+
+    match packed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        Ok(Some((filename, _plugin_id, bytes))) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (header::CONTENT_LENGTH, bytes.len().to_string()),
+                // 包内含明文渠道密钥：与整库备份同级，任何共享缓存都不得留副本。
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+                (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+            ],
+            axum::body::Body::from(bytes),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => fail(e),
+    }
 }
 
 /// 面板的插件列表(R12)。manifest_json 就在行里,把 subscribes 与 v2 的能力
@@ -1042,6 +1155,89 @@ mod tests {
         assert_eq!(listed[0]["subscribes"], json!(["agent_offline", "plugin_expiry_soon"]));
         assert_eq!(listed[0]["status"], "disabled");
         assert!(listed[0].get("wasm_blob").is_none(), "列表不携带模块字节");
+    }
+
+    /// 把导出响应体解开成 `文件名 -> 字节` 的表,复用生产的解包路径。
+    async fn unpack_export(response: Response) -> HashMap<String, Vec<u8>> {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        unpack_plugin(&bytes).unwrap()
+    }
+
+    /// 导出一个插件连同它的数据(R2、R4):三个条目都在,plugin.toml 与库内
+    /// manifest_json 逐字节一致,data.json 的记录/kv 与库一致,响应头带 no-store
+    /// 与 attachment。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_packs_the_plugin_with_its_data() {
+        let app = plugin_app();
+        let archive = plugin_archive(&plugin_manifest("com.example.fin", 2));
+        assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        let manifest_json = app.db.get_plugin(id).unwrap().unwrap().manifest_json;
+        app.db.plugin_data_put("com.example.fin", "node:1", "42").unwrap();
+        app.db.set("plugin.com.example.fin:bot_token", "secret").unwrap();
+
+        let response = export_plugin(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert!(headers[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
+        assert_eq!(headers[header::CONTENT_TYPE], "application/octet-stream");
+
+        let files = unpack_export(response).await;
+        assert_eq!(files.len(), 3, "plugin.toml + wasm + data.json");
+        assert_eq!(files["plugin.toml"], manifest_json.as_bytes(), "manifest 原文逐字节一致");
+        assert!(files.contains_key("plugin.wasm"), "缺省 wasm_entry 名");
+        let data: DataJson = serde_json::from_slice(&files["data.json"]).unwrap();
+        assert_eq!(data.format, 1);
+        assert_eq!(data.plugin_id, "com.example.fin");
+        assert_eq!(data.records["node:1"].data, "42");
+        assert_eq!(data.kv["bot_token"], "secret");
+    }
+
+    /// 不存在的 id 返回 404。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exporting_a_missing_plugin_is_404() {
+        let app = plugin_app();
+        assert_eq!(
+            export_plugin(Admin, State(app.clone()), Path(9999)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// 自定义 wasm_entry:manifest 声明非缺省名时 wasm 条目用该名——round-trip
+    /// 把模块按原名放回的前提。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_uses_the_declared_wasm_entry_name() {
+        let app = plugin_app();
+        let manifest = "plugin_id = \"com.example.fin\"\nname = \"Fin\"\nversion = \"1.0.0\"\n\
+             abi_version = 2\nsubscribes = [\"agent_offline\"]\nwasm_entry = \"module.wasm\"\n"
+            .to_owned();
+        let archive = tarball(&[
+            ("plugin.toml", manifest.into_bytes()),
+            ("module.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
+        ]);
+        assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+
+        let files = unpack_export(export_plugin(Admin, State(app.clone()), Path(id)).await).await;
+        assert!(files.contains_key("module.wasm"), "wasm 用声明的入口名");
+        assert!(!files.contains_key("plugin.wasm"));
+    }
+
+    /// 停用与 failed 的行同样导得出——数据是值钱的部分,不允许实现成只给
+    /// enabled 行(R1)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_and_failed_plugins_can_still_be_exported() {
+        let app = plugin_app();
+        let archive = plugin_archive(&plugin_manifest("com.example.fin", 2));
+        assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        // 上传后就是 disabled;再打成 failed。
+        app.db.set_plugin_status(id, "failed", Some("boom")).unwrap();
+
+        let response = export_plugin(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(response.status(), StatusCode::OK, "failed 行也导得出");
+        assert_eq!(unpack_export(response).await.len(), 3);
     }
 
     /// 每一种坏包都带着原因被拒,并且什么都不写:manifest 缺失、ABI 不符、

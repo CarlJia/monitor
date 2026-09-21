@@ -452,6 +452,7 @@ async fn main() -> Result<()> {
         // routes, because a plugin tar.gz is megabytes against this layer's
         // 64 KiB ceiling; everything else is a few bytes of id and key.
         .route("/api/plugins", get(api_plugins::list_plugins))
+        .route("/api/plugins/{id}/export", get(api_plugins::export_plugin))
         .route("/api/plugins/{id}", delete(api_plugins::delete_plugin))
         .route("/api/plugins/{id}/enable", post(api_plugins::enable_plugin))
         .route("/api/plugins/{id}/disable", post(api_plugins::disable_plugin))
