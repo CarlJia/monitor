@@ -763,17 +763,31 @@ pub async fn list_plugin_kv(_: Admin, State(app): State<Shared>, Path(id): Path<
 /// 拼好的精确键,不走 LIKE:调用方给的是 key 而不是模式,`%` 与 `_` 只能按
 /// 字符匹配。删除不存在的行不是错误——两处面板同时打开,后点的那个同样
 /// 达成目标(与 `delete_session` 对同一竞态的处理一致)。
+///
+/// 插件在 manifest `[[kv]]` 里声明过的字段是内置参数,挡删除:删掉它渠道配置
+/// 就没了(bot_token 一没,通知一个都发不出),所以只许改值、不许删行——模板类
+/// 字段清空保存即回到插件内置文案,用不着删。清单接口对坏 manifest 容错,这里
+/// 同一态度:解析失败就不拦,手工改库弄坏的行不至于连删都删不掉。
 pub async fn delete_plugin_kv_route(
     _: Admin,
     State(app): State<Shared>,
     Path((id, key)): Path<(i64, String)>,
 ) -> Response {
-    let plugin_id = match plugin_or_404(&app, id) {
-        Ok(plugin_id) => plugin_id,
-        Err(resp) => return resp,
+    let row = match app.db.get_plugin(id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return fail(e),
     };
+    let plugin_id = row.plugin_id;
     if let Some(resp) = kv_key_error(&key) {
         return resp;
+    }
+    if let Ok(manifest) = Manifest::parse(&row.manifest_json) {
+        if manifest.kv.iter().any(|decl| decl.key == key) {
+            return bad(&format!(
+                "key「{key}」由插件在 plugin.toml 里声明，不能删除；请直接修改它的值（模板类字段清空保存即回到插件内置文案）"
+            ));
+        }
     }
     match app.db.delete_setting(&format!("plugin.{plugin_id}:{key}")) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1723,6 +1737,34 @@ mod tests {
             delete_plugin_kv_route(Admin, State(app.clone()), Path((9999, "k".to_owned()))).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// 插件声明过的 key 拒绝删除——那是内置参数,删掉渠道配置就没了,只能
+    /// 改值;没声明的存量 key 照旧可删。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_kv_key_refuses_deletion_but_an_undeclared_one_still_deletes() {
+        let app = plugin_app();
+        let manifest = format!(
+            "{}[[kv]]\nkey = \"bot_token\"\nrequired = true\n",
+            plugin_manifest("com.example.kv-guard", 2)
+        );
+        assert_eq!(upload(&app, plugin_archive(&manifest)).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        let put = |key: &str| {
+            set_plugin_kv(Admin, State(app.clone()), Path((id, key.to_owned())), Json(json!({"value": "v"})))
+        };
+        assert_eq!(put("bot_token").await.status(), StatusCode::OK);
+        assert_eq!(put("extra").await.status(), StatusCode::OK);
+        let del = |key: &str| delete_plugin_kv_route(Admin, State(app.clone()), Path((id, key.to_owned())));
+
+        // 声明过的:400,行还在——删除被整个挡下,不是删掉声明行外的什么。
+        assert_eq!(del("bot_token").await.status(), StatusCode::BAD_REQUEST);
+        let listed = body_of(list_plugin_kv(Admin, State(app.clone()), Path(id)).await).await;
+        assert_eq!(listed.as_array().unwrap().len(), 2, "声明过的 key 不该被删掉：{listed}");
+        assert!(listed.as_array().unwrap().iter().any(|r| r["key"] == "bot_token"), "{listed}");
+
+        // 没声明的存量 key:照旧可删。
+        assert_eq!(del("extra").await.status(), StatusCode::NO_CONTENT);
     }
 
     /// 派发日志按 plugin_id 过滤:两个插件各自测试过,每个的日志只有自己的。

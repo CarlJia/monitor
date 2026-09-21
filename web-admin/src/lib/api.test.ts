@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, kvIsDefault, kvShownValue, kvWriteFor, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
+import { addresses, asText, changes, formPayload, GIB, httpErrorText, inputType, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, moneyCell, normalizeFields, provisioningSite, toastKind, trafficCorrection } from "./api.ts"
 import type { PluginConfigDecl, PluginFieldDecl } from "./api.ts"
 import { dispatchResultText, money, testResultsText } from "./format.ts"
 
@@ -335,5 +335,10 @@ assert.equal(kvWriteFor({ key: "chat_id", value: "-100", original: null, decl: p
 assert.equal(kvWriteFor({ key: "chat_id", value: "-100", original: "-100", decl: plainDecl }), undefined)
 // 自己加的行（没声明、key 还空着）不写。
 assert.equal(kvWriteFor({ key: "  ", value: "x", original: null }), undefined)
+// 删除资格：声明过的字段是内置参数，只能改值不给删；自定义的 key 才可删。
+assert.equal(kvDeletable({ key: "chat_id", value: "-100", original: "-100", decl: plainDecl }), false)
+assert.equal(kvDeletable(kvRow(tplDecl.default!, null, tplDecl)), false)
+assert.equal(kvDeletable({ key: "webhook_url", value: "x", original: "x" }), true)
+assert.equal(kvDeletable({ key: "  ", value: "x", original: null }), true)
 
 console.log("partial edits, traffic corrections, provisioning, page-vocabulary, address, plugin-config and dispatch-result checks passed")
