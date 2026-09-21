@@ -22,19 +22,32 @@ use crate::{App, Shared};
 
 // ---- plugins(U5):上传、启停删、测试、日志与 kv ----
 
-/// 插件上传包(tar.gz)的累计字节上限(R11)。独立于主题的 32 MiB:一个插件是
-/// 一份 manifest 加一个 wasm 模块,8 MiB 已是宽裕。这条路由因此挂在
-/// [`MAX_CHUNK`] 的 merge 子 router 上(见 main),reverse proxy 需要放行的
-/// 单请求大小与备份分片相同。
-pub const MAX_PLUGIN: u64 = 8 * 1024 * 1024;
+/// 插件上传包(tar.gz)的收流字节上限(R10、KTD5)。抬到 32 MiB 与主题
+/// [`MAX_THEME`] 对齐:含数据包要装下满配额的 plugin_data(16 MiB)加 wasm
+/// 模块(16 MiB)及序列化开销。这条路由**不再**共用 [`MAX_CHUNK`] 的 merge
+/// 子 router,而是挂进自己的嵌套子 router(见 main),两层 body limit 都配成
+/// 本常量——reverse proxy 需要按 32 MiB 放行**插件上传路由**(备份分片与主题
+/// 上传的 8 MiB 不变)。
+///
+/// 纯插件包(无 data.json)的有效上限仍是 8 MiB:抬高的是收流上限,纯包在
+/// unpack 后按压缩体复查、超 8 MiB 仍拒(见 [`install_plugin`]),只是拒绝
+/// 时机从收流移到解包后。
+pub const MAX_PLUGIN: u64 = 32 * 1024 * 1024;
+
+/// 纯插件包(无 data.json)在 unpack 后复查的压缩体上限(KTD5):纯包的有效
+/// 上限不变,只是从收流上限降级为解包后复查,好让含数据包共用同一条收流
+/// 路径而不给纯包松绑。
+const PURE_PLUGIN_MAX: u64 = 8 * 1024 * 1024;
 
 /// 解包防护,与 frontend 的主题包防护同一套思路,只是全程内存、不落盘:
 /// 条目数、单个 entry 与解压后的总量分别封顶,把三种形态的解压炸弹都挡在
-/// 写库之前。上限比主题宽(200 条 / 16 MiB / 32 MiB),因为插件包预期就是
-/// 两个文件,任何接近上限的包都可疑。
+/// 写库之前。数据条目时代的口径(KTD5):单 entry 24 MiB 容纳满配额数据
+/// 的序列化膨胀,总展开 40 MiB 容纳 wasm 16 + 数据 24;条目数仍 200——
+/// 数据不逐记录一个条目(装不下),而是一个 data.json,任何接近条目数
+/// 上限的包都可疑。
 const PLUGIN_MAX_ENTRIES: usize = 200;
-const PLUGIN_MAX_FILE: u64 = 16 << 20;
-const PLUGIN_MAX_EXPANDED: u64 = 32 << 20;
+const PLUGIN_MAX_FILE: u64 = 24 << 20;
+const PLUGIN_MAX_EXPANDED: u64 = 40 << 20;
 /// manifest 与 wasm 模块各自的体量上限:manifest 是几十行 TOML,wasm 模块
 /// 在 16 MiB 封顶处与单 entry 上限重合。
 const PLUGIN_MANIFEST_MAX: usize = 64 * 1024;
@@ -151,6 +164,12 @@ fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
     use anyhow::{bail, Context};
 
     let files = unpack_plugin(archive)?;
+    // 纯插件包(无 data.json)的有效上限仍是 8 MiB(KTD5):收流上限抬到
+    // 32 MiB 是给含数据包用的,纯包在解包后按压缩体复查,超出仍拒且文案
+    // 与现状同款——拒绝时机从收流移到解包后,不算行为变化。
+    if !files.contains_key(DATA_JSON_NAME) && archive.len() as u64 > PURE_PLUGIN_MAX {
+        bail!("插件包超过 {} MiB 的上限", PURE_PLUGIN_MAX / 1024 / 1024);
+    }
     let toml_text = files.get("plugin.toml").context("插件包里没有 plugin.toml")?;
     if toml_text.len() > PLUGIN_MANIFEST_MAX {
         bail!("plugin.toml 超过 64 KiB");
@@ -914,7 +933,7 @@ mod tests {
 
     // 仍留在 api.rs 的测试依赖:分层 router 里挂主 router 的 `nodes`、restore
     // 测试直接调用的 `db_restore`/`Chunk`,以及两道 body limit 共用的 `MAX_CHUNK`。
-    use crate::api::{db_restore, nodes, Chunk, MAX_CHUNK};
+    use crate::api::{db_restore, nodes, Chunk};
     // 与 api.rs 的测试模块同源的会话/建库助手。
     use crate::auth::{random_token, sha256};
     use crate::db::Db;
@@ -924,10 +943,10 @@ mod tests {
     // ---- plugins(U5) ----
     //
     // 上传走 router 级整调(oneshot),分层照抄 main.rs:POST /api/plugins 在
-    // 8 MiB 的 merge 子 router 里,主 router 的 64 KiB 层在它之外。Multipart
-    // 提取器还会在 tower 的层之上再套一层自己的 body limit(缺省 2 MiB),main
-    // 用 DefaultBodyLimit 配平了它——这里照抄,否则 2 MiB 以上的包在测试里就
-    // 先失败,而生产里也会(这是本分层测试真正抓过的 bug)。
+    // 自己的 32 MiB 嵌套子 router 里(U3/KTD5),主 router 的 64 KiB 层在它之外。
+    // Multipart 提取器还会在 tower 的层之上再套一层自己的 body limit(缺省
+    // 2 MiB),main 用 DefaultBodyLimit 配平了它——这里照抄,否则 2 MiB 以上的
+    // 包在测试里就先失败,而生产里也会(这是本分层测试真正抓过的 bug)。
 
     use tower::ServiceExt as _;
 
@@ -1094,14 +1113,16 @@ mod tests {
             .unwrap()
     }
 
-    /// 与 main.rs 相同的分层:上传路由挂在 8 MiB 的 merge 子 router,主 router
-    /// 的 64 KiB 层在它之外。一个超过 64 KiB 的包从这里活着走到 handler,证明
-    /// 挂载的层放行了大包(挂在主 router 的 64 KiB 层之下就会 413)。
+    /// 与 main.rs 相同的分层(U3/KTD5):上传路由挂在自己的 32 MiB 嵌套子
+    /// router,主 router 的 64 KiB 层在它之外。一个超过 64 KiB 的包从这里活着
+    /// 走到 handler,证明挂载的层放行了大包(挂在主 router 的 64 KiB 层之下就会
+    /// 413)。两层都配 MAX_PLUGIN——与生产同值,才测得到 8–32 MiB 的含数据包
+    /// 过两层 body limit。
     fn upload_router(app: &Shared) -> axum::Router {
         let uploads = axum::Router::new()
             .route("/api/plugins", axum::routing::post(upload_plugin))
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_CHUNK))
-            .layer(axum::extract::DefaultBodyLimit::max(MAX_CHUNK))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_PLUGIN as usize))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_PLUGIN as usize))
             .with_state(app.clone());
         axum::Router::new()
             .route("/api/nodes", axum::routing::get(nodes))
@@ -1395,18 +1416,21 @@ mod tests {
         assert_eq!(app.db.list_plugins().unwrap().len(), 1);
     }
 
-    /// 超过字节上限的包,两道防线各尽其职:router 的层先行断流(413),handler
-    /// 的累计上限是它之外的第二道(400 带原因)——后者只有抬高前者才测得到。
+    /// 超过 32 MiB 收流上限的包,两道防线各尽其职:router 的层先行断流(413),
+    /// handler 的累计上限是它之外的第二道(400 带原因)——后者只有抬高前者才
+    /// 测得到。累计检查在 unpack 之前的收流阶段,所以多个大 noise 条目(各自
+    /// 在单 entry 上限内)攒过 32 MiB 即可,不必单条超限。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_package_over_the_byte_cap_is_refused() {
         let app = plugin_app();
         let archive = tarball(&[
             ("plugin.toml", plugin_manifest("com.example.huge", 2).into_bytes()),
-            ("plugin.wasm", noise(MAX_PLUGIN as usize + 1)), // 单 entry 仍在 16 MiB 内
+            ("plugin.wasm", noise(20 * 1024 * 1024)),
+            ("pad.bin", noise(13 * 1024 * 1024)),
         ]);
-        assert!(archive.len() as u64 > MAX_PLUGIN);
+        assert!(archive.len() as u64 > MAX_PLUGIN, "fixture 必须跨过 32 MiB 收流上限");
 
-        // 生产路径:8 MiB 的层先看到超限。
+        // 生产路径:32 MiB 的层先看到超限。
         assert_eq!(upload(&app, archive.clone()).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(app.db.list_plugins().unwrap().is_empty());
 
@@ -1416,6 +1440,28 @@ mod tests {
         let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("上限"), "{}", String::from_utf8_lossy(&bytes));
         assert!(app.db.list_plugins().unwrap().is_empty());
+    }
+
+    /// 纯包(无 data.json)的有效上限仍是 8 MiB(KTD5):压缩体 >8 MiB 的纯包
+    /// 在 unpack 后被复查拒绝,文案与收流上限同款(「超过 8 MiB」)——拒绝时机
+    /// 从收流移到解包后,不算行为变化。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pure_package_over_8_mib_is_refused_after_unpack() {
+        let app = plugin_app();
+        // 难压缩填充把压缩体顶过 8 MiB,但整体在 32 MiB 收流上限内、单条在
+        // 24 MiB 单 entry 上限内——收流层与 unpack 防线都放行,只剩纯包复查拦它。
+        let archive = tarball(&[
+            ("plugin.toml", plugin_manifest("com.example.pure", 2).into_bytes()),
+            ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
+            ("assets/pad.bin", noise(9 * 1024 * 1024)),
+        ]);
+        assert!((archive.len() as u64) > PURE_PLUGIN_MAX && (archive.len() as u64) < MAX_PLUGIN);
+
+        let refused = upload(&app, archive).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "纯包超 8 MiB 复查拒绝");
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("8 MiB"), "{}", String::from_utf8_lossy(&bytes));
+        assert!(app.db.list_plugins().unwrap().is_empty(), "被拒的包一行不写");
     }
 
     /// 启停生命周期:enable 写库又装内存,test 走完整执行路径拿回结果,
