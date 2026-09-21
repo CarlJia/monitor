@@ -113,7 +113,6 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "mem_total": live("mem_total", node.mem_total),
         "swap_total": live("swap_total", node.swap_total),
         "disk_total": live("disk_total", node.disk_total),
-        "agent_version": node.agent_version,
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -138,6 +137,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
     // Address, private notes and the token never leave the panel. The token is
     // included so the install command can be displayed without reissuing it.
     if full {
+        // Panel only: the agent build is operational detail for whoever manages
+        // the fleet, not something a public status page needs to disclose.
+        view["agent_version"] = json!(node.agent_version);
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
@@ -2140,7 +2142,9 @@ mod tests {
         let app = app();
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
-        app.db.save_facts(open, &json!({"hostname": "vps-1"}), "198.51.100.9", "198.51.100.9").unwrap();
+        app.db
+            .save_facts(open, &json!({"hostname": "vps-1", "agent_version": "1.2.3"}), "198.51.100.9", "198.51.100.9")
+            .unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is
         // what a node token in the wrong hands can insert, and what the agent
@@ -2156,7 +2160,10 @@ mod tests {
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "ipv4", "ipv6", "observed_ip", "remark", "hostname", "token"] {
+        // `agent_version` is operational fleet detail: it identifies the build a
+        // machine runs and belongs to whoever manages the panel, not to anonymous
+        // visitors, so it rides with the address fields in the admin-only view.
+        for hidden in ["ip", "ipv4", "ipv6", "observed_ip", "remark", "hostname", "token", "agent_version"] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2179,6 +2186,7 @@ mod tests {
             "面板按地址族择优要用这一列,它必须随 ip/ipv4/ipv6 一起只出现在管理视图"
         );
         assert_eq!(admin[0]["remark"], "secret note");
+        assert_eq!(admin[0]["agent_version"], "1.2.3", "the panel still sees the agent build");
     }
 
     #[tokio::test]
