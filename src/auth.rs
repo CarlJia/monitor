@@ -489,10 +489,18 @@ mod tests {
         assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
     }
 
+    /// `PASSWORD_GATE` 是进程级、只有一个许可的信号量(argon2 太贵,同时只放一个
+    /// 密码校验进门)。任何真正驱动 `login()` 的测试都会争这唯一的许可——两条并发
+    /// 跑,后到的那条拿不到许可、被判 429,而它本想测的是别的东西。用一把测试专用
+    /// 的锁把这些测试串起来,谁驱动 `login()` 谁先拿锁。`#[tokio::test]` 默认是
+    /// current-thread 运行时,所以跨 `.await` 持有 std 的 MutexGuard 是安全的。
+    static LOGIN_SERIAL: Mutex<()> = Mutex::new(());
+
     /// 读库失败不是「密码登录被禁用」——那是策略状态。库坏了要报 500,否则操作员会
     /// 以为是自己关掉了密码登录,而真因被这句谎话盖住。
     #[tokio::test]
     async fn a_broken_read_at_login_is_a_500_not_a_disabled_policy() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
         app.db.set("admin_password_hash", &hash_password("pw").unwrap()).unwrap();
         // 表没了 —— 一次真实的读库失败,而不是「这个 setting 没设」。
@@ -514,6 +522,7 @@ mod tests {
     /// 撞在同一个内容键上被去重。
     #[tokio::test]
     async fn a_password_login_reports_both_outcomes_to_the_bus() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
         app.db.set("admin_password_hash", &hash_password("pw").unwrap()).unwrap();
 
