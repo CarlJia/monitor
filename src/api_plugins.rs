@@ -450,6 +450,20 @@ fn synthetic_events(manifest: &Manifest, now: i64) -> Vec<(String, Option<Event>
                 Event::NODE_DELETED => {
                     Some(Event::NodeDeleted { node_id: 0, name: "test".into(), created_at: now })
                 }
+                // 登录事件宿主自己造得出真实结构:成功给一个 GitHub 主体,失败给一
+                // 条示例原因,都带一个占位地址,好让操作员在「测试」里看清文案。
+                Event::LOGIN_SUCCEEDED => Some(Event::LoginSucceeded {
+                    method: "github".into(),
+                    actor: "test-user".into(),
+                    ip: "203.0.113.7".into(),
+                    observed_at: now,
+                }),
+                Event::LOGIN_FAILED => Some(Event::LoginFailed {
+                    method: "password".into(),
+                    reason: "invalid password".into(),
+                    ip: "203.0.113.7".into(),
+                    observed_at: now,
+                }),
                 plugin_event => manifest
                     .samples
                     .iter()
@@ -1385,7 +1399,8 @@ mod tests {
     fn synthetic_events_carry_real_host_payloads_and_replay_samples() {
         let text = "plugin_id = \"com.example.synth\"\nname = \"t\"\nversion = \"1.0.0\"\n\
                     abi_version = 2\nsubscribes = [\"agent_offline\", \"agent_online\", \"node_added\", \
-                    \"node_deleted\", \"plugin_expiry_soon\", \"plugin_ghost\"]\n\
+                    \"node_deleted\", \"login_succeeded\", \"login_failed\", \"plugin_expiry_soon\", \
+                    \"plugin_ghost\"]\n\
                     [[sample]]\nname = \"plugin_expiry_soon\"\npayload = '{\"node_id\":7,\"name\":\"edge-1\"}'\n";
         let events = synthetic_events(&Manifest::parse(text).unwrap(), 1_000);
         let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
@@ -1396,6 +1411,8 @@ mod tests {
                 "agent_online",
                 "node_added",
                 "node_deleted",
+                "login_succeeded",
+                "login_failed",
                 "plugin_expiry_soon",
                 "plugin_ghost"
             ],
@@ -1429,14 +1446,29 @@ mod tests {
             }
             other => panic!("应当是 NodeAdded + NodeDeleted,实际 {other:?}"),
         }
+        // 登录事件宿主自己造真实结构:成功带一个 GitHub 主体,失败带一条示例原因。
         match &events[4].1 {
+            Some(Event::LoginSucceeded { method, actor, ip, observed_at }) => {
+                assert_eq!((method.as_str(), actor.as_str()), ("github", "test-user"));
+                assert_eq!((ip.as_str(), *observed_at), ("203.0.113.7", 1_000));
+            }
+            other => panic!("应当是真实结构的 LoginSucceeded,实际 {other:?}"),
+        }
+        match &events[5].1 {
+            Some(Event::LoginFailed { method, reason, observed_at, .. }) => {
+                assert_eq!((method.as_str(), reason.as_str()), ("password", "invalid password"));
+                assert_eq!(*observed_at, 1_000);
+            }
+            other => panic!("应当是真实结构的 LoginFailed,实际 {other:?}"),
+        }
+        match &events[6].1 {
             Some(Event::Plugin { name, payload }) => {
                 assert_eq!(name, "plugin_expiry_soon");
                 assert_eq!(payload["name"], "edge-1", "回放的是插件在 manifest 里声明的样例");
             }
             other => panic!("应当回放声明的样例,实际 {other:?}"),
         }
-        assert!(events[5].1.is_none(), "没声明样例的插件事件记成「测不了」,而不是编一个空载荷去派发");
+        assert!(events[7].1.is_none(), "没声明样例的插件事件记成「测不了」,而不是编一个空载荷去派发");
     }
 
     /// 「测试」按订阅逐条真派发:一次点击把每条订阅都过一遍真实路径,声明的样例

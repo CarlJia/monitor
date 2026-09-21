@@ -183,12 +183,45 @@ pub async fn login(
     };
     if !verify_password(&body.password, &stored) {
         app.throttle.record_failure(ip);
+        announce_login_failed(&app, "password", "invalid password", ip);
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
-        Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
+        Ok(cookie) => {
+            announce_login_succeeded(&app, "password", "", ip);
+            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// A rejected/accepted panel sign-in is reported to the notification bus so a
+/// subscriber (e.g. the tg-notify plugin) can push it out. Like `announce` in
+/// `api.rs`, a bus failure is logged and swallowed: the sign-in outcome itself
+/// stands, and an audit row that could not be written must not change the
+/// response the operator sees.
+fn announce_login_succeeded(app: &App, method: &str, actor: &str, ip: IpAddr) {
+    let event = crate::notification_bus::Event::LoginSucceeded {
+        method: method.to_owned(),
+        actor: actor.to_owned(),
+        ip: ip.to_string(),
+        observed_at: Utc::now().timestamp(),
+    };
+    if let Err(e) = crate::notification_bus::emit(app, &event) {
+        warn!("上报 login_succeeded 失败: {e:#}");
+    }
+}
+
+fn announce_login_failed(app: &App, method: &str, reason: &str, ip: IpAddr) {
+    let event = crate::notification_bus::Event::LoginFailed {
+        method: method.to_owned(),
+        reason: reason.to_owned(),
+        ip: ip.to_string(),
+        observed_at: Utc::now().timestamp(),
+    };
+    if let Err(e) = crate::notification_bus::emit(app, &event) {
+        warn!("上报 login_failed 失败: {e:#}");
     }
 }
 
@@ -232,13 +265,15 @@ pub struct Callback {
 
 pub async fn github_callback(
     State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<Callback>,
 ) -> Response {
+    let ip = client_ip(&headers, peer.ip());
     // GitHub reports a refusal in the query string rather than the body.
     if let Some(error) = &query.error {
         let reason = query.error_description.as_deref().unwrap_or(error);
-        return sign_in_failed(&app, &headers, &format!("GitHub returned {error}: {reason}"));
+        return sign_in_failed(&app, &headers, ip, &format!("GitHub returned {error}: {reason}"));
     }
     // Reject a callback the browser did not initiate.
     let state = query.state.as_deref().unwrap_or_default();
@@ -246,28 +281,32 @@ pub async fn github_callback(
         return sign_in_failed(
             &app,
             &headers,
+            ip,
             "state mismatch or missing; start again from the sign-in page",
         );
     }
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
-        return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
+        return sign_in_failed(&app, &headers, ip, "GitHub sent no authorization code");
     };
-    if let Err(e) = github_login(&app, code).await {
-        return sign_in_failed(&app, &headers, &e.to_string());
-    }
+    let user = match github_login(&app, code).await {
+        Ok(user) => user,
+        Err(e) => return sign_in_failed(&app, &headers, ip, &e.to_string()),
+    };
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
+        Err(e) => return sign_in_failed(&app, &headers, ip, &e.to_string()),
     };
+    announce_login_succeeded(&app, "github", &user, ip);
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
 /// leaving a bare 401 at a callback URL offering no way forward.
-fn sign_in_failed(app: &App, headers: &HeaderMap, reason: &str) -> Response {
+fn sign_in_failed(app: &App, headers: &HeaderMap, ip: IpAddr, reason: &str) -> Response {
     // A rejected sign-in must leave a server-side record; the browser sees only
     // the redirect.
     warn!("GitHub sign-in rejected: {reason}");
+    announce_login_failed(app, "github", reason, ip);
     let target = format!("/admin?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
 }
@@ -308,7 +347,9 @@ fn urlencode(value: &str) -> String {
 }
 
 /// Exchanges the code for a token and checks the login against the allow list.
-async fn github_login(app: &App, code: &str) -> Result<()> {
+/// Returns the accepted GitHub login on success, so the caller can name the
+/// actor in the sign-in notification.
+async fn github_login(app: &App, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
     else {
         bail!("not configured");
@@ -369,7 +410,7 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
         bail!("GitHub user {} is not on the allowed list", user.login);
     }
     info!("GitHub sign-in accepted for {}", user.login);
-    Ok(())
+    Ok(user.login)
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
@@ -464,6 +505,55 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "库故障不该谎称登录被禁用");
+    }
+
+    /// 密码登录的成功与失败都要真的过一遍通知总线——不是「词表里有这个事件」,
+    /// 而是 handler 调到 `emit`、往 `notification_log` 落了一条。落库发生在派发
+    /// 之前(派发是 fire-and-forget),没装插件时订阅者为空、派发直接返回,但这一
+    /// 条审计行仍在,所以订阅了 login_* 的插件收得到。用两个不同地址,免得两条
+    /// 撞在同一个内容键上被去重。
+    #[tokio::test]
+    async fn a_password_login_reports_both_outcomes_to_the_bus() {
+        let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        app.db.set("admin_password_hash", &hash_password("pw").unwrap()).unwrap();
+
+        // 失败:密码错。返回 401,且总线上多了一条 login_failed。
+        let resp = login(
+            State(app.clone()),
+            ConnectInfo("203.0.113.10:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(LoginBody { password: "wrong".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(bus_has(&app, "login_failed"), "登录失败应落一条 login_failed");
+        assert!(!bus_has(&app, "login_succeeded"), "失败不该落成功事件");
+
+        // 成功:密码对。返回 200,且总线上多了一条 login_succeeded。
+        let resp = login(
+            State(app.clone()),
+            ConnectInfo("203.0.113.11:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(LoginBody { password: "pw".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(bus_has(&app, "login_succeeded"), "登录成功应落一条 login_succeeded");
+    }
+
+    /// notification_log 里是否有某类事件的行(node_id 恒 0)。登录事件的键按内容
+    /// 算,测试不预知它,所以按 (node_id, event_type) 计数即可。
+    #[cfg(test)]
+    fn bus_has(app: &App, event_type: &str) -> bool {
+        app.db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_log WHERE node_id=0 AND event_type=?1",
+                [event_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
     }
 
     /// One address through the full lockout lifecycle: attempts up to the limit
