@@ -1,10 +1,14 @@
+import type { ReactNode } from "react"
+
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 
 // Shared by every page's destructive action, in Admin.tsx and Plugins.tsx alike.
+// `description` takes a ReactNode so callers can include inline code/links without
+// the dialog shaping its own copy.
 export function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
   title: string
-  description: string
+  description: ReactNode
   confirmLabel: string
   busy?: boolean
   onClose: () => void

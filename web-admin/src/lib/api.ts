@@ -350,9 +350,11 @@ export type PluginKv = { key: string; value: string }
 export type PluginTestResult = { event: string; result: string; elapsed_ms: number; detail: string | null }
 
 /**
- * 上传插件包（R11）。multipart 的 `plugin` 字段带 tar.gz，后端上限 8 MiB。
- * 单独于 `api()`：FormData 不能带 json 的 content-type；413 是代理拦的，
- * 网络断在 fetch 自己身上——两者都要一句人说的话。
+ * 上传插件包（R11）。multipart 的 `plugin` 字段带 tar.gz，后端上限 32 MiB
+ * （含数据包要装下满配额的数据与 wasm 模块及序列化开销）；纯插件包按
+ * 压缩体 8 MiB 复查。单独于 `api()`：FormData 不能带 json 的 content-type；
+ * 413 是反代按 MAX_CHUNK 拦的，含数据包可能需要把反代的 `client_max_body_size`
+ * 调到 32m——两者都要一句人说的话。
  */
 export async function uploadPlugin(file: File): Promise<{
   id: number
@@ -362,10 +364,15 @@ export async function uploadPlugin(file: File): Promise<{
   status: string
   last_error: string | null
   /**
-   * true 表示这次**替换**了同 `plugin_id` 的旧包（上传的版本比已装的高），而
-   * 不是首次安装。两种都得由操作员点开关启用，但提示文案不同。
+   * true 表示这次**替换**了同 `plugin_id` 的旧包（上传的版本比已装的高或
+   * 等于），而不是首次安装——含数据包接口允许同版本（恢复）覆盖。两种都得
+   * 由操作员点开关启用，但提示文案不同。
    */
   replaced: boolean
+  /** true 表示这是个含 data.json 的包，数据已合并；false 是纯插件包。 */
+  data_merged: boolean
+  records_merged: number
+  kv_merged: number
 }> {
   const form = new FormData()
   form.append("plugin", file)
@@ -376,13 +383,42 @@ export async function uploadPlugin(file: File): Promise<{
     throw new ApiError(0, "上传失败，请检查网络")
   }
   if (!res.ok) {
-    if (res.status === 413) throw new ApiError(413, "文件过大")
+    if (res.status === 413) throw new ApiError(413, "文件过大；含数据包上限 32 MiB，反代可能要调到 client_max_body_size 32m")
     throw new ApiError(res.status, httpErrorText(res.status, res.statusText, await res.text()))
   }
-  return res.json()
+  const body = await res.json() as {
+    id: number
+    plugin_id: string
+    version: string
+    status: string
+    last_error: string | null
+    replaced: boolean
+    data_merged?: boolean
+    records_merged?: number
+    kv_merged?: number
+  }
+  // 老 hub 没有 data_merged 字段（旧前端上传的也是）——补默认值。
+  return {
+    id: body.id,
+    plugin_id: body.plugin_id,
+    version: body.version,
+    status: body.status,
+    last_error: body.last_error,
+    replaced: body.replaced,
+    data_merged: body.data_merged ?? false,
+    records_merged: body.records_merged ?? 0,
+    kv_merged: body.kv_merged ?? 0,
+  }
 }
 
 export const listPlugins = () => api<Plugin[]>("/plugins")
+
+/**
+ * 导出某个已安装插件连同它的数据为一个 tar.gz 文件下载（U2）。调用方只
+ * 需要把返回的 URL 交给浏览器的下载机制（同源自动带 cookie 过 Admin
+ * 提取器，文件不进页面内存）。404 表示插件已被删。
+ */
+export const exportPluginUrl = (id: number): string => `/api/plugins/${id}/export`
 
 export const deletePlugin = (id: number) => api<void>(`/plugins/${id}`, { method: "DELETE" })
 

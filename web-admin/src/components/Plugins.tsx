@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Eye, EyeOff, KeyRound, LayoutDashboard, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
+import { Download, Eye, EyeOff, KeyRound, LayoutDashboard, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -12,7 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
+  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, exportPluginUrl, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
   type KvDraft, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 import { testResultsText } from "@/lib/format"
@@ -450,6 +450,10 @@ export function Plugins({ go }: { go: (to: string) => void }) {
   const [deleting, setDeleting] = useState<Plugin | null>(null)
   const [removing, setRemoving] = useState(false)
   const [kvFor, setKvFor] = useState<Plugin | null>(null)
+  // 上传前先弹的确认框：含 data.json 的包会按包优先语义合并到已装同款——
+  // 这是**不可逆**的覆盖（纯包仍按「版本必须更高」拒绝，所以没有这条
+  // 提醒；data 包的同版本恢复场景则强依赖这条文案让操作员确认意图）。
+  const [pendingUpload, setPendingUpload] = useState<File | null>(null)
   // 动作后递增，让日志卡片跟着刷新。「测试」只能靠它（不重拉列表）；启停额外
   // 重拉列表；删除刻意不 pulse——见 remove()。
   const [pulse, setPulse] = useState(0)
@@ -477,10 +481,15 @@ export function Plugins({ go }: { go: (to: string) => void }) {
       // 上传即入库但默认停用（KTD10）：预检失败也一样入库，行上的红徽标会
       // 给出原因，所以这里只引导去点开关，不报错。同名包版本更高时走的是
       // **替换**：行与插件数据都保留，但同样回到停用，要点开关才会装载新包。
-      toast.success(
-        installed.replaced ? "插件已更新，请点击开关启用新版本" : "插件已上传，请点击开关启用",
-        { description: `${installed.plugin_id} · v${installed.version}` },
-      )
+      // 含 data.json 的包按包优先合并已有记录与 kv：response 报回合并了多少
+      // 条，让操作员确认处理结果。
+      const description = installed.data_merged
+        ? `${installed.plugin_id} · v${installed.version} · 合并 ${installed.records_merged} 条记录 / ${installed.kv_merged} 项配置`
+        : `${installed.plugin_id} · v${installed.version}`
+      const title = installed.data_merged
+        ? (installed.replaced ? "插件与数据已覆盖，请点击开关启用新版本" : "插件与数据已上传，请点击开关启用")
+        : (installed.replaced ? "插件已更新，请点击开关启用新版本" : "插件已上传，请点击开关启用")
+      toast.success(title, { description })
       load()
     } catch (e) {
       // 400 的响应体就是后端那句中文原因；413 与网络错误在 uploadPlugin 里
@@ -573,7 +582,9 @@ export function Plugins({ go }: { go: (to: string) => void }) {
         <div>
           <h3 className="text-sm font-medium">上传插件</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            插件作者发布的 <code>plugin.tar.gz</code>（plugin.toml + plugin.wasm，上限 8 MiB）。
+            插件作者发布的 <code>plugin.tar.gz</code>（plugin.toml + plugin.wasm，上限 32 MiB）。
+            含 data.json 的包会把插件的数据与渠道配置一并带上来，按包优先合并到已装的同款
+            （同版本=恢复，更高=升级并恢复，更低=拒绝）；含明文密钥，请保管好。
             上传后默认停用，到列表里点开关启用。插件在 hub 进程内运行，请只安装可信来源。
           </p>
         </div>
@@ -589,7 +600,10 @@ export function Plugins({ go }: { go: (to: string) => void }) {
             onChange={(e) => {
               const file = e.target.files?.[0]
               e.target.value = ""
-              if (file) upload(file)
+              // 不立刻上传：先弹确认框。含数据包的覆盖是不可逆的,纯包
+              // 则会因版本不够被后端拒绝——后者不需要这条提醒,但前置拦截
+              // 让所有上传都走同一条入口,行为更可预测。
+              if (file) setPendingUpload(file)
             }}
           />
         </div>
@@ -655,6 +669,14 @@ export function Plugins({ go }: { go: (to: string) => void }) {
                         {cleaning === p.id ? "清理中…" : "清理"}
                       </Button>
                     )}
+                    {/* 导出含数据 + 渠道配置的单个插件包（U2）。同源自动带
+                        cookie 过 Admin 提取器，文件不进页面内存。包内含明文
+                        渠道密钥——同整库备份的处置要求。 */}
+                    <Button variant="ghost" size="sm" asChild title="导出插件与数据">
+                      <a href={exportPluginUrl(p.id)} download>
+                        <Download className="size-4" /> 导出
+                      </a>
+                    </Button>
                     <Button variant="ghost" size="icon-sm" onClick={() => setDeleting(p)} title="删除插件" aria-label="删除插件">
                       <Trash2 className="text-destructive" />
                     </Button>
@@ -684,6 +706,25 @@ export function Plugins({ go }: { go: (to: string) => void }) {
           busy={removing}
           onClose={() => setDeleting(null)}
           onConfirm={remove}
+        />
+      )}
+      {/* 上传前的意图确认(R11)：含 data.json 的包会按包优先合并到已装同款
+          ——同版本恢复或更高升级都会覆盖行与数据,纯包则被后端按「版本必须
+          更高」拒绝。后端无法读心,意图区分只能落在这里。 */}
+      {pendingUpload && (
+        <ConfirmDialog
+          title="上传插件包？"
+          description={
+            <span className="leading-relaxed">
+              含 <code>data.json</code> 的包会覆盖同款已装插件并合并数据
+              （同版本=恢复，更高=升级并恢复，更低=拒绝）；纯插件包按版本是否
+              更高决定是否替换。包内可能含明文渠道密钥。
+            </span>
+          }
+          confirmLabel="上传"
+          busy={uploading}
+          onClose={() => setPendingUpload(null)}
+          onConfirm={() => { const f = pendingUpload; setPendingUpload(null); upload(f) }}
         />
       )}
     </div>
