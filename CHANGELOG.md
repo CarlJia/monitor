@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **破坏性变更**：`GET /api/plugins/{id}/logs` 的响应从裸数组（至多 100 条派发结果）改为 `{ entries, total, page, page_size }` 信封——`total` 是该插件在环形缓冲里的全部条数，翻页不动它，日志条目移到 `entries` 里。直接消费旧响应形状的调用方（面板之外的脚本、监控等）需改为读取 `entries` 字段。
+- **破坏性变更（agent 协议）**：agent↔hub 的 WebSocket 上行从 JSON 文本帧改为 msgpack 二进制帧，去掉每帧重复的字段名引号，约省 50% 流量。envelope 新增 `version` 首字段（当前 `1`），版本不匹配时 hub `ensure!` 拒收、agent 断开重连——**hub 与 agent 必须同步升级到带 `version` 的版本**，混部会被版本校验拒绝（清晰拒绝，非静默损坏）。不变量字段 `mem_total`/`swap_total`/`disk_total` 不再每帧上报，只在 hello 时折入 `entry.metrics`；agent 检测到漂移（热插盘/内存变更）时主动重发 hello，与新的 `used` 值在同一帧配对。旧 JSON agent 无法与新 hub 通信，反之亦然。
 
 ## [2.0.7] - 2026-09-20
 
