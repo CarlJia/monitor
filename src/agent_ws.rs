@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -44,8 +44,9 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 pub struct Agent {
     /// Distinguishes one session on a node from the next; see [`release`].
     pub session: u64,
-    /// Outbound channel, used to push probe assignments.
-    pub tx: mpsc::Sender<String>,
+    /// Outbound channel, used to push probe assignments. msgpack-encoded
+    /// bytes; the only outbound the hub pushes today is `ping.tasks`.
+    pub tx: mpsc::Sender<Vec<u8>>,
     /// The latest report, or `Null` between connecting and the first one.
     pub metrics: serde_json::Value,
     pub last_seen: i64,
@@ -69,7 +70,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
+    pub fn new(session: u64, tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
             session,
             tx,
@@ -130,12 +131,32 @@ impl Minute {
     }
 }
 
+/// Inbound RPC envelope. Matches the agent's `RpcEnvelope` on the other side
+/// of the wire: the same four-field shape, so the msgpack array length is
+/// symmetric. `params` is left as a JSON-shaped value because `rmp-serde`
+/// decodes msgpack maps into `serde_json::Value` for free.
+///
+/// `version` rides first so a protocol mismatch fails closed before the hub
+/// books anything from a frame it cannot fully trust.
 #[derive(Deserialize)]
 struct Rpc {
+    version: u8,
+    #[allow(dead_code)]
+    jsonrpc: String,
     method: String,
     #[serde(default)]
     params: serde_json::Value,
 }
+
+/// Wire-protocol version. Must match the agent's `PROTOCOL_VERSION`; bumped in
+/// lockstep on any breaking change to the envelope shape. The hub rejects a
+/// frame whose version differs rather than decode a layout it may misread.
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Fields the agent reports only on hello, then never again unless they
+/// change. Folded into `entry.metrics` so the live view can read them before
+/// the first report and so a stable host pays zero per-frame wire cost.
+const HELLO_INVARIANTS: &[&str] = &["mem_total", "swap_total", "disk_total"];
 
 pub async fn handler(
     State(app): State<Shared>,
@@ -167,7 +188,10 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<String>(16);
+    // The only outbound the hub pushes is `ping.tasks` -- a fresh probe list.
+    // The payload is msgpack encoded; the channel carries the raw bytes so
+    // the dispatch path does not need to know which frame type wraps them.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
@@ -176,7 +200,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     info!("node {node_id} connected from {ip}");
 
     // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    let _ = socket.send(Message::Binary(ping_tasks_message(&app, node_id).into())).await;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
@@ -185,7 +209,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
     let outcome = loop {
         tokio::select! {
             outbound = rx.recv() => match outbound {
-                Some(text) => socket.send(Message::Text(text.into())).await?,
+                Some(bytes) => socket.send(Message::Binary(bytes.into())).await?,
                 None => break Ok(()),
             },
             // A machine that leaves the network without closing its socket would
@@ -208,8 +232,8 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // would park every worker thread on that lock and starve the rest
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
-                Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
+                Some(Ok(Message::Binary(buf))) =>
+                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &buf)) {
                     Ok(Some(geo)) => locate(app.clone(), node_id, geo),
                     Ok(None) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -249,8 +273,17 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
 ///
 /// `serve` passes the same address to both `save_facts` and `locate`, so the
 /// country always belongs to the address that was asked about.
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<String>> {
-    let rpc: Rpc = serde_json::from_str(text)?;
+fn dispatch(app: &App, node_id: i64, ip: &str, bytes: &[u8]) -> Result<Option<String>> {
+    let rpc: Rpc = rmp_serde::from_slice(bytes).context("msgpack decode")?;
+    // Fail closed on a protocol mismatch: a frame from a version this hub does
+    // not speak may share the envelope shape by accident but carry a different
+    // field layout, and booking it would corrupt the node's live view.
+    anyhow::ensure!(
+        rpc.version == PROTOCOL_VERSION,
+        "agent speaks protocol version {}, this hub only understands {}",
+        rpc.version,
+        PROTOCOL_VERSION
+    );
     match rpc.method.as_str() {
         "hello" => {
             let geo = geo_address(&rpc.params, ip);
@@ -259,6 +292,26 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<Option<Stri
             // piece of evidence about where this node is reachable from that
             // the node itself does not get to report.
             let owed = app.db.save_facts(node_id, &rpc.params, &geo, ip)?;
+            // The agent only sends these fields on hello and on the rare
+            // frame they change; the live view reads `entry.metrics` not the
+            // nodes table, so folding them in here is what keeps the panel
+            // from blanking the moment the first report (without totals)
+            // arrives. `save_facts` already updates the nodes table; this
+            // step keeps the in-memory view in sync.
+            if let Ok(mut agents) = app.agents.write() {
+                if let Some(entry) = agents.get_mut(&node_id) {
+                    if !entry.metrics.is_object() {
+                        entry.metrics = serde_json::Value::Object(Default::default());
+                    }
+                    if let Some(obj) = entry.metrics.as_object_mut() {
+                        for k in HELLO_INVARIANTS {
+                            if let Some(v) = rpc.params.get(*k).cloned() {
+                                obj.insert((*k).to_owned(), v);
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(owed.then_some(geo));
         }
         "report" => report(app, node_id, rpc.params)?,
@@ -437,6 +490,19 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // token, or the socket is unwinding. The bytes above remain booked; there is
     // simply no longer a session to attribute them to.
     let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
+    // Spread the report over the entry's prior metrics rather than replacing
+    // them: hello may have folded `mem_total`/`swap_total`/`disk_total` into
+    // `entry.metrics` (the agent only sends those on hello and on the rare
+    // frame they change), and a plain clone would drop them. The contract
+    // check and the minute average then see the merged view.
+    if let Some(report_obj) = metrics.as_object() {
+        let prior = entry.metrics.as_object().cloned().unwrap_or_default();
+        let mut merged = prior;
+        for (k, v) in report_obj {
+            merged.insert(k.clone(), v.clone());
+        }
+        metrics = serde_json::Value::Object(merged);
+    }
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);
@@ -482,15 +548,37 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     Ok(())
 }
 
-fn ping_tasks_message(app: &App, node_id: i64) -> String {
+/// Outbound envelope, msgpack-encoded. Same shape as the agent's `RpcEnvelope`
+/// on the other side, so the wire format stays symmetric -- `version` first,
+/// then the JSON-RPC trio.
+#[derive(Serialize)]
+struct Outbound<'a, P: Serialize> {
+    version: u8,
+    jsonrpc: &'a str,
+    method: &'a str,
+    params: &'a P,
+}
+
+/// Returns the bytes for a `ping.tasks` envelope. The `.expect` is safe here in
+/// a way the agent's generic `notify` is not: `params` is a concrete
+/// `Vec<PingTask>` of `i64`/`String`/`u64`, none of which can fail to
+/// serialize to msgpack. A future non-trivial outbound type would need its own
+/// error handling.
+fn ping_tasks_message(app: &App, node_id: i64) -> Vec<u8> {
     let tasks = app.db.ping_tasks_for(node_id).unwrap_or_default();
-    json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
+    rmp_serde::to_vec(&Outbound {
+        version: PROTOCOL_VERSION,
+        jsonrpc: "2.0",
+        method: "ping.tasks",
+        params: &tasks,
+    })
+    .expect("msgpack pack of a concrete Vec<PingTask> is infallible")
 }
 
 /// Pushes the current probe list to every connected agent, so a panel edit takes
 /// effect without waiting for a reconnect.
 pub fn push_ping_tasks(app: &App) {
-    let connected: Vec<(i64, mpsc::Sender<String>)> = app
+    let connected: Vec<(i64, mpsc::Sender<Vec<u8>>)> = app
         .agents
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -525,20 +613,39 @@ mod tests {
 
     /// A connected agent, the precondition for filing any report: the session
     /// holds the node's live state.
-    fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
+    fn connect(app: &App) -> (i64, mpsc::Receiver<Vec<u8>>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(1, tx));
         (id, rx)
     }
 
-    fn report_json(boot: &str, rx: i64, tx: i64) -> String {
-        json!({
+    /// Packs an envelope JSON as the msgpack bytes `dispatch` consumes. Tests
+    /// build the shape they want with `serde_json::json!` -- readable and
+    /// already validated by the JSON tooling -- then convert here.
+    fn pack(envelope: serde_json::Value) -> Vec<u8> {
+        pack_versioned(PROTOCOL_VERSION, envelope)
+    }
+
+    /// Like `pack`, but with an explicit protocol version so a test can forge a
+    /// frame from a version the hub does not speak.
+    fn pack_versioned(version: u8, envelope: serde_json::Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        let envelope = envelope.as_object().expect("envelope is a json object");
+        let method = envelope["method"].as_str().expect("method is a string");
+        let params = envelope.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        let env = Outbound { version, jsonrpc: "2.0", method, params: &params };
+        let mut ser = rmp_serde::Serializer::new(&mut out);
+        env.serialize(&mut ser).expect("msgpack pack");
+        out
+    }
+
+    fn report_json(boot: &str, rx: i64, tx: i64) -> Vec<u8> {
+        pack(json!({
             "jsonrpc": "2.0", "method": "report",
             "params": {"boot_id": boot, "cpu": 12.5, "load": [0.5, 0.4, 0.3],
                        "mem_used": 100, "net_rx_total": rx, "net_tx_total": tx}
-        })
-        .to_string()
+        }))
     }
 
     #[test]
@@ -664,11 +771,10 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let burst = |rx: i64, instant: i64, cpu: f64, mem: i64| {
-            json!({"jsonrpc": "2.0", "method": "report",
+            pack(json!({"jsonrpc": "2.0", "method": "report",
                    "params": {"boot_id": "boot-a", "net_rx_total": rx, "net_tx_total": 0,
                               // What the agent measured over its own last second.
-                              "net_rx": instant, "net_tx": 0, "cpu": cpu, "mem_used": mem}})
-            .to_string()
+                              "net_rx": instant, "net_tx": 0, "cpu": cpu, "mem_used": mem}}))
         };
 
         // Busy for half the minute, then idle. The first reading is also the
@@ -716,10 +822,9 @@ mod tests {
         // The socket drops and the agent returns within the same minute.
         let (tx, _rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(2, tx));
-        let loud = json!({"jsonrpc": "2.0", "method": "report",
+        let loud = pack(json!({"jsonrpc": "2.0", "method": "report",
                           "params": {"boot_id": "boot-a", "cpu": 99.0, "net_rx_total": 9_000,
-                                     "net_tx_total": 4_500}})
-        .to_string();
+                                     "net_tx_total": 4_500}}));
         dispatch(&app, id, "ip", &loud).unwrap();
 
         assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
@@ -736,9 +841,8 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         let report = |rx: i64| {
-            json!({"jsonrpc": "2.0", "method": "report",
-                   "params": {"cpu": 1.0, "net_rx_total": rx, "net_tx_total": 0}})
-            .to_string()
+            pack(json!({"jsonrpc": "2.0", "method": "report",
+                   "params": {"cpu": 1.0, "net_rx_total": rx, "net_tx_total": 0}}))
         };
         dispatch(&app, id, "ip", &report(1_000)).unwrap();
         dispatch(&app, id, "ip", &report(3_000)).unwrap();
@@ -746,7 +850,7 @@ mod tests {
 
         // A report with no counters books nothing and, crucially, leaves the
         // baseline unchanged so the next one is a delta.
-        let blind = json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": 1.0}}).to_string();
+        let blind = pack(json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": 1.0}}));
         dispatch(&app, id, "ip", &blind).unwrap();
         dispatch(&app, id, "ip", &report(4_000)).unwrap();
         assert_eq!(
@@ -764,7 +868,7 @@ mod tests {
             "jsonrpc": "2.0", "method": "hello",
             "params": {"hostname": "vps-1", "os": "Debian 12", "cpu_cores": 4, "mem_total": 2048}
         });
-        dispatch(&app, id, "198.51.100.4", &hello.to_string()).unwrap();
+        dispatch(&app, id, "198.51.100.4", &pack(hello)).unwrap();
 
         let n = app.db.node(id).unwrap().unwrap();
         assert_eq!(n.hostname, "vps-1");
@@ -781,9 +885,8 @@ mod tests {
         let app = app();
         let id = node(&app);
         let hello = |v6: &str| {
-            json!({"jsonrpc": "2.0", "method": "hello",
-                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}})
-            .to_string()
+            pack(json!({"jsonrpc": "2.0", "method": "hello",
+                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}}))
         };
 
         // A public v6 is reported: `ip` keeps it and the peer is stored apart.
@@ -815,9 +918,8 @@ mod tests {
         let app = app();
         let id = node(&app);
         let hello = |v6: &str| {
-            json!({"jsonrpc": "2.0", "method": "hello",
-                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}})
-            .to_string()
+            pack(json!({"jsonrpc": "2.0", "method": "hello",
+                   "params": {"hostname": "tw", "ipv4": "192.168.1.25", "ipv6": v6}}))
         };
 
         // The peer is a CDN edge; the address the agent holds is public v6.
@@ -857,9 +959,8 @@ mod tests {
         };
         let (one, two) = (probe("one"), probe("two"));
         let result = |task, latency| {
-            json!({"jsonrpc": "2.0", "method": "ping.result",
-                   "params": {"task_id": task, "latency_ms": latency}})
-            .to_string()
+            pack(json!({"jsonrpc": "2.0", "method": "ping.result",
+                   "params": {"task_id": task, "latency_ms": latency}}))
         };
         dispatch(&app, id, "ip", &result(one, 42)).unwrap();
         // The rejected results carry task ids of their own: a bare count would be
@@ -873,9 +974,8 @@ mod tests {
             &app,
             id,
             "ip",
-            &json!({"jsonrpc": "2.0", "method": "ping.result",
-                                         "params": {"task_id": one}})
-            .to_string(),
+            &pack(json!({"jsonrpc": "2.0", "method": "ping.result",
+                                         "params": {"task_id": one}})),
         )
         .unwrap();
 
@@ -935,8 +1035,79 @@ mod tests {
     fn junk_from_an_agent_is_rejected_without_taking_the_connection_down() {
         let app = app();
         let id = node(&app);
-        assert!(dispatch(&app, id, "ip", "not json").is_err());
+        assert!(dispatch(&app, id, "ip", b"not msgpack").is_err());
         // Unknown methods are ignored.
-        assert!(dispatch(&app, id, "ip", r#"{"method":"whatever"}"#).is_ok());
+        assert!(dispatch(&app, id, "ip", &pack(json!({"jsonrpc": "2.0", "method": "whatever"}))).is_ok());
+    }
+
+    /// A frame from a protocol version this hub does not speak is rejected
+    /// before it books anything, rather than decoded against a layout that may
+    /// have shifted. This is the guard that stops a half-upgraded fleet from
+    /// silently corrupting the live view.
+    #[test]
+    fn a_frame_from_another_protocol_version_is_refused() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        // A well-formed report at the current version is accepted.
+        assert!(dispatch(&app, id, "ip", &report_json("boot", 1_000, 500)).is_ok());
+        // The same shape at a foreign version is refused, even though it would
+        // decode fine as a struct.
+        let foreign = pack_versioned(
+            PROTOCOL_VERSION.wrapping_add(1),
+            json!({"jsonrpc": "2.0", "method": "report",
+                   "params": {"boot_id": "boot", "cpu": 1.0, "net_rx_total": 1, "net_tx_total": 1}}),
+        );
+        let err = dispatch(&app, id, "ip", &foreign).unwrap_err().to_string();
+        assert!(err.contains("protocol version"), "the refusal names the mismatch: {err}");
+    }
+
+    /// The hub folds exactly the fields the agent omits from every report back
+    /// into `entry.metrics` on hello. If that list drifts from what the agent
+    /// actually sends only-on-hello, the live view silently loses a card. This
+    /// pins the contract: HELLO_INVARIANTS is the set the report path must not
+    /// carry, and the api.rs live() view reads each one from entry.metrics with
+    /// a nodes-table fallback.
+    #[test]
+    fn hello_folds_the_invariant_fields_into_the_live_view() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let hello = json!({
+            "jsonrpc": "2.0", "method": "hello",
+            "params": {"hostname": "vps", "mem_total": 2048, "swap_total": 1024, "disk_total": 4096}
+        });
+        dispatch(&app, id, "ip", &pack(hello)).unwrap();
+
+        let live = app.agents.read().unwrap();
+        let m = &live[&id].metrics;
+        for k in HELLO_INVARIANTS {
+            assert!(m.get(*k).is_some(), "{k} must be folded into the live view on hello");
+        }
+        assert_eq!(m["mem_total"], 2048);
+        assert_eq!(m["disk_total"], 4096);
+    }
+
+    /// A report that omits the hello-folded invariants keeps the values hello
+    /// set, rather than dropping them: the spread merges the report over the
+    /// prior metrics, so a card that was populated on hello stays populated.
+    #[test]
+    fn a_report_after_hello_keeps_the_folded_invariants() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        dispatch(
+            &app,
+            id,
+            "ip",
+            &pack(json!({"jsonrpc": "2.0", "method": "hello",
+                         "params": {"mem_total": 2048, "swap_total": 1024, "disk_total": 4096}})),
+        )
+        .unwrap();
+        // A normal report carries no totals (the agent stopped sending them).
+        dispatch(&app, id, "ip", &report_json("boot", 1_000, 500)).unwrap();
+
+        let live = app.agents.read().unwrap();
+        let m = &live[&id].metrics;
+        assert_eq!(m["mem_total"], 2048, "the hello total survives a report that omits it");
+        assert_eq!(m["disk_total"], 4096);
+        assert_eq!(m["cpu"], 12.5, "and the report's own fields are present");
     }
 }
