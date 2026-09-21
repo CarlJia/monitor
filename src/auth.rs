@@ -27,7 +27,7 @@ pub const COOKIE: &str = "monitor_session";
 const STATE_COOKIE: &str = "monitor_oauth_state";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(900);
 
 /// How many password checks may run concurrently.
@@ -47,6 +47,38 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+
+/// Per-address failure counter for the GitHub OAuth callback. Separate from the
+/// password throttle: the callback is an unauthenticated public endpoint and
+/// a bored attacker hitting it with arbitrary `error` / `error_description` /
+/// `state` values could otherwise spam `login_failed` notifications and grow
+/// `notification_log` unboundedly. Sharing the password throttle would also let
+/// callback noise burn the 5/15-min budget for any legitimate user behind the
+/// same egress (corporate NAT, VPN), locking them out of password sign-in.
+#[derive(Default)]
+pub struct CallbackThrottle {
+    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl CallbackThrottle {
+    fn locked(&self, ip: IpAddr) -> bool {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&ip) {
+            Some((n, since)) if since.elapsed() < LOCKOUT => *n >= MAX_ATTEMPTS,
+            Some(_) => {
+                map.remove(&ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (_, since)| since.elapsed() < LOCKOUT);
+        map.entry(ip).or_insert((0, Instant::now())).0 += 1;
+    }
+}
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -302,11 +334,24 @@ pub async fn github_callback(
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
 /// leaving a bare 401 at a callback URL offering no way forward.
+///
+/// The callback is a public endpoint (no session, no token). A bored attacker
+/// can hit it with arbitrary `error` / `error_description` / `state` values —
+/// each one used to become one Telegram notification. `CallbackThrottle` caps
+/// that noise at 5 failures / IP / 15 minutes: an emit is suppressed once the
+/// address is locked out, so a locked-out address is silent on subsequent
+/// probes — the redirect still goes out, but no Telegram message and no
+/// `notification_log` row are created. The throttle is separate from the
+/// password throttle so callback noise cannot lock a legitimate operator out
+/// of password sign-in (or vice versa).
 fn sign_in_failed(app: &App, headers: &HeaderMap, ip: IpAddr, reason: &str) -> Response {
+    if !app.callback_throttle.locked(ip) {
+        app.callback_throttle.record_failure(ip);
+        announce_login_failed(app, "github", reason, ip);
+    }
     // A rejected sign-in must leave a server-side record; the browser sees only
     // the redirect.
     warn!("GitHub sign-in rejected: {reason}");
-    announce_login_failed(app, "github", reason, ip);
     let target = format!("/admin?login_error={}", urlencode(reason));
     with_cookies(Redirect::to(&target), [clear_state(app, headers), String::new()])
 }
@@ -563,6 +608,57 @@ mod tests {
             )
             .unwrap()
             > 0
+    }
+
+    /// 回调端是公网匿名端点:被刷的话每条都曾经落一条 login_failed 通知。Callback
+    /// 限流封顶之后,从同一 IP 来的第 6 次失败调用 `sign_in_failed` 不应再往总线上
+    /// emit——否则攻击者用 `?error=...&error_description=...` 轮询就能涨爆
+    /// notification_log 并刷 Telegram。锁定期内的 emit 抑制是关键:锁是另一回事。
+    #[tokio::test]
+    async fn callback_failures_silence_the_bus_after_the_throttle_locks() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        let mut headers = HeaderMap::new();
+        // 用一个空的 state cookie 把回调最初的 state 校验带过去,避免它走错分支;
+        // 这里只关心限流。
+        headers.insert(crate::auth::STATE_COOKIE, "anything".parse().unwrap());
+        // 触发 5 次(MAX_ATTEMPTS):emit 各落一条;第 6 次起被锁、不再 emit。
+        for i in 0..MAX_ATTEMPTS {
+            let resp = sign_in_failed(
+                &app,
+                &headers,
+                "198.51.100.7".parse().unwrap(),
+                &format!("reason {i}"),
+            );
+            // 不校验响应状态——sign_in_failed 总是 302;关心的是总线。
+            let _ = resp;
+        }
+        let before = count_rows(&app, "login_failed");
+        assert_eq!(before, MAX_ATTEMPTS as i64, "限流前 5 次都该发出");
+
+        // 第 6 次:已锁,不应 emit,但仍要让浏览器看到跳转(302)。
+        let resp = sign_in_failed(&app, &headers, "198.51.100.7".parse().unwrap(), "spam");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "浏览器仍要拿到跳转");
+        let after = count_rows(&app, "login_failed");
+        assert_eq!(after, before, "锁定后不应再 emit");
+
+        // 另一个 IP 不受同一个锁定状态影响。
+        let resp = sign_in_failed(&app, &headers, "198.51.100.8".parse().unwrap(), "ok");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let other = count_rows(&app, "login_failed");
+        assert_eq!(other, before + 1, "另一 IP 的 emit 不受上一 IP 锁定影响");
+    }
+
+    #[cfg(test)]
+    fn count_rows(app: &App, event_type: &str) -> i64 {
+        app.db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_log WHERE node_id=0 AND event_type=?1",
+                [event_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
     }
 
     /// One address through the full lockout lifecycle: attempts up to the limit

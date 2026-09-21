@@ -55,6 +55,9 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// GitHub OAuth 回调端的失败计数。回调是公网匿名端点,失败的
+    /// `login_failed` 通知必须限流——详见 `auth::CallbackThrottle`。
+    pub callback_throttle: auth::CallbackThrottle,
     pub http: reqwest::Client,
     /// 插件 http 专用 client。与 `http` 分开的唯一原因是重定向策略:
     /// `reqwest` 0.12 只能在 Client 上设,而宿主自身的调用(GitHub release、
@@ -96,6 +99,7 @@ impl App {
             quality: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            callback_throttle: auth::CallbackThrottle::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
