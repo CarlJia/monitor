@@ -158,6 +158,95 @@ fn multipart_failed(e: MultipartError) -> Response {
     }
 }
 
+/// 含数据包的写库路径(KTD3、KTD4):解析 data.json、校验格式与 manifest 一致、
+/// 调 U1 的合并写。失败整包 400,一行不写。
+fn install_with_data(
+    app: &App,
+    manifest: &Manifest,
+    toml_text: &str,
+    wasm: &[u8],
+    wasm_sha256: &str,
+    data_bytes: &[u8],
+) -> Result<Value, anyhow::Error> {
+    use anyhow::{bail, Context};
+
+    let data: DataJson = serde_json::from_slice(data_bytes).context("data.json 不是合法的 JSON")?;
+    if data.format != DATA_JSON_FORMAT {
+        bail!("data.json 的 format 是 {}，本 hub 只认 {}", data.format, DATA_JSON_FORMAT);
+    }
+    if data.plugin_id != manifest.plugin_id {
+        bail!(
+            "data.json 的 plugin_id 是 {}，与 plugin.toml 的 {} 不一致",
+            data.plugin_id,
+            manifest.plugin_id
+        );
+    }
+
+    let records: Vec<(String, String)> = data.records.into_iter().map(|(k, r)| (k, r.data)).collect();
+    let kv: Vec<(String, String)> = data.kv.into_iter().collect();
+
+    // 预热校验与合并写:读条目集和 kv 各自去重,避免包内对同一 key 重复打包时
+    // 配额预检被双重计入。保留最后一次出现的值,与包优先合并语义一致(后写
+    // 覆盖前写)。
+    let mut deduped_records: std::collections::BTreeMap<String, String> = Default::default();
+    for (k, v) in records {
+        deduped_records.insert(k, v);
+    }
+    let mut deduped_kv: std::collections::BTreeMap<String, String> = Default::default();
+    for (k, v) in kv {
+        deduped_kv.insert(k, v);
+    }
+    let records: Vec<(String, String)> = deduped_records.into_iter().collect();
+    let kv: Vec<(String, String)> = deduped_kv.into_iter().collect();
+
+    // 预热校验:跟纯包同一条路径,把「manifest 写错了」「模块缺导出」在写库
+    // 之前暴露。失败不拒绝入库:status 保持 disabled、原因写进 last_error。
+    let candidate = PluginRow {
+        id: 0,
+        plugin_id: manifest.plugin_id.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        manifest_json: toml_text.to_owned(),
+        wasm_blob: wasm.to_vec(),
+        wasm_sha256: String::new(),
+        enabled: false,
+        status: "disabled".into(),
+        last_error: None,
+        uploaded_at: 0,
+    };
+    let last_error = plugin::load(&app.engine, &candidate).err().map(|e| format!("{e:#}"));
+
+    let outcome = app.db.install_plugin_package_with_data(
+        &manifest.plugin_id,
+        &manifest.name,
+        &manifest.version,
+        toml_text,
+        wasm,
+        wasm_sha256,
+        &records,
+        &kv,
+    )?;
+    if outcome.replaced {
+        // 替换或升级:旧内存实例当场下线,与纯包升级同一条路(KTD6)。重启
+        // 之间事件不补发——与升级一致。
+        app.plugins.write().unwrap_or_else(|e| e.into_inner()).disable_plugin(outcome.row.id);
+    }
+    if let Some(error) = &last_error {
+        app.db.set_plugin_status(outcome.row.id, "disabled", Some(error))?;
+    }
+    Ok(json!({
+        "id": outcome.row.id,
+        "plugin_id": outcome.row.plugin_id,
+        "version": manifest.version,
+        "status": "disabled",
+        "last_error": last_error,
+        "replaced": outcome.replaced,
+        "data_merged": true,
+        "records_merged": outcome.records_merged,
+        "kv_merged": outcome.kv_merged,
+    }))
+}
+
 /// 解包、校验并写库,`upload_plugin` 的同步主体。每一步失败都带着可操作的
 /// 原因返回(它就是 400 的响应体)。
 fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
@@ -176,12 +265,25 @@ fn install_plugin(app: &App, archive: &[u8]) -> Result<Value, anyhow::Error> {
     }
     let toml_text = String::from_utf8(toml_text.clone()).context("plugin.toml 不是合法的 UTF-8 文本")?;
     let manifest = Manifest::parse(&toml_text)?;
+    // 构造包守卫(KTD3):`wasm_entry` 在 manifest 解析里无后缀校验,一个把
+    // wasm 声明成 `data.json` 的包会让数据条目与模块条目同名、互相顶掉。含
+    // data.json 的包里这种同名按构造包整包拒绝。
+    if files.contains_key(DATA_JSON_NAME) && manifest.wasm_entry == DATA_JSON_NAME {
+        bail!("wasm_entry 不能声明为 {DATA_JSON_NAME}：它是数据条目的保留名");
+    }
     let wasm =
         files.get(&manifest.wasm_entry).with_context(|| format!("插件包里没有 {}", manifest.wasm_entry))?;
     if wasm.len() > PLUGIN_WASM_MAX {
         bail!("{} 超过 {} MiB 的上限", manifest.wasm_entry, PLUGIN_WASM_MAX >> 20);
     }
     let wasm_sha256 = hex::encode(Sha256::digest(wasm));
+
+    // 含数据包(出现 data.json 条目即是)走 U1 的合并写(KTD3、KTD4)。解析
+    // 失败宁可整包 400,不静默丢:损坏的 data 条目当纯包装上=数据丢失不留痕,
+    // 是最危险的静默失败。
+    if let Some(data_bytes) = files.get(DATA_JSON_NAME) {
+        return install_with_data(app, &manifest, &toml_text, wasm, &wasm_sha256, data_bytes);
+    }
 
     // 预热校验:用一条临时行(id=0,不落库)走真实的加载路径,把「manifest 写
     // 错了」「模块缺导出」「模块编译不过」在上传时就暴露。失败不拒绝入库:
@@ -1462,6 +1564,142 @@ mod tests {
         let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("8 MiB"), "{}", String::from_utf8_lossy(&bytes));
         assert!(app.db.list_plugins().unwrap().is_empty(), "被拒的包一行不写");
+    }
+
+    /// 含数据包导出→导入 round-trip(U4/AE1 的 API 半边):导出响应包上传
+    /// 到空库风格的 plugin_id,插件行 + 记录 + kv 全部落库、停用待启用,
+    /// 响应体带 data_merged 与合并计数。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exporting_then_importing_a_data_package_lands_disabled_with_merged_data() {
+        let app = plugin_app();
+        // 在 plugin_a 上造数据。
+        let archive = plugin_archive(&plugin_manifest("com.example.a", 2));
+        assert_eq!(upload(&app, archive).await.status(), StatusCode::OK);
+        let id_a = app.db.list_plugins().unwrap()[0].id;
+        app.db.plugin_data_put("com.example.a", "node:1", "{\"price\":1}").unwrap();
+        app.db.plugin_data_put("com.example.a", "node:2", "{\"price\":2}").unwrap();
+        app.db.set("plugin.com.example.a:bot_token", "secret").unwrap();
+
+        // 导出响应体直接当另一个 plugin_id 的"导入包"——但要改 plugin.toml
+        // 和 data.json 的 plugin_id 到 plugin_b 才合法,所以原样 round-trip 用
+        // plugin_a(同名同版本按 R7 走同版本合并)。
+        let exported = export_plugin(Admin, State(app.clone()), Path(id_a)).await;
+        assert_eq!(exported.status(), StatusCode::OK);
+        let exported_bytes = axum::body::to_bytes(exported.into_body(), usize::MAX).await.unwrap();
+
+        // 同 plugin_id 同版本再导一次,验证包优先合并。
+        let imported = upload(&app, exported_bytes.to_vec()).await;
+        assert_eq!(imported.status(), StatusCode::OK);
+        let body = body_of(imported).await;
+        assert_eq!(body["data_merged"], true);
+        assert_eq!(body["replaced"], true, "同版本是覆盖");
+        assert!(body["records_merged"].as_u64().unwrap() >= 2);
+        assert_eq!(body["kv_merged"].as_u64().unwrap(), 1);
+        // 数据仍在。
+        assert_eq!(
+            app.db.plugin_data_get("com.example.a", "node:1").unwrap().as_deref(),
+            Some("{\"price\":1}")
+        );
+        assert_eq!(app.db.get("plugin.com.example.a:bot_token").as_deref(), Some("secret"));
+        // 旧内存实例下线。
+        assert!(!app.plugins.read().unwrap_or_else(|e| e.into_inner()).is_loaded(id_a));
+    }
+
+    /// data.json 损坏:非法 JSON / 缺 format / plugin_id 与 manifest 不符,都整
+    /// 包 400,库内无任何变化(AE4)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_package_with_a_broken_data_json_is_refused() {
+        let app = plugin_app();
+        // 先装一份纯包作为对照,验证坏包一行不写。
+        let base = plugin_archive(&plugin_manifest("com.example.broken", 2));
+        assert_eq!(upload(&app, base).await.status(), StatusCode::OK);
+        let row = app.db.list_plugins().unwrap().remove(0);
+        app.db.plugin_data_put("com.example.broken", "kept", "yes").unwrap();
+
+        // 非法 JSON。
+        let archive = tarball(&[
+            ("plugin.toml", plugin_manifest("com.example.broken", 2).into_bytes()),
+            ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
+            ("data.json", b"{not json".to_vec()),
+        ]);
+        let refused = upload(&app, archive).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(
+            &axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap()
+        )
+        .contains("data.json"));
+
+        // plugin_id 与 manifest 不符。
+        let mut mismatch = DataJson {
+            format: 1,
+            plugin_id: "com.example.other".into(),
+            kv: Default::default(),
+            records: Default::default(),
+        };
+        mismatch.records.insert("r".into(), DataRecord { data: "v".into(), updated_at: 0 });
+        let archive = tarball(&[
+            ("plugin.toml", plugin_manifest("com.example.broken", 2).into_bytes()),
+            ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
+            ("data.json", serde_json::to_vec(&mismatch).unwrap()),
+        ]);
+        let refused = upload(&app, archive).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let text =
+            String::from_utf8_lossy(&axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap())
+                .to_string();
+        assert!(text.contains("plugin_id"), "{text}");
+
+        // 库内原数据不动。
+        assert_eq!(app.db.plugin_data_get("com.example.broken", "kept").unwrap().as_deref(), Some("yes"));
+        assert_eq!(app.db.get_plugin(row.id).unwrap().unwrap().version, "1.0.0");
+    }
+
+    /// 构造包守卫(KTD3):wasm_entry 声明成 data.json 的包被整包拒绝。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plugin_claiming_data_json_as_wasm_entry_is_refused() {
+        let app = plugin_app();
+        let manifest = "plugin_id = \"com.example.evil\"\nname = \"Evil\"\nversion = \"1.0.0\"\n\
+             abi_version = 2\nsubscribes = [\"agent_offline\"]\nwasm_entry = \"data.json\"\n"
+            .to_owned();
+        let archive = tarball(&[
+            ("plugin.toml", manifest.into_bytes()),
+            ("data.json", wat::parse_str(MINIMAL_WAT).unwrap()),
+        ]);
+        let refused = upload(&app, archive).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let text =
+            String::from_utf8_lossy(&axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap())
+                .to_string();
+        assert!(text.contains("data.json") && text.contains("保留"), "{text}");
+        assert!(app.db.list_plugins().unwrap().is_empty());
+    }
+
+    /// 含数据包过两层 body limit:8 MiB < 压缩体 < 32 MiB,数据条目让它跨过原
+    /// 来 8 MiB 的合并上限。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_package_in_the_8_to_32_mib_band_passes_the_router_layer() {
+        let app = plugin_app();
+        // 难压缩填充顶过 8 MiB 但远未到 32 MiB。
+        let big_pad = noise(9 * 1024 * 1024);
+        let data = DataJson {
+            format: 1,
+            plugin_id: "com.example.band".into(),
+            kv: Default::default(),
+            records: [("k".to_owned(), DataRecord { data: "v".into(), updated_at: 0 })].into_iter().collect(),
+        };
+        let archive = tarball(&[
+            ("plugin.toml", plugin_manifest("com.example.band", 2).into_bytes()),
+            ("plugin.wasm", wat::parse_str(MINIMAL_WAT).unwrap()),
+            ("data.json", serde_json::to_vec(&data).unwrap()),
+            ("assets/pad.bin", big_pad),
+        ]);
+        let size = archive.len() as u64;
+        assert!(size > PURE_PLUGIN_MAX && size < MAX_PLUGIN, "fixture 必须在 8–32 MiB 之间,实际 {size}");
+
+        let response = upload(&app, archive).await;
+        assert_eq!(response.status(), StatusCode::OK, "含数据包过 32 MiB router 层");
+        assert_eq!(body_of(response).await["data_merged"], true);
+        assert_eq!(app.db.plugin_data_get("com.example.band", "k").unwrap().as_deref(), Some("v"));
     }
 
     /// 启停生命周期:enable 写库又装内存,test 走完整执行路径拿回结果,
