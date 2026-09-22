@@ -844,20 +844,12 @@ pub async fn plugin_dispatch_log(
 /// 反而引入新的边界差异。push 与 `Registry::clear_dispatch_log` 共用一把
 /// 互斥锁,清的过程中并发派发照常写,新条目都在锁释放之后落地,不存在「
 /// 边清边写丢一条」的窗口。
-pub async fn clear_plugin_dispatch_log(
-    _: Admin,
-    State(app): State<Shared>,
-    Path(id): Path<i64>,
-) -> Response {
+pub async fn clear_plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let plugin_id = match plugin_or_404(&app, id) {
         Ok(plugin_id) => plugin_id,
         Err(resp) => return resp,
     };
-    let cleared = app
-        .plugins
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear_dispatch_log(&plugin_id);
+    let cleared = app.plugins.write().unwrap_or_else(|e| e.into_inner()).clear_dispatch_log(&plugin_id);
     Json(json!({"cleared": cleared})).into_response()
 }
 
