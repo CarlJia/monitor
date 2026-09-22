@@ -15,14 +15,16 @@
 | [monitor-theme-default](https://github.com/monitor-probe/monitor-theme-default) | 内置默认主题 |
 
 ```
-agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
+agent (Linux)  ⇄── WebSocket · MessagePack ──⇄  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
+
+连接是双向的——hub 在握手后立刻下发 `ping.tasks`，每 30 s 发一次 WebSocket Ping；120 s 收不到任何帧即断。信封沿用 JSON-RPC 形状（`version` / `jsonrpc` / `method` / `params`），`version` 让协议不匹配在解出字段前失败关闭。
 
 ## 插件开发
 
 hub 支持用 Rust 编写的 WASM 通知插件：节点到期、agent 掉线/恢复等事件会
 派发给所有订阅了该事件的已启用插件，插件在沙箱（wasmtime）里运行，只能通过
-14 个宿主函数与外界交互——日志、时钟、键值存储、受限的 https 请求、节点只读
+13 个宿主函数与外界交互——日志、时钟、键值存储、受限的 https 请求、节点只读
 查询、事件发出以及自有的 key/value 数据存储。两个完整可编译的参考实现
 ——[`tg-notify`](https://github.com/CarlJia/monitor-hub-plugins/tree/main/tg-notify)
 （Telegram 通知，订阅宿主事件）和
@@ -90,7 +92,7 @@ payload = '{"node_id":0,"name":"test"}'  # JSON 对象；顶层不能带 type（
 | `plugin_id` | 非空、不含 `:`（它是 kv 命名空间 `plugin.<plugin_id>:<key>` 的分隔符）；重复的 `plugin_id` 上传被拒，升级需先删除旧版 |
 | `name` / `version` | 非空 |
 | `abi_version` | 必须为 `2` |
-| `subscribes` | 订阅的宿主事件列表，最多 32 条、不重复。宿主自身的事件名有白名单——`agent_offline` / `agent_online` / `node_added` / `node_deleted`，其余必须是 `plugin_` 前缀，写错在上传时即被拒。`node_added` / `node_deleted` 是较新的宿主事件：宿主未升级时插件会因白名单校验而加载失败，**发布顺序是先宿主后插件**（`abi_version` 仍为 2）。v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
+| `subscribes` | 订阅的宿主事件列表，最多 32 条、不重复。宿主自身的事件名有白名单——`agent_offline` / `agent_online` / `node_added` / `node_deleted` / `login_succeeded` / `login_failed`，其余必须是 `plugin_` 前缀，写错在上传时即被拒。`node_added` / `node_deleted` / `login_succeeded` / `login_failed` 是较新的宿主事件：宿主未升级时插件会因白名单校验而加载失败，**发布顺序是先宿主后插件**（`abi_version` 仍为 2）。v2 起宿主自身不再产生到期提醒，到期由财务类插件发 `plugin_expiry_soon`，其他插件订阅这条而不是旧的 `expiry_soon` |
 | `wasm_entry` | 可选，缺省 `plugin.wasm`：包内 wasm 入口文件名 |
 | `[tick]` | 存在则每小时调度一次 `on_tick`（面板**启用**插件成功后立刻另跑一次） |
 | `[page]` | 存在则面板里出现「页面」入口；`title` 必填 |
@@ -182,7 +184,7 @@ payload = '{"node_id":0,"name":"test"}'  # JSON 对象；顶层不能带 type（
 {"type":"plugin_expiry_soon","node_id":7,"name":"edge-1","expires_at":"2026-10-01","days_left":7,"threshold_days":7}
 ```
 
-宿主事件有 `agent_offline` / `agent_online` / `node_added` / `node_deleted` 四种
+宿主事件有 `agent_offline` / `agent_online` / `node_added` / `node_deleted` / `login_succeeded` / `login_failed` 六种
 `type`，加上任意 `plugin_<作者选>` 由插件经 `host_emit_event` 发出。面板只识别
 `agent_*` 与 `plugin_*` 前缀的事件。
 
@@ -393,9 +395,14 @@ SQLite 复用（删掉最大 id 的节点后新建的节点拿到同一个 id）
 
 要点速览：
 
+- **2.1.0** — 派发日志支持翻页（`page` / `page_size`，单页上限 500）；agent↔hub 改 msgpack 二进制帧，envelope 加 `version` 首字段（破坏性，hub 与 agent 必须同步升级）
+- **2.0.7** — 财务统计页「汇总与币种选择」合成一行展示；CI(plugin-contract) 契约 tag gate 拦截 stale commit
+- **2.0.6** — 抽出 `monitor-plugin-contract` crate（13 个宿主函数）；新增 `node_added` / `node_deleted` 节点增删事件；web-admin 地址按族分两行
+- **2.0.5** — web-admin NAT 节点显示连接来源公网地址；`isLocalV4` 与 agent `is_public` 同步排除 TEST-NETs
+- **2.0.4** — hub 从 `CF-Connecting-IP` 头部读取节点真实公网 IP；插件源码迁到 `monitor-hub-plugins` 子仓；CI(plugin-abi) 基于 toml 的 `abi_version` 派生构建矩阵
 - **2.0.3** — 同 `plugin_id` 更高版本上传就地替换，插件数据保留
 - **2.0.2** — 财务统计页 UX（页面首屏拉汇率、币种/周期下拉、列头中文、保存提示）
 - **2.0.1** — 后台 CLS 修复（安全页 0.18、Chrome 调试地址假红）、插件数据面钩子独立 fuel 预算
 - **1.2.1** — 插件失败透出插件日志、`host.rs` 拆分
-- **1.2.0** — 插件 ABI 升到 v2（破坏性）：14 个宿主函数、SSRF 防线、`plugin_data` 自持表、`finance-stats` 财务统计插件、`tg-notify` 迁移到 v2
+- **1.2.0** — 插件 ABI 升到 v2（破坏性）：13 个宿主函数、SSRF 防线、`plugin_data` 自持表、`finance-stats` 财务统计插件、`tg-notify` 迁移到 v2
 - **1.0.0** — 初始版本
