@@ -2143,7 +2143,12 @@ mod tests {
         let open = node(&app, "open", true);
         node(&app, "hidden", false);
         app.db
-            .save_facts(open, &json!({"hostname": "vps-1", "agent_version": "1.2.3"}), "198.51.100.9", "198.51.100.9")
+            .save_facts(
+                open,
+                &json!({"hostname": "vps-1", "agent_version": "1.2.3"}),
+                "198.51.100.9",
+                "198.51.100.9",
+            )
             .unwrap();
 
         // A live report, so the public view has metrics to strip. `hostname` is

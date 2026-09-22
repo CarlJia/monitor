@@ -218,15 +218,13 @@ impl Event {
             // FNV-1a 而不是 DefaultHasher:后者算法未指定、跨 Rust 版本会变,而这
             // 个值要持久化进 notification_log,变了就会重发。
             Event::LoginSucceeded { method, actor, ip, observed_at } => {
-                let content = format!(
-                    "{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{actor}{LOGIN_KEY_SEP}{ip}"
-                );
+                let content =
+                    format!("{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{actor}{LOGIN_KEY_SEP}{ip}");
                 fnv1a(content.as_bytes()) as i64
             }
             Event::LoginFailed { method, reason, ip, observed_at } => {
-                let content = format!(
-                    "{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{reason}{LOGIN_KEY_SEP}{ip}"
-                );
+                let content =
+                    format!("{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{reason}{LOGIN_KEY_SEP}{ip}");
                 fnv1a(content.as_bytes()) as i64
             }
             Event::Plugin { payload, .. } => {

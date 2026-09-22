@@ -624,12 +624,8 @@ mod tests {
         headers.insert(crate::auth::STATE_COOKIE, "anything".parse().unwrap());
         // 触发 5 次(MAX_ATTEMPTS):emit 各落一条;第 6 次起被锁、不再 emit。
         for i in 0..MAX_ATTEMPTS {
-            let resp = sign_in_failed(
-                &app,
-                &headers,
-                "198.51.100.7".parse().unwrap(),
-                &format!("reason {i}"),
-            );
+            let resp =
+                sign_in_failed(&app, &headers, "198.51.100.7".parse().unwrap(), &format!("reason {i}"));
             // 不校验响应状态——sign_in_failed 总是 302;关心的是总线。
             let _ = resp;
         }
