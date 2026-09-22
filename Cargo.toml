@@ -19,8 +19,11 @@ rmp-serde = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# "multipart": 插件上传(R11)接收 multipart/form-data 的 tar.gz。
-axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+# "multipart": 插件上传(R11)接收 multipart/form-data 的 tar.gz。`http1`/
+# `json`/`query`/`tokio` 是显式列出来的必要项;`tracing`/`tower-log`/`form`/
+# `matched-path` 等默认 features 都是我们没在用的(没有 TraceLayer/LogLayer/
+# Form extractor/匹配路径展开),default-features=false 砍掉。
+axum = { version = "0.8", default-features = false, features = ["ws", "macros", "multipart", "http1", "json", "query", "tokio"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
@@ -32,7 +35,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "compression-gzip"] }
 # Theme archives. Both are pure Rust: the release binary is built with `cross`
 # and the image is FROM scratch, which rules out a C dependency or an external
 # tar.
