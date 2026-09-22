@@ -186,6 +186,20 @@ impl Registry {
         self.dispatch_log.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().cloned().collect()
     }
 
+    /// 清空一个插件的派发记录(R16):面板给操作员的逃生门。缓冲是内存里的环形,
+    /// 清掉就是丢;长期审计在通知日志表,那里没有「清空」入口。
+    ///
+    /// 返回实际清掉的条数,面板 toast 据此告诉操作员清掉了多少。0 行也走这条
+    /// 路——not 空管道不该把"明明没有记录"包装成失败。push 与本方法共用同
+    /// 把互斥锁,清的过程中派发照常写,但都排在锁后;新条目不会同时被丢,
+    /// 因为它们进队列的时机就在锁释放之后。
+    pub fn clear_dispatch_log(&self, plugin_id: &str) -> usize {
+        let mut log = self.dispatch_log.lock().unwrap_or_else(|e| e.into_inner());
+        let before = log.len();
+        log.retain(|entry| entry.plugin_id != plugin_id);
+        before - log.len()
+    }
+
     /// 派发到所有订阅该事件的已启用插件(R5),fire-and-forget:emit 的调用
     /// 链是同步的,不等插件。
     ///

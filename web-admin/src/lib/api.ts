@@ -439,6 +439,16 @@ export const testPlugin = (id: number) =>
 export const pluginLogs = (id: number, page: number, pageSize: number) =>
   api<PluginLogPage>(`/plugins/${id}/logs?page=${page}&page_size=${pageSize}`)
 
+/**
+ * 清空一个插件的派发日志(R16):面板给操作员的逃生门。响应体带 `cleared`,
+ * 面板 toast 据此告诉操作员清掉了多少——「丢了什么」是这种不可撤销动作
+ * 值得多报一句话的那类。空管道也走同一条路(200, cleared=0),不该把「明明
+ * 没有记录」包装成失败——`httpErrorText` 对空体响应回退到状态码,不会让
+ * toast 出现空白。
+ */
+export const clearPluginLogs = (id: number) =>
+  api<{ cleared: number }>(`/plugins/${id}/logs`, { method: "DELETE" })
+
 /** 写一个插件的 kv 行（R13）。key 校验在后端 set_plugin_kv。 */
 export const setPluginKv = (id: number, key: string, value: string) =>
   api<{ ok: boolean }>(`/plugins/${id}/kv/${encodeURIComponent(key)}`, {
