@@ -33,6 +33,8 @@ const EVENT_BADGES: Record<string, { label: string; className: string }> = {
   node_added: { label: "新增节点", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
   node_deleted: { label: "删除节点", className: "bg-red-500/15 text-red-700 dark:text-red-400" },
   tick: { label: "定时任务", className: "bg-slate-500/15 text-slate-700 dark:text-slate-400" },
+  login_succeeded: { label: "登录成功", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
+  login_failed: { label: "登录失败", className: "bg-red-500/15 text-red-700 dark:text-red-400" },
 }
 
 // 启用绿 / 手动停用灰 / 加载失败红。失败判定先于 enabled：后端回滚 enabled 前，
