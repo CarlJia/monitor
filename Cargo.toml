@@ -74,3 +74,8 @@ lto = true
 opt-level = "z"
 panic = "abort"
 strip = true
+# 整数溢出检查在 release 里关掉:`panic = "abort"` 已经把 panic 转成进程退出,
+# overflow 也只是这条路径的另一条出口,减一个分支检查能再压一点体积;hub 内部
+# 计数(流量字节、月份累加、id 序列)的 `wrapping_*` 调用仍然走显式环绕,
+# 不依赖隐式 wrapping。debug profile 保留检查,免得本地复现时被静默溢出误导。
+overflow-checks = false
