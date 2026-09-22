@@ -5,6 +5,18 @@ All notable changes to monitor-hub will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- 插件级导出与导入：`GET /api/plugins/{id}/export` 把单个已装插件连同它的 `plugin_data` 记录与渠道 kv 打成一个 tar.gz 下载（响应头与整库备份同级——`no-store` + `attachment`，包内含明文渠道密钥，处置要求同上）。面板「插件」页操作列新增「导出」按钮（原生 `<a download>`，文件不进页面内存）。导入复用 `POST /api/plugins`：包内出现 `data.json` 条目即识别为含数据包，按包优先合并到已装同款（**同版本=恢复**，更高=升级并恢复，更低=拒绝），合并与插件行 upsert 在同一事务，任何一步校验失败整包 400、一行不写（合并后总量超 `plugin_data` 16 MiB 配额、单条超 256 KiB、kv value 超 8 KiB、记录或 kv key 为空、`data.json` 的 `plugin_id` 与 manifest 不符都拒）。面板上传动作先弹确认框说明覆盖与合并行为；导入完成后 toast 说明合并了多少条记录/项配置。
+
+### Changed
+
+- **破坏性变更**：`POST /api/plugins` 收流上限从 8 MiB 抬到 32 MiB——含数据包要装下满配额的 `plugin_data`（16 MiB）加 wasm 模块（16 MiB）及序列化开销。纯插件包（无 `data.json`）在 unpack 后按压缩体复查 8 MiB，超出仍拒且文案与现状同款（拒绝时机从收流移到解包后）。解包防护 `PLUGIN_MAX_FILE` 16→24 MiB、`PLUGIN_MAX_EXPANDED` 32→40 MiB。**反代部署面变化**：reverse proxy 的 `client_max_body_size` 必须按插件上传路由放行到 32m——漏改的部署会在大包上 413。备份分片（`/api/db/restore`）与主题上传（`/api/themes`）的 8 MiB 上限不变。
+- **破坏性变更**：含数据包的 `POST /api/plugins` 响应体新增 `data_merged`（bool）、`records_merged`（数字）、`kv_merged`（数字）字段——纯包上传的响应不带这些字段。直接消费旧响应形状的调用方不受影响（新增字段即可被读到）；含数据包的调用方需按新字段说明处理结果。
+- 含数据包的导入到已装同款**允许同版本覆盖**（按包优先合并），纯插件包仍按现状「版本必须更高」门槛走——同版本与更低版本拒绝且文案逐字不变。覆盖后插件回到**停用**、旧内存实例下线，期间订阅事件不补发——与升级一致。
+
 ## [2.1.0] - 2026-09-21
 
 ### Added

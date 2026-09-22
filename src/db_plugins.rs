@@ -5,12 +5,14 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use monitor_plugin_contract::constants::{KV_VALUE_MAX, PLUGIN_DATA_MAX, RECORD_MAX};
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
+use std::cmp::Ordering;
 
 use crate::db::Db;
 use crate::notification_bus::Event;
-use crate::plugin::is_newer_version;
+use crate::plugin::{is_newer_version, version_ordering};
 
 /// One stored plugin: its manifest, wasm bytes and lifecycle flags.
 #[derive(Serialize, Debug, Clone)]
@@ -28,6 +30,27 @@ pub struct PluginRow {
     pub status: String,
     pub last_error: Option<String>,
     pub uploaded_at: i64,
+}
+
+/// 单事务快照读出的一个插件连同它的数据（U1/KTD2）：插件行全列、全部
+/// `plugin_data` 记录、全部渠道 kv（已剥 `plugin.<id>:` 前缀）。导出 API
+/// 把它序列化进包，导入侧再按同样的三份合并回库。
+pub struct PluginExport {
+    pub plugin: PluginRow,
+    /// `(record_key, data)`，按 key 排序。
+    pub records: Vec<(String, String)>,
+    /// `(key, value)`，前缀已剥，按 key 排序。
+    pub kv: Vec<(String, String)>,
+}
+
+/// 一次含数据导入的合并结果（U1/KTD4）：给面板 toast 报数用。`replaced`
+/// 与纯包升级同义——true 表示覆盖/升级了已装的同款，false 表示新装。
+#[derive(Debug)]
+pub struct DataMergeOutcome {
+    pub row: PluginRow,
+    pub replaced: bool,
+    pub records_merged: usize,
+    pub kv_merged: usize,
 }
 
 /// The state event on the other side of `event_type`, if it names one. A state
@@ -127,6 +150,173 @@ impl Db {
         )?;
         tx.commit()?;
         Ok((row, true))
+    }
+
+    /// 单事务快照读一个插件连同它的数据（U1/KTD2）：插件行全列、全部
+    /// `plugin_data` 记录、全部渠道 kv 三处在**同一条事务**里读，导出期间
+    /// 另一处的插件写入不会让包里三份互相撕裂。行不存在返回 `Ok(None)`，
+    /// 让导出 API 转成 404。kv 的前缀匹配与转义理由见 [`Db::plugin_kv`]。
+    pub fn export_plugin(&self, id: i64) -> Result<Option<PluginExport>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let plugin = tx
+            .query_row(
+                &format!("SELECT {} FROM plugin WHERE id=?1", Self::PLUGIN_COLUMNS),
+                [id],
+                row_to_plugin,
+            )
+            .optional()?;
+        let Some(plugin) = plugin else {
+            return Ok(None);
+        };
+
+        let records = {
+            let mut stmt = tx
+                .prepare("SELECT record_key, data FROM plugin_data WHERE plugin_id=?1 ORDER BY record_key")?;
+            let rows = stmt
+                .query_map([&plugin.plugin_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let prefix = format!("plugin.{}:", plugin.plugin_id);
+        let kv = {
+            let pattern = format!("{}%", like_escaped(&prefix));
+            let mut stmt =
+                tx.prepare("SELECT key, value FROM setting WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")?;
+            let rows = stmt.query_map([pattern], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(key, value)| (key[prefix.len()..].to_owned(), value))
+                .collect()
+        };
+        // 只读，无写入，drop 即回滚（读锁释放）——无需 commit。
+        Ok(Some(PluginExport { plugin, records, kv }))
+    }
+
+    /// 含数据包的导入合并（U1/KTD3、KTD4）：版本判定含**同版本旁路**、逐条
+    /// 校验、合并后并集配额预检、插件行 upsert、kv 与记录合并，全部在**同一
+    /// 条事务**里——任何一步失败整体回滚，一行不写（R9）。
+    ///
+    /// 与 [`Db::install_plugin_package`] 的差别只在版本门：纯包只有更高才替换，
+    /// 含数据包把「等于（恢复）」与「更高（升级）」都放行、只拒「更低」。
+    ///
+    /// 合并语义是**包优先**（R8）：包内有的键恢复为包里的值，包里没有的键
+    /// 保留库里现值，不删除库内任何数据；同一包重复导入结果幂等。
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_plugin_package_with_data(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        version: &str,
+        manifest_json: &str,
+        wasm_blob: &[u8],
+        wasm_sha256: &str,
+        records: &[(String, String)],
+        kv: &[(String, String)],
+    ) -> Result<DataMergeOutcome> {
+        // 逐条形态校验先于任何库写入：坏包在开事务前就被拒（R9）。记录 key
+        // 允许含 `:`（宿主写侧本就允许 `node:1` 这类），只禁空；kv key 只禁空
+        // （「≤128 且无 :」是 manifest 声明层的约束，不作导入拒绝条件）。
+        for (key, data) in records {
+            if key.is_empty() {
+                anyhow::bail!("数据记录的 key 不能为空");
+            }
+            if data.len() > RECORD_MAX {
+                anyhow::bail!("数据记录 {key} 超过单条 {} KiB 的上限", RECORD_MAX / 1024);
+            }
+        }
+        for (key, value) in kv {
+            if key.is_empty() {
+                anyhow::bail!("渠道配置的 key 不能为空");
+            }
+            if value.len() > KV_VALUE_MAX {
+                anyhow::bail!("渠道配置 {key} 超过单项 {} KiB 的上限", KV_VALUE_MAX / 1024);
+            }
+        }
+
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        let installed: Option<(i64, String)> = tx
+            .query_row("SELECT id, version FROM plugin WHERE plugin_id=?1", [plugin_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+
+        let (id, replaced) = match &installed {
+            None => {
+                let row =
+                    insert_plugin_row(&tx, plugin_id, name, version, manifest_json, wasm_blob, wasm_sha256)?;
+                (row.id, false)
+            }
+            Some((id, installed_version)) => {
+                // 同版本旁路：等于（恢复）或更高（升级）放行，只拒更低。
+                if version_ordering(version, installed_version) == Ordering::Less {
+                    anyhow::bail!(
+                        "插件 {plugin_id} 已装版本 {installed_version}，这次导入的是 {version}；\
+                         含数据包只有版本相等（恢复）或更高（升级）才能覆盖，更低会拒绝"
+                    );
+                }
+                tx.execute(
+                    "UPDATE plugin SET name=?2, version=?3, manifest_json=?4, wasm_blob=?5,
+                            wasm_sha256=?6, enabled=0, status='disabled', last_error=NULL, uploaded_at=?7
+                     WHERE id=?1",
+                    params![id, name, version, manifest_json, wasm_blob, wasm_sha256, now],
+                )?;
+                (*id, true)
+            }
+        };
+
+        // 合并后并集配额预检（R8、R9）：从库内现用量出发，对每个包内记录
+        // 扣掉被它覆盖的旧值、加上包里的新值——同 key 以包为准只计一次，不是
+        // `existing + package` 简单相加。字节口径与 `plugin_data_usage` 一致
+        // （`LENGTH(CAST(data AS BLOB))`）。超限整包拒绝，一行不写。
+        let mut projected: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB))),0) FROM plugin_data WHERE plugin_id=?1",
+            [plugin_id],
+            |r| r.get(0),
+        )?;
+        for (key, data) in records {
+            let existing: i64 = tx
+                .query_row(
+                    "SELECT LENGTH(CAST(data AS BLOB)) FROM plugin_data WHERE plugin_id=?1 AND record_key=?2",
+                    params![plugin_id, key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            projected = projected - existing + data.len() as i64;
+        }
+        if projected > PLUGIN_DATA_MAX {
+            anyhow::bail!("合并后 plugin_data 总量超过单插件 {} MiB 的配额", PLUGIN_DATA_MAX / 1024 / 1024);
+        }
+
+        // 记录合并（包优先 upsert）：包内键写包值，库内其他键不动。
+        for (key, data) in records {
+            tx.execute(
+                "INSERT INTO plugin_data (plugin_id, record_key, data, updated_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(plugin_id, record_key) DO UPDATE SET data=?3, updated_at=?4",
+                params![plugin_id, key, data, now],
+            )?;
+        }
+        // kv 合并：setting 表按 `plugin.<id>:<key>` 命名空间 upsert（与 `Db::set`
+        // 同一冲突语义），前缀在这里补回。
+        for (key, value) in kv {
+            tx.execute(
+                "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![format!("plugin.{plugin_id}:{key}"), value],
+            )?;
+        }
+
+        let row = tx.query_row(
+            &format!("SELECT {} FROM plugin WHERE id=?1", Self::PLUGIN_COLUMNS),
+            [id],
+            row_to_plugin,
+        )?;
+        tx.commit()?;
+        Ok(DataMergeOutcome { row, replaced, records_merged: records.len(), kv_merged: kv.len() })
     }
 
     pub fn list_plugins(&self) -> Result<Vec<PluginRow>> {
@@ -571,7 +761,9 @@ fn row_to_plugin(r: &rusqlite::Row<'_>) -> rusqlite::Result<PluginRow> {
 
 #[cfg(test)]
 mod tests {
+    use super::{KV_VALUE_MAX, RECORD_MAX};
     use crate::db::db;
+    use crate::db::Db;
 
     /// The plugin round trip: upload, read back with and without the bytes,
     /// flip the lifecycle flags, and refuse a second copy of the same
@@ -674,6 +866,204 @@ mod tests {
         assert!(!replaced);
         assert_ne!(other.id, first.id);
         assert_eq!(db.list_plugins().unwrap().len(), 2);
+    }
+
+    /// 导出快照单事务读出插件行、记录与 kv 三份；导入合并把它们按包优先
+    /// 语义写回，往返后库内可见状态与导出时一致（U1 的 Db 层半边）。
+    #[test]
+    fn export_reads_a_snapshot_and_import_merges_it_back() {
+        let db = db();
+        let (src, _) =
+            db.install_plugin_package("fin", "Finance", "1.2", "{\"a\":1}", b"m1", "sha1").unwrap();
+        db.plugin_data_put("fin", "node:1", "d1").unwrap();
+        db.plugin_data_put("fin", "node:2", "d2").unwrap();
+        db.set("plugin.fin:bot_token", "secret").unwrap();
+        db.set_plugin_enabled(src.id, true).unwrap();
+
+        let export = db.export_plugin(src.id).unwrap().expect("装过的插件导得出");
+        assert_eq!(export.plugin.version, "1.2");
+        assert_eq!(export.records, vec![("node:1".into(), "d1".into()), ("node:2".into(), "d2".into())]);
+        assert_eq!(export.kv, vec![("bot_token".into(), "secret".into())], "kv 前缀已剥");
+        assert!(db.export_plugin(9999).unwrap().is_none(), "不存在的 id 返回 None");
+
+        // 新装：另一个空库风格的 plugin_id，插件行 + kv + 记录全落库、停用。
+        let out = db
+            .install_plugin_package_with_data(
+                "fresh",
+                "Fresh",
+                "1.0",
+                "{}",
+                b"m2",
+                "sha2",
+                &[("k".into(), "v".into())],
+                &[("token".into(), "t".into())],
+            )
+            .unwrap();
+        assert!(!out.replaced && !out.row.enabled && out.row.status == "disabled");
+        assert_eq!((out.records_merged, out.kv_merged), (1, 1));
+        assert_eq!(db.plugin_data_get("fresh", "k").unwrap().as_deref(), Some("v"));
+        assert_eq!(db.get("plugin.fresh:token").as_deref(), Some("t"));
+    }
+
+    /// 同版本覆盖：包内键恢复包值、包外键保留、库内无删除；重复导入幂等。
+    #[test]
+    fn same_version_import_merges_package_over_existing_and_is_idempotent() {
+        let db = db();
+        let (row, _) = db.install_plugin_package("fin", "Finance", "1.2", "{}", b"m", "sha").unwrap();
+        db.plugin_data_put("fin", "d1", "old").unwrap();
+        db.plugin_data_put("fin", "d2", "keep").unwrap();
+        db.set("plugin.fin:token", "old-token").unwrap();
+        db.set_plugin_enabled(row.id, true).unwrap();
+
+        // 同版本，携带 d1 的新值 + 新增 d3；d2 与包无关。
+        let import = |db: &Db| {
+            db.install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.2",
+                "{}",
+                b"m2",
+                "sha2",
+                &[("d1".into(), "new".into()), ("d3".into(), "add".into())],
+                &[("token".into(), "new-token".into())],
+            )
+            .unwrap()
+        };
+        let out = import(&db);
+        assert!(out.replaced, "同版本是覆盖");
+        assert!(!out.row.enabled && out.row.status == "disabled", "覆盖后回停用待启用");
+        assert_eq!(out.row.id, row.id, "覆盖不换行 id");
+        assert_eq!(db.plugin_data_get("fin", "d1").unwrap().as_deref(), Some("new"), "包内键恢复包值");
+        assert_eq!(db.plugin_data_get("fin", "d2").unwrap().as_deref(), Some("keep"), "包外键保留");
+        assert_eq!(db.plugin_data_get("fin", "d3").unwrap().as_deref(), Some("add"), "包内新键新增");
+        assert_eq!(db.get("plugin.fin:token").as_deref(), Some("new-token"), "kv 恢复包值");
+
+        // 幂等：同包再导一次，库内值集完全一致，行不新增。
+        import(&db);
+        assert_eq!(db.plugin_data_list("fin", "").unwrap().len(), 3);
+        assert_eq!(db.plugin_data_get("fin", "d1").unwrap().as_deref(), Some("new"));
+        assert_eq!(db.list_plugins().unwrap().len(), 1);
+    }
+
+    /// 更高版本导入是升级 + 合并；库内更高则整包拒绝、一行不写。
+    #[test]
+    fn higher_version_upgrades_but_a_lower_version_import_is_refused() {
+        let db = db();
+        db.install_plugin_package("fin", "Finance", "1.2", "{}", b"m", "sha").unwrap();
+        db.plugin_data_put("fin", "d1", "orig").unwrap();
+
+        let up = db
+            .install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.3",
+                "{}",
+                b"m2",
+                "sha2",
+                &[("d1".into(), "v13".into())],
+                &[],
+            )
+            .unwrap();
+        assert!(up.replaced && up.row.version == "1.3");
+        assert_eq!(db.plugin_data_get("fin", "d1").unwrap().as_deref(), Some("v13"));
+
+        let refused = db
+            .install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.2",
+                "{}",
+                b"m3",
+                "sha3",
+                &[("d1".into(), "downgrade".into())],
+                &[],
+            )
+            .expect_err("库内版本更高，含数据包按 R7 拒绝");
+        assert!(refused.to_string().contains("更低会拒绝"), "{refused}");
+        let kept = db.get_plugin(up.row.id).unwrap().unwrap();
+        assert_eq!(kept.version, "1.3", "被拒的包一行不写");
+        assert_eq!(db.plugin_data_get("fin", "d1").unwrap().as_deref(), Some("v13"), "记录也不动");
+    }
+
+    /// 校验与配额：合并后总量超配额、单条超限、key 为空都整包拒绝，pre/post
+    /// 行数一致（R9 的一行不写）；记录 key 含 `:` 是合法形状，不拒。
+    #[test]
+    fn import_rejects_oversized_or_malformed_data_without_writing_a_row() {
+        let db = db();
+        db.install_plugin_package("fin", "Finance", "1.0", "{}", b"m", "sha").unwrap();
+        db.plugin_data_put("fin", "existing", "x").unwrap();
+        let before = db.plugin_data_list("fin", "").unwrap();
+
+        // 单条超 256 KiB。
+        let big = "x".repeat(RECORD_MAX + 1);
+        let e = db
+            .install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.0",
+                "{}",
+                b"m",
+                "sha",
+                &[("d".into(), big)],
+                &[],
+            )
+            .expect_err("单条超限");
+        assert!(e.to_string().contains("单条"), "{e}");
+
+        // kv value 超 8 KiB。
+        let big_kv = "y".repeat(KV_VALUE_MAX + 1);
+        assert!(db
+            .install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.0",
+                "{}",
+                b"m",
+                "sha",
+                &[],
+                &[("token".into(), big_kv)],
+            )
+            .is_err());
+
+        // 空 key。
+        assert!(db
+            .install_plugin_package_with_data(
+                "fin",
+                "Finance",
+                "1.0",
+                "{}",
+                b"m",
+                "sha",
+                &[("".into(), "v".into())],
+                &[],
+            )
+            .is_err());
+
+        // 合并后总量超配额：多条各 200 KiB 累加越过 16 MiB。
+        let chunk = "z".repeat(200 * 1024);
+        let many: Vec<(String, String)> = (0..90).map(|i| (format!("rec{i}"), chunk.clone())).collect();
+        let e = db
+            .install_plugin_package_with_data("fin", "Finance", "1.0", "{}", b"m", "sha", &many, &[])
+            .expect_err("合并后超配额");
+        assert!(e.to_string().contains("配额"), "{e}");
+
+        // 记录 key 含 `:` 合法，放行。
+        db.install_plugin_package_with_data(
+            "fin",
+            "Finance",
+            "1.0",
+            "{}",
+            b"m",
+            "sha",
+            &[("node:1".into(), "v".into())],
+            &[],
+        )
+        .expect("含 `:` 的记录 key 是合法形状");
+        assert_eq!(db.plugin_data_get("fin", "node:1").unwrap().as_deref(), Some("v"));
+
+        // 每一次拒绝都没动 existing 那行。
+        assert_eq!(db.plugin_data_get("fin", "existing").unwrap().as_deref(), Some("x"));
+        assert!(before.iter().all(|(k, _)| db.plugin_data_get("fin", k).unwrap().is_some()));
     }
 
     /// 删除插件是行与 kv 行一条事务:两端一起消失,行不在时整体报错而不

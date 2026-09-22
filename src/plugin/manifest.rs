@@ -301,6 +301,14 @@ pub fn is_newer_version(candidate: &str, installed: &str) -> bool {
     version_segments(candidate) > version_segments(installed)
 }
 
+/// 候选版本与已装版本的完整序关系。纯插件包只关心「更高才替换」，用
+/// [`is_newer_version`] 就够；含数据包的导入要把「等于（恢复）」与「更高
+/// （升级）」都放行、只拒「更低」，需要三态而不是布尔——两者共用同一套
+/// [`version_segments`] 口径，`1.2` 与 `1.2.0` 判为相等。
+pub fn version_ordering(candidate: &str, installed: &str) -> std::cmp::Ordering {
+    version_segments(candidate).cmp(&version_segments(installed))
+}
+
 /// 版本 → 可比较的数字段。尾部多余的 0 去掉，让 `1.2` 与 `1.2.0` 相等。
 fn version_segments(version: &str) -> Vec<u64> {
     let mut segments: Vec<u64> = version

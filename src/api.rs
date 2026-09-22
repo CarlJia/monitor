@@ -1008,6 +1008,11 @@ const READABLE_SETTINGS: &[&str] = &[
 /// **This, not the two ceilings below, is what a reverse proxy must pass.** A
 /// backup of any size arrives 4 MiB at a time, so `client_max_body_size` no
 /// longer tracks the size of the database.
+///
+/// The plugin upload route has its own, higher body-limit layer
+/// (`api_plugins::MAX_PLUGIN`, 32 MiB) so a reverse proxy must pass that size
+/// for it specifically; this 8 MiB ceiling still governs the backup and theme
+/// chunked uploads.
 pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Whole-file ceilings, one per route, checked against the declared `total` on
