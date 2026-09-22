@@ -538,7 +538,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
               <TableHead className="w-[20%]">名称</TableHead>
               <TableHead className="w-[22%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
-              <TableHead className="w-[16%]">流量</TableHead>
+              <TableHead className="w-[10%]">版本</TableHead>
+              <TableHead className="w-[14%]">流量</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
@@ -605,6 +606,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     </div>
                   )}
                 </TableCell>
+                {/* Panel only: the build the machine on the other end still
+                    runs. A node that has never connected reports nothing. */}
+                <TableCell className="tnum text-sm">
+                  {n.agent_version || <span className="text-muted-foreground">—</span>}
+                </TableCell>
                 {/* Counted by the node's own billing rule, as on the public
                     page. */}
                 <TableCell className="tnum text-sm">
@@ -628,7 +634,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             ))}
             {nodes.length === 0 && (
               <TableRow>
-                <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
+                <TableCell colSpan={6} className="py-10 text-center text-sm text-muted-foreground">
                   还没有节点，右上角添加
                 </TableCell>
               </TableRow>
