@@ -834,6 +834,25 @@ pub async fn plugin_dispatch_log(
     .into_response()
 }
 
+/// 清空一个插件的派发日志(R16):面板给操作员的逃生门,缓冲是内存里的环形,
+/// 清掉就是丢。返回实际清掉的条数,面板 toast 据此告诉操作员清掉了多少——
+/// 「丢了什么」是这种不可撤销动作值得多报一句话的那类。0 行走同一条路,
+/// not 空管道不该把「明明没有记录」包装成失败。
+///
+/// 复用 GET 的鉴权面(Admin 提取器)与 404 门(plugin_or_404):未登录与不存
+/// 在的插件行号,操作员的预期与「查看」一致——不必为「清空」再细一档,
+/// 反而引入新的边界差异。push 与 `Registry::clear_dispatch_log` 共用一把
+/// 互斥锁,清的过程中并发派发照常写,新条目都在锁释放之后落地,不存在「
+/// 边清边写丢一条」的窗口。
+pub async fn clear_plugin_dispatch_log(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let plugin_id = match plugin_or_404(&app, id) {
+        Ok(plugin_id) => plugin_id,
+        Err(resp) => return resp,
+    };
+    let cleared = app.plugins.write().unwrap_or_else(|e| e.into_inner()).clear_dispatch_log(&plugin_id);
+    Json(json!({"cleared": cleared})).into_response()
+}
+
 /// 一个声明了 page 的启用插件渲染它的面板页面(U5/KTD5)。宿主调插件的
 /// `render_page` 导出,把返回的 JSON UI 描述原样转给前端;插件侧失败
 /// (超时/trap/非 2xx)返回 502 由前端显示错误卡片。
@@ -1760,6 +1779,37 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(test_plugin(Admin, State(app.clone()), Path(9999)).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 清空一个插件的派发日志:首次清空返回实际清掉的条数,缓冲立刻空;
+    /// 空管道再清空走同一条路返回 0,不报错;不存在的行号 404,与查看同门。
+    /// 启用即 tick 落一条 entry 后,清空前快照非空、清空后快照空;`until_tick`
+    /// 不再用(它只判断是否非空,清空之后首次轮询就提前返回),所以这条路径
+    /// 不重复触发 tick,而是直接断言终态。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_plugins_dispatch_log_emits_count_and_clears() {
+        let app = plugin_app();
+        assert_eq!(upload(&app, tick_archive("com.example.clearable")).await.status(), StatusCode::OK);
+        let id = app.db.list_plugins().unwrap()[0].id;
+        assert_eq!(enable_plugin(Admin, State(app.clone()), Path(id)).await.status(), StatusCode::OK);
+        until_tick(&app).await;
+        assert_eq!(app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot().len(), 1);
+
+        // 首次清空:cleared=1,缓冲空。
+        let body = body_of(clear_plugin_dispatch_log(Admin, State(app.clone()), Path(id)).await).await;
+        assert_eq!(body["cleared"], 1);
+        assert_eq!(app.plugins.read().unwrap_or_else(|e| e.into_inner()).dispatch_log_snapshot().len(), 0);
+
+        // 空管道再清空:cleared=0,200,与「没有失败原因」分得开。
+        let empty = clear_plugin_dispatch_log(Admin, State(app.clone()), Path(id)).await;
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(body_of(empty).await["cleared"], 0);
+
+        // 不存在的行号:404,与查看路径同门(plugin_or_404)。
+        assert_eq!(
+            clear_plugin_dispatch_log(Admin, State(app.clone()), Path(9999)).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// 声明 `tick` 的 manifest 加一个会写 kv 的 on_tick 模块。

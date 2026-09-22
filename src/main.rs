@@ -461,7 +461,10 @@ async fn main() -> Result<()> {
         .route("/api/plugins/{id}/enable", post(api_plugins::enable_plugin))
         .route("/api/plugins/{id}/disable", post(api_plugins::disable_plugin))
         .route("/api/plugins/{id}/test", post(api_plugins::test_plugin))
-        .route("/api/plugins/{id}/logs", get(api_plugins::plugin_dispatch_log))
+        .route(
+            "/api/plugins/{id}/logs",
+            get(api_plugins::plugin_dispatch_log).delete(api_plugins::clear_plugin_dispatch_log),
+        )
         .route("/api/plugins/{id}/kv", get(api_plugins::list_plugin_kv))
         .route("/api/plugins/{id}/page", get(api_plugins::render_plugin_page))
         .route("/api/plugins/{id}/action", post(api_plugins::plugin_page_action))

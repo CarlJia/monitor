@@ -12,7 +12,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, exportPluginUrl, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, setPluginKv, testPlugin, uploadPlugin,
+  deletePlugin, deletePluginKv, disablePlugin, enablePlugin, exportPluginUrl, kvDeletable, kvIsDefault, kvShownValue, kvWriteFor, listPluginKv, listPlugins, pluginCleanup, pluginLogs, clearPluginLogs, setPluginKv, testPlugin, uploadPlugin,
   type KvDraft, type Plugin, type PluginLogEntry,
 } from "@/lib/api"
 import { testResultsText } from "@/lib/format"
@@ -260,6 +260,8 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
   const [page, setPage] = useState(1)
   const [events, setEvents] = useState<string[]>(Object.keys(EVENT_BADGES))
   const [tick, setTick] = useState(0)
+  const [clearing, setClearing] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   // 序号化的重拉：翻页、刷新与动作后的并发响应若乱序，只有最新一次落地——
   // 与父组件 loadSeq 同一招，旧页的慢响应不能盖掉新页。
   const seq = useRef(0)
@@ -330,6 +332,27 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epoch, page])
 
+  // 清空派发日志(R16):缓冲是 hub 内存里的环形,清掉就是丢。响应带
+  // `cleared` 计数,toast 据此告诉操作员清掉了多少——「丢了什么」是这种
+  // 不可撤销动作值得多报一句话的那类。空管道也走同一条路(200, cleared=0),
+  // toast 落到「派发日志已是空的」,与真有记录被清走的两条 toast 分开。
+  async function clearLogs() {
+    if (selected == null) return
+    setClearing(true)
+    try {
+      const { cleared } = await clearPluginLogs(selected)
+      toast.success(cleared ? `已清空 ${cleared} 条记录` : "派发日志已是空的")
+      // 调本地的 epoch(tick++)重拉,父组件的 pulse 只在「测试」/启停等动作后才
+      // 递增,清空是当前组件自己的事,不该动别人的视图。
+      setTick((n) => n + 1)
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setClearing(false)
+      setConfirmClear(false)
+    }
+  }
+
   if (!plugins.length || selected == null) return null
   const shown = (entries ?? []).filter((entry) => events.includes(entry.event_type))
   const toggle = (type: string) =>
@@ -355,6 +378,15 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
               ))}
             </SelectContent>
           </Select>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={clearing}
+            onClick={() => setConfirmClear(true)}
+            title="清空派发日志"
+          >
+            <Trash2 className="size-4" /> 清空
+          </Button>
           <Button variant="outline" size="icon" title="刷新" aria-label="刷新日志" onClick={() => setTick((n) => n + 1)}>
             <RefreshCw />
           </Button>
@@ -439,6 +471,16 @@ function PluginLogsCard({ plugins, pulse }: { plugins: Plugin[]; pulse: number }
             下一页
           </Button>
         </div>
+      )}
+      {confirmClear && (
+        <ConfirmDialog
+          title={`清空「${plugins.find((p) => p.id === selected)?.name ?? "此插件"}」的派发日志？`}
+          description="将清空这个插件的所有派发记录，操作不可撤销。缓冲是 hub 进程内的环形，重启之后也是空。"
+          confirmLabel="清空"
+          busy={clearing}
+          onClose={() => setConfirmClear(false)}
+          onConfirm={clearLogs}
+        />
       )}
     </Card>
   )
