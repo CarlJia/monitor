@@ -707,6 +707,9 @@ mod tests {
     /// arena for the life of the process.
     #[test]
     fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        // 同 LOGIN_SERIAL 上方的理由:这条测试也争同一把信号量,并行跑会让它
+        // 在别处持有 permit 的中途争不到许可、误判成 NoPermits 而 panic。
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");
