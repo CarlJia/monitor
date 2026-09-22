@@ -5,6 +5,12 @@ All notable changes to monitor-hub will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- 面板「节点」页表格新增「版本」列，显示每台节点上报的 agent 构建版本（`agent_version`）——这个字段一直只在管理端 API 的响应里，操作员看不出哪些机器还跑着旧 agent。从未连上来的节点显示「—」。字段仍属面板专属，公开状态页的响应里没有它。
+
 ## [2.2.0] - 2026-09-22
 
 ### Added

@@ -42,11 +42,11 @@ const PNG = Buffer.from(
   "base64",
 )
 
-const node = (id, name, country) => ({
+const node = (id, name, country, agentVersion) => ({
   id, name, sort: id, public: true, online: true, last_seen: Date.now() / 1000,
   metrics: null, os: "Debian 12", kernel: "6.1.0", arch: "x86_64", virt: "kvm",
   cpu_name: "AMD EPYC", cpu_cores: 4, mem_total: 8, swap_total: 0, disk_total: 100,
-  agent_version: "1.0.0", traffic_limit: 0, traffic_mode: "sum", traffic_reset_day: 1,
+  agent_version: agentVersion, traffic_limit: 0, traffic_mode: "sum", traffic_reset_day: 1,
   total_rx: 0, total_tx: 0, month_rx: 0, month_tx: 0, month_start: "2026-09-01", country,
 })
 
@@ -70,7 +70,10 @@ const SESSIONS = [
 
 const ENDPOINTS = {
   "/api/me": { delay: 40, body: {} }, // site 在监听后才定得下来，见下方赋值
-  "/api/nodes": { delay: 120, body: { admin: true, nodes: [node(1, "hk-1", "HK"), node(2, "jp-1", "JP")] } },
+  "/api/nodes": {
+    delay: 120,
+    body: { admin: true, nodes: [node(1, "hk-1", "HK", "1.0.0"), node(2, "jp-1", "JP", "2.2.1")] },
+  },
   "/api/settings": { delay: 150, body: SETTINGS },
   "/api/sessions": { delay: 450, body: SESSIONS },
   "/api/ping-tasks": {
@@ -108,8 +111,9 @@ const PREVIEW = /^\/api\/themes\/[^/]+\/preview$/
 
 // markers 全部是「数据到齐才画出来」的文字。用数据本身而不是固定文案，是为了让
 // 请求失败（catch 分支渲染空态）也满足不了断言——那正是假通过的高发处。
+// 节点页的两个版本号取自两台不同的节点：同一个常量满足不了「每行显示自己那一份」。
 const ROUTES = [
-  { path: "/admin/nodes", markers: ["hk-1", "jp-1"] },
+  { path: "/admin/nodes", markers: ["hk-1", "jp-1", "1.0.0", "2.2.1"] },
   { path: "/admin/ping", markers: ["东京-延迟"] },
   { path: "/admin/plugins", markers: ["示例插件"] },
   { path: "/admin/data", markers: ["可回收空间", "保留天数"] },
