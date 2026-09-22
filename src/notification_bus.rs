@@ -12,6 +12,10 @@ use chrono::{Datelike, NaiveDate, Utc};
 
 use crate::App;
 
+/// 登录事件按内容 + 时刻算派发键的字段分隔符。用一个正常不会出现在 method /
+/// actor / reason / ip 里的字节,免得 `("a","b")` 与 `("ab","")` 撞成同一个键。
+const LOGIN_KEY_SEP: char = '\u{1f}';
+
 /// The event types the bus carries. Field set is what a plugin needs to
 /// render a notification a human can act on.
 ///
@@ -31,12 +35,22 @@ use crate::App;
 /// Both carry the node's own `created_at`, because a subscriber has to tell one
 /// *machine* from another -- SQLite hands a deleted node's id to the next node
 /// created -- and the two can reach a subscriber out of order.
+///
+/// 面板登录事件 `LoginSucceeded` / `LoginFailed` 同样是宿主事件:密码登录与
+/// GitHub 登录各有成功/失败两路,`method` 区分渠道(`password` / `github`),
+/// `actor` 是登录主体(GitHub 用户名;应急密码没有账号,留空),失败另带
+/// `reason`,两者都带发起端 `ip` 与 `observed_at`。它们不绑节点(`node_id` 恒
+/// 为 0),也不是状态事件——每次尝试都是独立一条,去重键按内容 + 时刻算(见
+/// [`Event::threshold_or_state_key`]),所以同一秒内两次不同的尝试各派发一条,
+/// 而重复回放的同一条仍被抑制。
 #[derive(Debug, Clone)]
 pub enum Event {
     AgentOffline { node_id: i64, name: String, observed_at: i64, last_seen_at: i64 },
     AgentOnline { node_id: i64, name: String, observed_at: i64 },
     NodeAdded { node_id: i64, name: String, created_at: i64 },
     NodeDeleted { node_id: i64, name: String, created_at: i64 },
+    LoginSucceeded { method: String, actor: String, ip: String, observed_at: i64 },
+    LoginFailed { method: String, reason: String, ip: String, observed_at: i64 },
     Plugin { name: String, payload: serde_json::Value },
 }
 
@@ -75,6 +89,24 @@ impl serde::Serialize for Event {
                 m.serialize_entry("created_at", created_at)?;
                 m.end()
             }
+            Event::LoginSucceeded { method, actor, ip, observed_at } => {
+                let mut m = s.serialize_map(Some(5))?;
+                m.serialize_entry("type", Self::LOGIN_SUCCEEDED)?;
+                m.serialize_entry("method", method)?;
+                m.serialize_entry("actor", actor)?;
+                m.serialize_entry("ip", ip)?;
+                m.serialize_entry("observed_at", observed_at)?;
+                m.end()
+            }
+            Event::LoginFailed { method, reason, ip, observed_at } => {
+                let mut m = s.serialize_map(Some(5))?;
+                m.serialize_entry("type", Self::LOGIN_FAILED)?;
+                m.serialize_entry("method", method)?;
+                m.serialize_entry("reason", reason)?;
+                m.serialize_entry("ip", ip)?;
+                m.serialize_entry("observed_at", observed_at)?;
+                m.end()
+            }
             Event::Plugin { name, payload } => {
                 let mut m = s.serialize_map(None)?;
                 m.serialize_entry("type", name)?;
@@ -100,9 +132,17 @@ impl Event {
     pub const AGENT_ONLINE: &'static str = "agent_online";
     pub const NODE_ADDED: &'static str = "node_added";
     pub const NODE_DELETED: &'static str = "node_deleted";
+    pub const LOGIN_SUCCEEDED: &'static str = "login_succeeded";
+    pub const LOGIN_FAILED: &'static str = "login_failed";
     /// v2 支持的全部宿主自身事件名,manifest 的 `subscribes` 逐项对照。
-    pub const KNOWN: [&'static str; 4] =
-        [Self::AGENT_OFFLINE, Self::AGENT_ONLINE, Self::NODE_ADDED, Self::NODE_DELETED];
+    pub const KNOWN: [&'static str; 6] = [
+        Self::AGENT_OFFLINE,
+        Self::AGENT_ONLINE,
+        Self::NODE_ADDED,
+        Self::NODE_DELETED,
+        Self::LOGIN_SUCCEEDED,
+        Self::LOGIN_FAILED,
+    ];
 
     /// The discriminator stored in `notification_log.event_type` and carried in
     /// the JSON `type` tag. A lifetime `&'static str` rather than a String:
@@ -113,6 +153,8 @@ impl Event {
             Event::AgentOnline { .. } => Self::AGENT_ONLINE,
             Event::NodeAdded { .. } => Self::NODE_ADDED,
             Event::NodeDeleted { .. } => Self::NODE_DELETED,
+            Event::LoginSucceeded { .. } => Self::LOGIN_SUCCEEDED,
+            Event::LoginFailed { .. } => Self::LOGIN_FAILED,
             Event::Plugin { name, .. } => name,
         }
     }
@@ -123,6 +165,8 @@ impl Event {
             | Event::AgentOnline { node_id, .. }
             | Event::NodeAdded { node_id, .. }
             | Event::NodeDeleted { node_id, .. } => *node_id,
+            // 登录事件不绑节点:去重键的 node_id 一律 0(键的区分靠内容 + 时刻)。
+            Event::LoginSucceeded { .. } | Event::LoginFailed { .. } => 0,
             Event::Plugin { payload, .. } => payload.get("node_id").and_then(|v| v.as_i64()).unwrap_or(0),
         }
     }
@@ -133,6 +177,10 @@ impl Event {
             | Event::AgentOnline { name, .. }
             | Event::NodeAdded { name, .. }
             | Event::NodeDeleted { name, .. } => name,
+            // 登录主体即「名字」:成功事件是 actor(GitHub 用户名,应急密码为空),
+            // 失败事件没有确定主体,留空。
+            Event::LoginSucceeded { actor, .. } => actor,
+            Event::LoginFailed { .. } => "",
             Event::Plugin { payload, .. } => payload.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
         }
     }
@@ -162,6 +210,23 @@ impl Event {
             // 身份取节点自己的创建时间戳:同一台机器的同一次创建只派发一次,
             // 而 id 被复用后新建的那台是另一个值,不会被旧行抑制掉。
             Event::NodeAdded { created_at, .. } | Event::NodeDeleted { created_at, .. } => *created_at,
+            // 每次登录尝试是独立一条,键必须逐次不同——否则同一 (node_id=0,
+            // event_type) 的第二次就被永久去重掉,失败告警只发第一条。键按
+            // 「时刻 + 内容」的 FNV-1a 算:同一秒里两次不同的尝试(ip/主体/原因
+            // 有别)得到不同的键、各派发一条;而重复回放的同一条(测试或重试同一
+            // 事件)算出同一个键,仍被 record_dispatch 的 INSERT OR IGNORE 抑制。
+            // FNV-1a 而不是 DefaultHasher:后者算法未指定、跨 Rust 版本会变,而这
+            // 个值要持久化进 notification_log,变了就会重发。
+            Event::LoginSucceeded { method, actor, ip, observed_at } => {
+                let content =
+                    format!("{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{actor}{LOGIN_KEY_SEP}{ip}");
+                fnv1a(content.as_bytes()) as i64
+            }
+            Event::LoginFailed { method, reason, ip, observed_at } => {
+                let content =
+                    format!("{observed_at}{LOGIN_KEY_SEP}{method}{LOGIN_KEY_SEP}{reason}{LOGIN_KEY_SEP}{ip}");
+                fnv1a(content.as_bytes()) as i64
+            }
             Event::Plugin { payload, .. } => {
                 let threshold = payload.get("threshold_days").and_then(|v| v.as_i64()).unwrap_or(0);
                 let day = payload
@@ -395,10 +460,71 @@ mod tests {
             Event::AgentOnline { node_id: 1, name: String::new(), observed_at: 0 },
             Event::NodeAdded { node_id: 1, name: String::new(), created_at: 0 },
             Event::NodeDeleted { node_id: 1, name: String::new(), created_at: 0 },
+            Event::LoginSucceeded {
+                method: "password".into(),
+                actor: String::new(),
+                ip: "1.2.3.4".into(),
+                observed_at: 0,
+            },
+            Event::LoginFailed {
+                method: "github".into(),
+                reason: "bad".into(),
+                ip: "1.2.3.4".into(),
+                observed_at: 0,
+            },
         ];
         for event in &all {
             assert!(Event::KNOWN.contains(&event.type_name()), "{} 不在 KNOWN 词表里", event.type_name());
         }
+    }
+
+    /// 登录事件每次尝试独立派发:同一秒里内容不同的两次尝试(ip/主体/原因有别)
+    /// 算出不同的键,各留一条;而回放的同一条算出同一个键,被去重抑制。这条守卫
+    /// 把登录事件与 node 事件(键取 created_at,同一次创建净效果为零)区分开——
+    /// 前者一旦退化成常量键,失败告警就只会发第一条。
+    #[test]
+    fn login_events_key_by_content_so_each_attempt_dispatches() {
+        let now = 1_700_000_000;
+        let a = Event::LoginFailed {
+            method: "password".into(),
+            reason: "invalid password".into(),
+            ip: "10.0.0.1".into(),
+            observed_at: now,
+        };
+        // 同一秒、同一渠道,但来自另一个地址:必须是另一条。
+        let b = Event::LoginFailed {
+            method: "password".into(),
+            reason: "invalid password".into(),
+            ip: "10.0.0.2".into(),
+            observed_at: now,
+        };
+        // 与 a 逐字段相同:回放的同一条,键必须一致(才会被去重抑制)。
+        let a_again = Event::LoginFailed {
+            method: "password".into(),
+            reason: "invalid password".into(),
+            ip: "10.0.0.1".into(),
+            observed_at: now,
+        };
+        assert_ne!(
+            a.threshold_or_state_key(),
+            b.threshold_or_state_key(),
+            "不同地址的两次失败尝试不该撞成同一个键"
+        );
+        assert_eq!(
+            a.threshold_or_state_key(),
+            a_again.threshold_or_state_key(),
+            "同一条事件回放必须得到同一个键"
+        );
+        // 成功与失败即使内容凑巧一致,event_type 也把它们分到不同的 (node_id,
+        // event_type, key) 主键上,这里再确认两类各自的键算得出来、非零。
+        let ok = Event::LoginSucceeded {
+            method: "github".into(),
+            actor: "carl".into(),
+            ip: "10.0.0.1".into(),
+            observed_at: now,
+        };
+        assert_ne!(ok.threshold_or_state_key(), 0);
+        assert!(!ok.is_state_event(), "登录事件不是状态事件,应走内容键去重");
     }
 
     /// The payload handed to a plugin, for U3/U8's ABI. Any change to this

@@ -27,7 +27,7 @@ pub const COOKIE: &str = "monitor_session";
 const STATE_COOKIE: &str = "monitor_oauth_state";
 const SESSION_DAYS: i64 = 14;
 /// Failed password attempts allowed per address before it is shut out.
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(900);
 
 /// How many password checks may run concurrently.
@@ -47,6 +47,38 @@ const LOCKOUT: Duration = Duration::from_secs(900);
 /// cost is that two simultaneous sign-ins require one to retry.
 const PASSWORD_CHECKS: usize = 1;
 static PASSWORD_GATE: Semaphore = Semaphore::const_new(PASSWORD_CHECKS);
+
+/// Per-address failure counter for the GitHub OAuth callback. Separate from the
+/// password throttle: the callback is an unauthenticated public endpoint and
+/// a bored attacker hitting it with arbitrary `error` / `error_description` /
+/// `state` values could otherwise spam `login_failed` notifications and grow
+/// `notification_log` unboundedly. Sharing the password throttle would also let
+/// callback noise burn the 5/15-min budget for any legitimate user behind the
+/// same egress (corporate NAT, VPN), locking them out of password sign-in.
+#[derive(Default)]
+pub struct CallbackThrottle {
+    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+impl CallbackThrottle {
+    fn locked(&self, ip: IpAddr) -> bool {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&ip) {
+            Some((n, since)) if since.elapsed() < LOCKOUT => *n >= MAX_ATTEMPTS,
+            Some(_) => {
+                map.remove(&ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, (_, since)| since.elapsed() < LOCKOUT);
+        map.entry(ip).or_insert((0, Instant::now())).0 += 1;
+    }
+}
 
 pub fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -183,12 +215,45 @@ pub async fn login(
     };
     if !verify_password(&body.password, &stored) {
         app.throttle.record_failure(ip);
+        announce_login_failed(&app, "password", "invalid password", ip);
         return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
     }
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
-        Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
+        Ok(cookie) => {
+            announce_login_succeeded(&app, "password", "", ip);
+            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// A rejected/accepted panel sign-in is reported to the notification bus so a
+/// subscriber (e.g. the tg-notify plugin) can push it out. Like `announce` in
+/// `api.rs`, a bus failure is logged and swallowed: the sign-in outcome itself
+/// stands, and an audit row that could not be written must not change the
+/// response the operator sees.
+fn announce_login_succeeded(app: &App, method: &str, actor: &str, ip: IpAddr) {
+    let event = crate::notification_bus::Event::LoginSucceeded {
+        method: method.to_owned(),
+        actor: actor.to_owned(),
+        ip: ip.to_string(),
+        observed_at: Utc::now().timestamp(),
+    };
+    if let Err(e) = crate::notification_bus::emit(app, &event) {
+        warn!("上报 login_succeeded 失败: {e:#}");
+    }
+}
+
+fn announce_login_failed(app: &App, method: &str, reason: &str, ip: IpAddr) {
+    let event = crate::notification_bus::Event::LoginFailed {
+        method: method.to_owned(),
+        reason: reason.to_owned(),
+        ip: ip.to_string(),
+        observed_at: Utc::now().timestamp(),
+    };
+    if let Err(e) = crate::notification_bus::emit(app, &event) {
+        warn!("上报 login_failed 失败: {e:#}");
     }
 }
 
@@ -232,13 +297,15 @@ pub struct Callback {
 
 pub async fn github_callback(
     State(app): State<crate::Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Query(query): Query<Callback>,
 ) -> Response {
+    let ip = client_ip(&headers, peer.ip());
     // GitHub reports a refusal in the query string rather than the body.
     if let Some(error) = &query.error {
         let reason = query.error_description.as_deref().unwrap_or(error);
-        return sign_in_failed(&app, &headers, &format!("GitHub returned {error}: {reason}"));
+        return sign_in_failed(&app, &headers, ip, &format!("GitHub returned {error}: {reason}"));
     }
     // Reject a callback the browser did not initiate.
     let state = query.state.as_deref().unwrap_or_default();
@@ -246,25 +313,42 @@ pub async fn github_callback(
         return sign_in_failed(
             &app,
             &headers,
+            ip,
             "state mismatch or missing; start again from the sign-in page",
         );
     }
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
-        return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
+        return sign_in_failed(&app, &headers, ip, "GitHub sent no authorization code");
     };
-    if let Err(e) = github_login(&app, code).await {
-        return sign_in_failed(&app, &headers, &e.to_string());
-    }
+    let user = match github_login(&app, code).await {
+        Ok(user) => user,
+        Err(e) => return sign_in_failed(&app, &headers, ip, &e.to_string()),
+    };
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
-        Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
+        Err(e) => return sign_in_failed(&app, &headers, ip, &e.to_string()),
     };
+    announce_login_succeeded(&app, "github", &user, ip);
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 
 /// Redirects the browser back to the sign-in page with the reason, rather than
 /// leaving a bare 401 at a callback URL offering no way forward.
-fn sign_in_failed(app: &App, headers: &HeaderMap, reason: &str) -> Response {
+///
+/// The callback is a public endpoint (no session, no token). A bored attacker
+/// can hit it with arbitrary `error` / `error_description` / `state` values —
+/// each one used to become one Telegram notification. `CallbackThrottle` caps
+/// that noise at 5 failures / IP / 15 minutes: an emit is suppressed once the
+/// address is locked out, so a locked-out address is silent on subsequent
+/// probes — the redirect still goes out, but no Telegram message and no
+/// `notification_log` row are created. The throttle is separate from the
+/// password throttle so callback noise cannot lock a legitimate operator out
+/// of password sign-in (or vice versa).
+fn sign_in_failed(app: &App, headers: &HeaderMap, ip: IpAddr, reason: &str) -> Response {
+    if !app.callback_throttle.locked(ip) {
+        app.callback_throttle.record_failure(ip);
+        announce_login_failed(app, "github", reason, ip);
+    }
     // A rejected sign-in must leave a server-side record; the browser sees only
     // the redirect.
     warn!("GitHub sign-in rejected: {reason}");
@@ -308,7 +392,9 @@ fn urlencode(value: &str) -> String {
 }
 
 /// Exchanges the code for a token and checks the login against the allow list.
-async fn github_login(app: &App, code: &str) -> Result<()> {
+/// Returns the accepted GitHub login on success, so the caller can name the
+/// actor in the sign-in notification.
+async fn github_login(app: &App, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
     else {
         bail!("not configured");
@@ -369,7 +455,7 @@ async fn github_login(app: &App, code: &str) -> Result<()> {
         bail!("GitHub user {} is not on the allowed list", user.login);
     }
     info!("GitHub sign-in accepted for {}", user.login);
-    Ok(())
+    Ok(user.login)
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
@@ -448,10 +534,21 @@ mod tests {
         assert_ne!(hash_password("same").unwrap(), hash_password("same").unwrap());
     }
 
+    /// `PASSWORD_GATE` 是进程级、只有一个许可的信号量(argon2 太贵,同时只放一个
+    /// 密码校验进门)。任何真正驱动 `login()` 的测试都会争这唯一的许可——两条并发
+    /// 跑,后到的那条拿不到许可、被判 429,而它本想测的是别的东西。用一把测试专用
+    /// 的锁把这些测试串起来,谁驱动 `login()` 谁先拿锁。`#[tokio::test]` 默认是
+    /// current-thread 运行时,所以跨 `.await` 持有 std 的 MutexGuard 是安全的。
+    static LOGIN_SERIAL: Mutex<()> = Mutex::new(());
+
     /// 读库失败不是「密码登录被禁用」——那是策略状态。库坏了要报 500,否则操作员会
     /// 以为是自己关掉了密码登录,而真因被这句谎话盖住。
     #[tokio::test]
+    // 见 LOGIN_SERIAL 上方的注释:`#[tokio::test]` 默认 current-thread 运行时,
+    // 跨 .await 持有 std MutexGuard 实际安全。clippy 看不到这个保证,这里显式放行。
+    #[allow(clippy::await_holding_lock)]
     async fn a_broken_read_at_login_is_a_500_not_a_disabled_policy() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
         app.db.set("admin_password_hash", &hash_password("pw").unwrap()).unwrap();
         // 表没了 —— 一次真实的读库失败,而不是「这个 setting 没设」。
@@ -464,6 +561,106 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "库故障不该谎称登录被禁用");
+    }
+
+    /// 密码登录的成功与失败都要真的过一遍通知总线——不是「词表里有这个事件」,
+    /// 而是 handler 调到 `emit`、往 `notification_log` 落了一条。落库发生在派发
+    /// 之前(派发是 fire-and-forget),没装插件时订阅者为空、派发直接返回,但这一
+    /// 条审计行仍在,所以订阅了 login_* 的插件收得到。用两个不同地址,免得两条
+    /// 撞在同一个内容键上被去重。
+    #[tokio::test]
+    // 见 LOGIN_SERIAL 上方的注释:`#[tokio::test]` 默认 current-thread 运行时,
+    // 跨 .await 持有 std MutexGuard 实际安全。clippy 看不到这个保证,这里显式放行。
+    #[allow(clippy::await_holding_lock)]
+    async fn a_password_login_reports_both_outcomes_to_the_bus() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        app.db.set("admin_password_hash", &hash_password("pw").unwrap()).unwrap();
+
+        // 失败:密码错。返回 401,且总线上多了一条 login_failed。
+        let resp = login(
+            State(app.clone()),
+            ConnectInfo("203.0.113.10:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(LoginBody { password: "wrong".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(bus_has(&app, "login_failed"), "登录失败应落一条 login_failed");
+        assert!(!bus_has(&app, "login_succeeded"), "失败不该落成功事件");
+
+        // 成功:密码对。返回 200,且总线上多了一条 login_succeeded。
+        let resp = login(
+            State(app.clone()),
+            ConnectInfo("203.0.113.11:1".parse().unwrap()),
+            HeaderMap::new(),
+            Json(LoginBody { password: "pw".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(bus_has(&app, "login_succeeded"), "登录成功应落一条 login_succeeded");
+    }
+
+    /// notification_log 里是否有某类事件的行(node_id 恒 0)。登录事件的键按内容
+    /// 算,测试不预知它,所以按 (node_id, event_type) 计数即可。
+    #[cfg(test)]
+    fn bus_has(app: &App, event_type: &str) -> bool {
+        app.db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_log WHERE node_id=0 AND event_type=?1",
+                [event_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// 回调端是公网匿名端点:被刷的话每条都曾经落一条 login_failed 通知。Callback
+    /// 限流封顶之后,从同一 IP 来的第 6 次失败调用 `sign_in_failed` 不应再往总线上
+    /// emit——否则攻击者用 `?error=...&error_description=...` 轮询就能涨爆
+    /// notification_log 并刷 Telegram。锁定期内的 emit 抑制是关键:锁是另一回事。
+    #[tokio::test]
+    async fn callback_failures_silence_the_bus_after_the_throttle_locks() {
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
+        let mut headers = HeaderMap::new();
+        // 用一个空的 state cookie 把回调最初的 state 校验带过去,避免它走错分支;
+        // 这里只关心限流。
+        headers.insert(crate::auth::STATE_COOKIE, "anything".parse().unwrap());
+        // 触发 5 次(MAX_ATTEMPTS):emit 各落一条;第 6 次起被锁、不再 emit。
+        for i in 0..MAX_ATTEMPTS {
+            let resp =
+                sign_in_failed(&app, &headers, "198.51.100.7".parse().unwrap(), &format!("reason {i}"));
+            // 不校验响应状态——sign_in_failed 总是 302;关心的是总线。
+            let _ = resp;
+        }
+        let before = count_rows(&app, "login_failed");
+        assert_eq!(before, MAX_ATTEMPTS as i64, "限流前 5 次都该发出");
+
+        // 第 6 次:已锁,不应 emit,但仍要让浏览器看到跳转(302)。
+        let resp = sign_in_failed(&app, &headers, "198.51.100.7".parse().unwrap(), "spam");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "浏览器仍要拿到跳转");
+        let after = count_rows(&app, "login_failed");
+        assert_eq!(after, before, "锁定后不应再 emit");
+
+        // 另一个 IP 不受同一个锁定状态影响。
+        let resp = sign_in_failed(&app, &headers, "198.51.100.8".parse().unwrap(), "ok");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let other = count_rows(&app, "login_failed");
+        assert_eq!(other, before + 1, "另一 IP 的 emit 不受上一 IP 锁定影响");
+    }
+
+    #[cfg(test)]
+    fn count_rows(app: &App, event_type: &str) -> i64 {
+        app.db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notification_log WHERE node_id=0 AND event_type=?1",
+                [event_type],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
     }
 
     /// One address through the full lockout lifecycle: attempts up to the limit
@@ -510,6 +707,9 @@ mod tests {
     /// arena for the life of the process.
     #[test]
     fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
+        // 同 LOGIN_SERIAL 上方的理由:这条测试也争同一把信号量,并行跑会让它
+        // 在别处持有 permit 的中途争不到许可、误判成 NoPermits 而 panic。
+        let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let held: Vec<_> =
             (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");

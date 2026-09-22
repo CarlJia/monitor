@@ -880,12 +880,13 @@ impl Db {
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str, observed_ip: &str) -> Result<bool> {
         // The same rule `api::agent_register` applies to the name it receives:
         // these values come from an unvouched machine, control characters break
-        // the panel's rows, and the length must be bounded. Six of them -- os,
-        // kernel, arch, virt, cpu_name, agent_version -- go straight into the
-        // anonymous public frame, which is rebuilt and pushed to every viewer
-        // every two seconds, so without a ceiling one node would determine that
-        // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
-        // characters and a CPU model to about 50.
+        // the panel's rows, and the length must be bounded. Five of them -- os,
+        // kernel, arch, virt, cpu_name -- go straight into the anonymous public
+        // frame, which is rebuilt and pushed to every viewer every two seconds,
+        // so without a ceiling one node would determine that frame's size.
+        // `agent_version` is bounded here for the same reason but stays panel
+        // only (see `api::node_view`). 128 rather than 64: a real PRETTY_NAME
+        // runs to about 60 characters and a CPU model to about 50.
         let s = |k: &str| {
             f.get(k)
                 .and_then(|v| v.as_str())
