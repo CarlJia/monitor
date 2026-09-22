@@ -108,10 +108,12 @@ const PREVIEW = /^\/api\/themes\/[^/]+\/preview$/
 
 // markers 全部是「数据到齐才画出来」的文字。用数据本身而不是固定文案，是为了让
 // 请求失败（catch 分支渲染空态）也满足不了断言——那正是假通过的高发处。
+// 插件页的「清空」来自派发日志卡片的按钮——按钮没渲染就不可能命中,免得
+// 「按钮从 DOM 里消失」也一路绿灯。
 const ROUTES = [
   { path: "/admin/nodes", markers: ["hk-1", "jp-1"] },
   { path: "/admin/ping", markers: ["东京-延迟"] },
-  { path: "/admin/plugins", markers: ["示例插件"] },
+  { path: "/admin/plugins", markers: ["示例插件", "清空"] },
   { path: "/admin/data", markers: ["可回收空间", "保留天数"] },
   { path: "/admin/themes", markers: ["默认主题"] },
   { path: "/admin/security", markers: ["登录会话", "GitHub 单点登录", "应急密码"] },

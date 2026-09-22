@@ -5,6 +5,12 @@ All notable changes to monitor-hub will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- 面板「插件」页派发日志卡片新增「清空」按钮：选中一个插件后点清空，弹确认框，再点确认即把该插件在 hub 内存环形缓冲里的全部派发记录一次性丢掉。响应体带 `cleared` 计数，面板 toast 据此告诉操作员清掉了多少；空管道也走同一条路返回 200 + `cleared:0`，不把「明明没有记录」包装成失败。按钮复用 GET 同名路由的鉴权面（Admin 提取器）与 404 门，不存在的插件行号 404。
+
 ## [2.2.0] - 2026-09-22
 
 ### Added
