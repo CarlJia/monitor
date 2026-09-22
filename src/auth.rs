@@ -544,6 +544,9 @@ mod tests {
     /// 读库失败不是「密码登录被禁用」——那是策略状态。库坏了要报 500,否则操作员会
     /// 以为是自己关掉了密码登录,而真因被这句谎话盖住。
     #[tokio::test]
+    // 见 LOGIN_SERIAL 上方的注释:`#[tokio::test]` 默认 current-thread 运行时,
+    // 跨 .await 持有 std MutexGuard 实际安全。clippy 看不到这个保证,这里显式放行。
+    #[allow(clippy::await_holding_lock)]
     async fn a_broken_read_at_login_is_a_500_not_a_disabled_policy() {
         let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
@@ -566,6 +569,9 @@ mod tests {
     /// 条审计行仍在,所以订阅了 login_* 的插件收得到。用两个不同地址,免得两条
     /// 撞在同一个内容键上被去重。
     #[tokio::test]
+    // 见 LOGIN_SERIAL 上方的注释:`#[tokio::test]` 默认 current-thread 运行时,
+    // 跨 .await 持有 std MutexGuard 实际安全。clippy 看不到这个保证,这里显式放行。
+    #[allow(clippy::await_holding_lock)]
     async fn a_password_login_reports_both_outcomes_to_the_bus() {
         let _serial = LOGIN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let app = std::sync::Arc::new(App::for_test(crate::db::Db::open(":memory:").unwrap()));
