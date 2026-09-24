@@ -615,6 +615,19 @@ fn node_limits(reset_day: Option<u32>, limit: Option<i64>) -> Option<&'static st
     None
 }
 
+/// Upper bound on a node's public remark source, in bytes. It is rendered on the
+/// read path for every node on each snapshot rebuild (~2s), so an unbounded value
+/// would be re-parsed indefinitely; 16 KiB is far more than a status-page note needs
+/// and keeps the per-tick render cost bounded. The admin textarea mirrors this.
+pub(crate) const PUBLIC_REMARK_MAX: usize = 16 * 1024;
+
+fn public_remark_ok(public_remark: Option<&str>) -> Option<&'static str> {
+    if public_remark.is_some_and(|s| s.len() > PUBLIC_REMARK_MAX) {
+        return Some("public remark is too long");
+    }
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -668,6 +681,9 @@ pub async fn create_node(
         return bad("name is required");
     }
     if let Some(message) = node_limits(Some(node.traffic_reset_day), Some(node.traffic_limit)) {
+        return bad(message);
+    }
+    if let Some(message) = public_remark_ok(Some(&node.public_remark)) {
         return bad(message);
     }
     node.name = node.name.trim().to_owned();
@@ -810,6 +826,9 @@ pub async fn update_node(
         }
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.traffic_limit) {
+        return bad(message);
+    }
+    if let Some(message) = public_remark_ok(node.public_remark.as_deref()) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -2241,6 +2260,16 @@ mod tests {
         let admin = &visible_nodes(&app, true).unwrap()[0];
         assert_eq!(admin["public_remark"], "**hi** <b>x</b>");
         assert!(admin["public_remark_html"].as_str().unwrap().contains("<strong>hi</strong>"));
+    }
+
+    #[test]
+    fn public_remark_over_the_length_cap_is_rejected() {
+        assert!(public_remark_ok(None).is_none());
+        assert!(public_remark_ok(Some("ok")).is_none());
+        let at_cap = "a".repeat(PUBLIC_REMARK_MAX);
+        assert!(public_remark_ok(Some(&at_cap)).is_none(), "exactly at the cap is allowed");
+        let over_cap = "a".repeat(PUBLIC_REMARK_MAX + 1);
+        assert!(public_remark_ok(Some(&over_cap)).is_some(), "over the cap is rejected");
     }
 
     #[tokio::test]

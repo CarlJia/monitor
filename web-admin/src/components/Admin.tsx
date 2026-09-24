@@ -236,6 +236,7 @@ function NodeForm({ node, onClose, onSaved }: {
               onChange={(e) => set("public_remark", e.target.value)}
               placeholder="**用途**、服务商、公告…（Markdown 或 HTML）"
               rows={4}
+              maxLength={16 * 1024}
             />
           </Field>
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
