@@ -41,6 +41,11 @@ tower-http = { version = "0.6", default-features = false, features = ["limit", "
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 公开备注渲染。纯 Rust、无重传递依赖(不引入 html5ever/ammonia,以免增大二进制)。
+# `default-features = false` 去掉 pulldown-cmark 二进制才用的 getopts;库 API
+# (Parser/Options/html::push_html)不受影响。源文本里的裸 HTML 原样透传——公开备注
+# 按受信任的管理员内容处理,刻意不做净化(见计划 R6/KTD2)。
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 # 插件运行时。编译期裁剪:wasmtime 默认 features 会拉入 wasi、component-model、
 # gc、cache、profiling 等一大批 v1 用不到的东西;`cranelift`(编译 wasm 到本机码,
 # 含 fuel metering 支持)+ `runtime`(Store/Linker/调用机制)+ `std` + `anyhow`

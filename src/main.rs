@@ -11,6 +11,7 @@ mod auth;
 mod db;
 mod db_plugins;
 mod frontend;
+mod markdown;
 mod notification_bus;
 mod plugin;
 

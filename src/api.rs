@@ -125,6 +125,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // the public page already shows, so this one is public as well.
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
+        // Deliberately public: admin-authored note rendered for the status page.
+        // The raw source is trusted admin content and passed through unsanitized
+        // (see plan R6/KTD2); the private `remark` stays behind the `full` gate below.
+        "public_remark_html": crate::markdown::render_public_remark(&node.public_remark),
     });
     // An allowlist rather than a denylist: the agent ships from its own
     // repository, so a field added there would otherwise reach anonymous visitors
@@ -146,6 +150,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6"] = json!(node.ipv6);
         view["observed_ip"] = json!(node.observed_ip);
         view["remark"] = json!(node.remark);
+        // The rendered HTML is already in the base view above; the admin frame also
+        // carries the raw source so the panel editor can load it back for editing.
+        view["public_remark"] = json!(node.public_remark);
         view["token"] = json!(node.token);
     }
     view
@@ -608,6 +615,19 @@ fn node_limits(reset_day: Option<u32>, limit: Option<i64>) -> Option<&'static st
     None
 }
 
+/// Upper bound on a node's public remark source, in bytes. It is rendered on the
+/// read path for every node on each snapshot rebuild (~2s), so an unbounded value
+/// would be re-parsed indefinitely; 16 KiB is far more than a status-page note needs
+/// and keeps the per-tick render cost bounded. The admin textarea mirrors this.
+pub(crate) const PUBLIC_REMARK_MAX: usize = 16 * 1024;
+
+fn public_remark_ok(public_remark: Option<&str>) -> Option<&'static str> {
+    if public_remark.is_some_and(|s| s.len() > PUBLIC_REMARK_MAX) {
+        return Some("public remark is too long");
+    }
+    None
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -661,6 +681,9 @@ pub async fn create_node(
         return bad("name is required");
     }
     if let Some(message) = node_limits(Some(node.traffic_reset_day), Some(node.traffic_limit)) {
+        return bad(message);
+    }
+    if let Some(message) = public_remark_ok(Some(&node.public_remark)) {
         return bad(message);
     }
     node.name = node.name.trim().to_owned();
@@ -803,6 +826,9 @@ pub async fn update_node(
         }
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.traffic_limit) {
+        return bad(message);
+    }
+    if let Some(message) = public_remark_ok(node.public_remark.as_deref()) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -2173,9 +2199,21 @@ mod tests {
         // `agent_version` is operational fleet detail: it identifies the build a
         // machine runs and belongs to whoever manages the panel, not to anonymous
         // visitors, so it rides with the address fields in the admin-only view.
-        for hidden in ["ip", "ipv4", "ipv6", "observed_ip", "remark", "hostname", "token", "agent_version"] {
+        for hidden in [
+            "ip",
+            "ipv4",
+            "ipv6",
+            "observed_ip",
+            "remark",
+            "public_remark",
+            "hostname",
+            "token",
+            "agent_version",
+        ] {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
+        // The rendered public note IS public (the raw `public_remark` source above is not).
+        assert!(public[0].get("public_remark_html").is_some(), "public_remark_html must be public");
         assert!(
             !serde_json::to_string(&public).unwrap().contains("token-of-open"),
             "no node's token may appear anywhere in a public payload"
@@ -2197,6 +2235,41 @@ mod tests {
         );
         assert_eq!(admin[0]["remark"], "secret note");
         assert_eq!(admin[0]["agent_version"], "1.2.3", "the panel still sees the agent build");
+    }
+
+    #[test]
+    fn public_remark_is_rendered_public_but_its_raw_source_stays_admin_only() {
+        let app = app();
+        let id = node(&app, "n", true);
+        app.db
+            .update_node(
+                id,
+                &crate::db::NodePatch { public_remark: Some("**hi** <b>x</b>".into()), ..Default::default() },
+            )
+            .unwrap();
+
+        let public = &visible_nodes(&app, false).unwrap()[0];
+        // The rendered HTML reaches anonymous visitors: Markdown and inline HTML both.
+        let html = public["public_remark_html"].as_str().unwrap();
+        assert!(html.contains("<strong>hi</strong>"), "{html}");
+        assert!(html.contains("<b>x</b>"), "{html}");
+        // The raw source is not exposed on the public frame.
+        assert!(public.get("public_remark").is_none(), "raw source must not be public");
+
+        // The admin frame carries both the rendered HTML and the raw source (for editing).
+        let admin = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(admin["public_remark"], "**hi** <b>x</b>");
+        assert!(admin["public_remark_html"].as_str().unwrap().contains("<strong>hi</strong>"));
+    }
+
+    #[test]
+    fn public_remark_over_the_length_cap_is_rejected() {
+        assert!(public_remark_ok(None).is_none());
+        assert!(public_remark_ok(Some("ok")).is_none());
+        let at_cap = "a".repeat(PUBLIC_REMARK_MAX);
+        assert!(public_remark_ok(Some(&at_cap)).is_none(), "exactly at the cap is allowed");
+        let over_cap = "a".repeat(PUBLIC_REMARK_MAX + 1);
+        assert!(public_remark_ok(Some(&over_cap)).is_some(), "over the cap is rejected");
     }
 
     #[tokio::test]
