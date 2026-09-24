@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
   addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload,
@@ -164,6 +165,7 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      public_remark: form.public_remark,
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -228,6 +230,14 @@ function NodeForm({ node, onClose, onSaved }: {
               <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途" />
             </Field>
           </div>
+          <Field label="公开备注" hint="支持 Markdown/HTML，公开状态页可见（受信任内容，按原样渲染）">
+            <Textarea
+              value={form.public_remark ?? ""}
+              onChange={(e) => set("public_remark", e.target.value)}
+              placeholder="**用途**、服务商、公告…（Markdown 或 HTML）"
+              rows={4}
+            />
+          </Field>
           <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
             <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
             <p className="mt-2 text-xs leading-relaxed text-muted-foreground">

@@ -64,6 +64,9 @@ export type Node = {
    */
   observed_ip?: string
   remark?: string
+  /** Public status-page note (Markdown/HTML source). Unlike `remark`, this is
+   * rendered and shown to anonymous visitors. */
+  public_remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
 }

@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS node (
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
   remark        TEXT    NOT NULL DEFAULT '',
+  public_remark TEXT    NOT NULL DEFAULT '',
   traffic_limit INTEGER NOT NULL DEFAULT 0,
   traffic_mode  TEXT    NOT NULL DEFAULT 'sum',
   traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -172,7 +173,7 @@ CREATE TABLE IF NOT EXISTS plugin_data (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// 两段式删列迁移(GATED_VERSION)未完成时停留的版本号。写成一个**绝对**的
 /// 常量而不是 `SCHEMA_VERSION - 1`:后者会随下一次升版一起漂走,把「v6 迁移
@@ -308,6 +309,15 @@ fn migrate_to_7(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "observed_ip TEXT NOT NULL DEFAULT ''")
 }
 
+/// v8 新增 node.public_remark:面向公开状态页的、管理员撰写的备注(Markdown/HTML
+/// 源文本),与仅管理员可见的 `remark` 分离。与 v7 同理不挂 v6 删列闸门——它是
+/// 读取路径(`node_view` 渲染公开帧)要用的列,停在 `GATED_VERSION` 的库若拿不到
+/// 会在每次报告/读取时失败;`add_column` 对重复列的容忍保证重跑安全。列同时进
+/// `SCHEMA`,故 `check_backup` 的列比对一致。
+fn migrate_to_8(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "public_remark TEXT NOT NULL DEFAULT ''")
+}
+
 /// v4 adds the `plugin` and `notification_log` tables and moves nothing. On a
 /// database opened through `Db::open` the schema batch has already created
 /// them by the time any migration runs; a backup candidate in `check_backup`
@@ -440,6 +450,11 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 7 {
         migrate_to_7(conn)?;
     }
+    // v8 与 v7 同理不挂 at_six 闸门:公开备注列在读取路径上使用,停在
+    // GATED_VERSION 的库也必须拿到,靠 add_column 容忍重复列随下次启动重跑。
+    if from < 8 {
+        migrate_to_8(conn)?;
+    }
     let stamped = if at_six { SCHEMA_VERSION } else { GATED_VERSION };
     conn.execute_batch(&format!("PRAGMA user_version = {stamped}"))?;
     Ok(())
@@ -477,6 +492,11 @@ pub struct Node {
     pub sort: i64,
     #[serde(default)]
     pub remark: String,
+    /// Admin-authored note shown on the public status page (Markdown/HTML source).
+    /// Distinct from `remark`, which never leaves the panel. Rendered to HTML in
+    /// `node_view` and sent to anonymous visitors; treated as trusted admin content.
+    #[serde(default)]
+    pub public_remark: String,
     /// Monthly allowance in bytes; 0 means unmetered.
     #[serde(default)]
     pub traffic_limit: i64,
@@ -545,6 +565,7 @@ pub struct NodePatch {
     pub sort: Option<i64>,
     pub public: Option<bool>,
     pub remark: Option<String>,
+    pub public_remark: Option<String>,
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
@@ -771,14 +792,15 @@ impl Db {
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, remark, traffic_limit,
+            "INSERT INTO node (name, token, sort, public, remark, public_remark, traffic_limit,
                                traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8)",
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9)",
             params![
                 n.name,
                 token,
                 n.public,
                 n.remark,
+                n.public_remark,
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
@@ -809,7 +831,8 @@ impl Db {
             "UPDATE node SET name=COALESCE(?2,name), sort=COALESCE(?3,sort), public=COALESCE(?4,public),
                              remark=COALESCE(?5,remark), traffic_limit=COALESCE(?6,traffic_limit),
                              traffic_mode=COALESCE(?7,traffic_mode),
-                             traffic_reset_day=COALESCE(?8,traffic_reset_day)
+                             traffic_reset_day=COALESCE(?8,traffic_reset_day),
+                             public_remark=COALESCE(?9,public_remark)
              WHERE id=?1",
             params![
                 id,
@@ -819,7 +842,8 @@ impl Db {
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
-                n.traffic_reset_day
+                n.traffic_reset_day,
+                n.public_remark
             ],
         )?;
         Ok(())
@@ -1894,6 +1918,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         public: r.get::<_, bool>("public").unwrap_or(true),
         sort: n("sort"),
         remark: s("remark"),
+        public_remark: s("public_remark"),
         traffic_limit: n("traffic_limit"),
         traffic_mode: s("traffic_mode"),
         traffic_reset_day: n("traffic_reset_day") as u32,
@@ -2602,7 +2627,13 @@ mod tests {
         let n = db.node(id).unwrap().unwrap();
         assert!(!n.public);
         assert_eq!(n.remark, "private");
+        // public_remark round-trips and is left untouched by a patch that omits it.
+        db.update_node(id, &patch(serde_json::json!({"public_remark":"**用途**"}))).unwrap();
+        assert_eq!(db.node(id).unwrap().unwrap().public_remark, "**用途**");
         db.update_node(id, &patch(serde_json::json!({"public":true}))).unwrap();
+        let n = db.node(id).unwrap().unwrap();
+        assert_eq!(n.public_remark, "**用途**", "omitting public_remark keeps it (COALESCE)");
+        assert_eq!(n.remark, "private", "omitting remark keeps it");
 
         db.accumulate(id, "boot", Some((0, 0))).unwrap();
         db.accumulate(id, "boot", Some((120_000, 10_000))).unwrap();
@@ -2881,10 +2912,10 @@ mod tests {
     /// also never grows the retired financial columns: `SCHEMA` no longer
     /// declares them.
     #[test]
-    fn a_fresh_database_is_on_schema_v7_with_the_new_tables() {
+    fn a_fresh_database_is_on_schema_v8_with_the_new_tables() {
         let db = db();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         let table = |name: &str| {
             conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [name], |r| {
                 r.get::<_, i64>(0)
@@ -2899,6 +2930,10 @@ mod tests {
             assert!(!node_columns.contains(retired), "新库不该带退役列 {retired}");
         }
         assert!(node_columns.contains("observed_ip"), "新库必须自己就带这一列,否则 save_facts 一写就失败");
+        assert!(
+            node_columns.contains("public_remark"),
+            "新库必须自己就带 public_remark,否则 node_view 读取一写就失败"
+        );
         drop(conn);
 
         assert!(TABLES.contains(&"plugin"));
@@ -2911,7 +2946,7 @@ mod tests {
     /// held. Opening the result again must not redo anything that cannot be
     /// redone.
     #[test]
-    fn a_v3_database_upgrades_to_v7_and_reopens_cleanly() {
+    fn a_v3_database_upgrades_to_v8_and_reopens_cleanly() {
         let file = std::env::temp_dir().join(format!("monitor-v3-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&file);
         let path = file.to_str().unwrap();
@@ -2932,7 +2967,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = conn
                 .query_row(
@@ -2949,7 +2984,7 @@ mod tests {
         // Reopening is a no-op: the migration chain stops before the stamp.
         drop(db);
         let again = Db::open(path).unwrap();
-        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(again.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         drop(again);
         let _ = std::fs::remove_file(&file);
     }
@@ -3001,7 +3036,7 @@ mod tests {
 
         let db = Db::open(path).unwrap();
         let conn = db.conn();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         assert!(columns_of(&conn, "node").unwrap().contains("observed_ip"), "migrate_to_7 必须加上这一列");
         drop(conn);
         assert_eq!(db.nodes().unwrap().len(), 1, "升级保留原有节点");
@@ -3155,7 +3190,7 @@ mod tests {
         drop(db);
 
         let db = Db::open(path).unwrap();
-        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(db.conn().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         let columns = columns_of(&db.conn(), "node").unwrap();
         for retired in ["price", "currency", "billing_cycle", "expires_at"] {
             assert!(!columns.contains(retired), "导入完成后 {retired} 应已删除");
@@ -3191,7 +3226,7 @@ mod tests {
         // must pass every gate and come out with the newer tables created.
         live.check_backup(&old_path).unwrap();
         let checked = Connection::open(&old_path).unwrap();
-        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(checked.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
         for table in ["plugin", "notification_log", "plugin_data"] {
             let found: i64 = checked
                 .query_row(
