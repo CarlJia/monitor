@@ -510,8 +510,12 @@ export type PluginFieldDecl = string | {
  *
  * `money` 是数字的展示形态：右对齐、两位小数（是不是钱由插件声明，面板不按
  * 字段名猜）。提交时按数字处理——格式化后的文本不该漏进载荷。
+ *
+ * `static` 是「只展示、不可编辑」：不渲染输入控件（值原样当文本），提交时整列
+ * 丢弃。派生值——比如按汇率折算出的金额——用它摆在编辑表里，而不给操作员一个
+ * 改不动又不生效的输入框。
  */
-export const FIELD_TYPES = ["text", "number", "date", "money"] as const
+export const FIELD_TYPES = ["text", "number", "date", "money", "static"] as const
 
 export type FieldType = typeof FIELD_TYPES[number]
 
@@ -625,6 +629,8 @@ export function formPayload(
   const payload: Record<string, unknown> = {}
   if (id !== undefined) payload.id = id
   for (const f of fields) {
+    // `static` 列只展示：不进提交载荷（它是派生值，插件也不读它）。
+    if (f.type === "static") continue
     const raw = values[f.name] ?? ""
     if (f.type !== "number" && f.type !== "money") {
       payload[f.name] = raw

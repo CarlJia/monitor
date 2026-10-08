@@ -158,6 +158,13 @@ function FormBlock({ block, busy, onSubmit }: {
                           {extra !== null && <SelectItem key={extra} value={extra}>{extra}</SelectItem>}
                         </SelectContent>
                       </Select>
+                    ) : f.type === "static" ? (
+                      <div className="flex items-center gap-1">
+                        {prefix !== "" && (
+                          <span className="text-sm text-muted-foreground">{prefix}</span>
+                        )}
+                        <span className="text-sm">{shown}</span>
+                      </div>
                     ) : money ? (
                       <div className="flex items-center justify-end gap-1">
                         {prefix !== "" && (
