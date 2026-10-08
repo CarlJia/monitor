@@ -212,6 +212,20 @@ const moneyForm = normalizeFields([{ name: "price", type: "money" }])
 assert.deepEqual(formPayload(moneyForm, 7, { price: "1200.00" }), { id: 7, price: 1200 })
 assert.deepEqual(formPayload(moneyForm, 7, { price: "" }), { id: 7 })
 
+// `static`：只展示的列。归一化后 type 就是 static，形状与其它字段一致。
+assert.deepEqual(normalizeFields([{ name: "display_price", label: "折算价格", type: "static" }]), [
+  { name: "display_price", label: "折算价格", type: "static", options: [], prefixKey: "" },
+])
+// `static` 列不进提交载荷（派生值，插件读不读无所谓）。
+assert.deepEqual(
+  formPayload(
+    normalizeFields([{ name: "name", type: "text" }, { name: "display_price", type: "static" }]),
+    5,
+    { name: "edge-1", display_price: "¥71.43" },
+  ),
+  { id: 5, name: "edge-1" },
+)
+
 // money 列的展示值：两位小数。空值保持空、非数字原样返回——两者都不能被格式
 // 化成 `0.00` 或 `NaN`：那会让一个没填的价格读成免费、一个坏值从页面上消失。
 assert.equal(moneyCell(1200), "1200.00")
